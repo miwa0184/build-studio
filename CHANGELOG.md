@@ -75,6 +75,29 @@ that move underneath you without your having edited anything.
 
 ### Fixed
 
+- **QA was told dev servers were running when none were, and given a port the
+  project does not use.** The QA prompt asserted "Worktree dev servers are
+  already running on offset ports" unconditionally, falling back to a hardcoded
+  `5173`/`4000` whenever the run had started none. A bugfix run works in the
+  project root and starts no servers; a project with no `dev_commands` has none
+  to start either way.
+
+  The result on a hello-world bugfix: QA pointed `playwright-cli` at an invented
+  `http://localhost:5173`, got `ERR_CONNECTION_REFUSED`, and reported it as a
+  blocking finding — while the project serves on `4173` via Playwright's own
+  `webServer` block, which starts it automatically (the E2E suite passed 7/7 in
+  the same run). The fix planner then spotted the port mismatch and aimed a fix
+  task at **the project**, i.e. at changing a working repo to match a prompt that
+  was wrong.
+
+  The section is now conditional: it lists the servers the workflow actually
+  started, or states plainly that none were and that no port should be guessed —
+  a connection refused on a port nobody serves is an environment characteristic,
+  not a finding. When a step genuinely needs the app served, it points at the
+  project's own configuration (`package.json` scripts, the E2E runner's
+  `webServer` block, which names both the command and the port) instead of a
+  default that belongs to no project.
+
 - **An execution run that hit the fix-loop round cap could not be moved at all.**
   The execution flow parks a run at `review_cap_reached` but implemented no
   transition out of it — only the *review* flow had one, and it routes to steps
