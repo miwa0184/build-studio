@@ -100,3 +100,44 @@ test('a missing or unreadable tree degrades to appending nothing', () => {
   const throwing = { existsSync: () => { throw new Error('boom'); }, readFileSync: () => { throw new Error('boom'); } };
   assert.equal(inlineReferencedDefinitions(QA_PROMPT, { cli: 'codex', roots: [ROOT], fs: throwing }), '');
 });
+
+// ── Claude-only capabilities: translated, not inlined ────────────────────────
+const { translateClaudeOnlyCapabilities } = require('./agent-skills');
+
+const REVIEW_PROMPT = 'You are a Code Reviewer.\n'
+  + 'Use the /code-review skill at high effort — a multi-angle, recall-biased pass: surface every plausible issue then verify.\n'
+  + 'Review all changes.';
+
+test('claude keeps the reference — it can actually run the harness', () => {
+  const r = translateClaudeOnlyCapabilities(REVIEW_PROMPT, 'claude');
+  assert.equal(r.text, REVIEW_PROMPT);
+  assert.deepEqual(r.translated, []);
+});
+
+test('codex gets the method spelled out instead of a name it cannot invoke', () => {
+  const r = translateClaudeOnlyCapabilities(REVIEW_PROMPT, 'codex');
+  assert.deepEqual(r.translated, ['/code-review']);
+  assert.doesNotMatch(r.text, /Use the \/code-review skill/);
+  assert.match(r.text, /Pass 1 — FIND/);
+  assert.match(r.text, /Pass 2 — VERIFY/);
+  assert.match(r.text, /at high depth/);
+  assert.match(r.text, /Review all changes\./);
+});
+
+test('a "do NOT use it" instruction is never inverted into "do the method"', () => {
+  const negative = 'Do NOT use the /code-review skill and do NOT launch parallel sub-agents. Do a single-pass focused review.';
+  const r = translateClaudeOnlyCapabilities(negative, 'codex');
+  assert.equal(r.text, negative);
+  assert.deepEqual(r.translated, []);
+});
+
+test('a prompt naming no claude-only capability is untouched', () => {
+  const plain = 'You are QA. Run the test suite and report counts.';
+  assert.equal(translateClaudeOnlyCapabilities(plain, 'codex').text, plain);
+});
+
+test('the regex is not left stateful across calls', () => {
+  for (let i = 0; i < 4; i++) {
+    assert.deepEqual(translateClaudeOnlyCapabilities(REVIEW_PROMPT, 'codex').translated, ['/code-review'], `call ${i}`);
+  }
+});

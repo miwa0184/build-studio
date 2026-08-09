@@ -161,10 +161,80 @@ function inlineReferencedDefinitions(instruction, { cli, roots, fs, maxBytes = M
     + parts.join('\n\n');
 }
 
+/**
+ * Capabilities that live INSIDE the Claude binary, with no file to inline.
+ *
+ * The `.claude/` resolution above works because those definitions are files: a
+ * project edits `commands/qa.md` and every CLI sees the change. `/code-review`
+ * cannot work that way. The one the review prompts mean — the effort-scaled
+ * pass over the current diff — is compiled into the claude executable; there is
+ * no skills directory on disk to read. (A same-named marketplace plugin does
+ * exist as a file, but it is a different tool: it drives `gh pr diff`, launches
+ * Haiku/Sonnet sub-agents and posts a GitHub PR comment. Inlining it would
+ * point a Build Studio reviewer at a pull request instead of the branch diff
+ * and tell it to comment on GitHub instead of POSTing structured feedback.)
+ *
+ * So this translates the reference instead of resolving it: for a CLI that
+ * cannot run the harness, say what the harness DOES. Measured cost of not
+ * doing so — the reviewer says "skill is not available in this session, so
+ * I'll use the project's review instructions" (fazon PRD-105 round 1, codex)
+ * and silently runs a single pass where the prompt specified recall-biased
+ * multi-pass. Every code review in this installation was affected, because the
+ * review slot is codex.
+ *
+ * Only the AFFIRMATIVE form is rewritten. Several prompts say "Do NOT use the
+ * /code-review skill and do NOT launch parallel sub-agents" to keep a targeted
+ * re-review cheap — turning that into a description of the method would invert
+ * the instruction.
+ */
+const CODE_REVIEW_METHOD = (effort) =>
+  `Run a multi-angle, recall-biased review${effort ? ` at ${effort} depth` : ''} in two distinct passes. `
+  + `(Claude Code's \`/code-review\` harness is not available to your CLI, so run its method by hand — `
+  + `do not skip it, and do not substitute a single read-through.)\n\n`
+  + `**Pass 1 — FIND.** Work the angles below one at a time and write down every plausible issue, `
+  + `including ones you are unsure about. Do not judge while finding. Stopping at the first few `
+  + `findings is the exact failure this pass exists to prevent.\n`
+  + `**Pass 2 — VERIFY.** Take each candidate in turn and actively try to disprove it: read the `
+  + `surrounding code, check whether it is pre-existing rather than introduced here, whether a `
+  + `linter/typechecker/CI would already catch it, and whether the path is actually reachable. `
+  + `Drop everything you cannot confirm.\n\n`
+  + `Report only what survives pass 2. A finding you could not verify is a false positive, not a `
+  + `low-confidence finding.`;
+
+const CLAUDE_ONLY_TRANSLATIONS = [
+  {
+    name: '/code-review',
+    // Matches the affirmative openers only, up to the end of that sentence.
+    re: /Use the \/code-review skill(?:\s+at\s+(\S+)\s+effort)?[^.]*\.\s*/g,
+    text: (m, effort) => `${CODE_REVIEW_METHOD(effort)}\n\n`,
+  },
+];
+
+/**
+ * Rewrite references to Claude-only capabilities into what they stand for.
+ * Returns the instruction unchanged for claude, and for any prompt that names
+ * none of them.
+ */
+function translateClaudeOnlyCapabilities(instruction, cli) {
+  if (NATIVE_CLAUDE_DIR_CLIS.has(cli)) return { text: instruction, translated: [] };
+  let text = String(instruction || '');
+  const translated = [];
+  for (const cap of CLAUDE_ONLY_TRANSLATIONS) {
+    cap.re.lastIndex = 0;
+    if (!cap.re.test(text)) continue;
+    cap.re.lastIndex = 0;
+    text = text.replace(cap.re, cap.text);
+    translated.push(cap.name);
+  }
+  return { text, translated };
+}
+
 module.exports = {
   inlineReferencedDefinitions,
+  translateClaudeOnlyCapabilities,
   resolveReferences,
   referencedNames,
   NATIVE_CLAUDE_DIR_CLIS,
+  CLAUDE_ONLY_TRANSLATIONS,
   MAX_INLINE_BYTES,
 };

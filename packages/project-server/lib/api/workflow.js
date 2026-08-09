@@ -1978,7 +1978,13 @@ ${EFFICIENCY_INSTRUCTIONS}`,
       if (inlinedSkills) {
         console.log(`[workflow] inlined .claude definitions for ${agent.role} (${agentCli}): ${inlinedSkills.length} chars`);
       }
-      const prompt = interpolate(`${agent.instruction}${extraInstructions}${inlinedSkills}${learningsResult.text}${history}${feedbackCurl}`);
+      // Capabilities with no file to inline (they live in the claude binary)
+      // get their method spelled out instead — see agent-skills.js.
+      const translated = agentSkills.translateClaudeOnlyCapabilities(agent.instruction, agentCli);
+      if (translated.translated.length) {
+        console.log(`[workflow] translated claude-only capabilities for ${agent.role} (${agentCli}): ${translated.translated.join(', ')}`);
+      }
+      const prompt = interpolate(`${translated.text}${extraInstructions}${inlinedSkills}${learningsResult.text}${history}${feedbackCurl}`);
 
       const baseWindow = (agent.window || agent.role).replace(/[^a-zA-Z0-9_-]/g, '-').slice(0, 12).replace(/-+$/, '');
       const windowName = wf.round > 1 ? `${baseWindow}-r${wf.round}` : baseWindow;

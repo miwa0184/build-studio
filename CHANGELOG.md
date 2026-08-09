@@ -23,6 +23,33 @@ that move underneath you without your having edited anything.
 
 ## 2026-08-09 — Human gates are listed before a run, not discovered at the round cap
 
+### Changed
+
+- **Non-Claude code reviewers are told the review method instead of a skill name
+  they cannot invoke.** The review prompts said "Use the `/code-review` skill at
+  high effort — a multi-angle, recall-biased pass". That harness is compiled into
+  the `claude` binary, so for a codex or opencode reviewer the instruction was
+  inert. It reported so itself: *"skill is not available in this session, so I'll
+  use the project's review instructions"* — and then ran a single pass where the
+  prompt specified recall-biased multi-pass. With the review slot set to codex,
+  that was **every code review, final review and bugfix review in the
+  installation**.
+
+  Those prompts now spell out the method for non-Claude CLIs: pass 1 finds every
+  plausible issue without judging, pass 2 actively tries to disprove each one,
+  and only what survives is reported. Claude keeps the real reference, since it
+  can run it.
+
+  This is a *translation*, not the file-inlining used for `.claude/commands` and
+  `.claude/skills` — there is no file to point at. A same-named marketplace
+  plugin does exist on disk, but it is a different tool (drives `gh pr diff`,
+  launches sub-agents, posts a GitHub PR comment), and inlining it would aim a
+  reviewer at a pull request instead of the branch diff.
+
+  Prompts that deliberately say "Do **NOT** use the /code-review skill" — the
+  targeted re-review and the bugfix review, which opt out of the fan-out on
+  purpose — are left alone.
+
 ### Added
 
 - **Requirements only a person can discharge are surfaced on the Start click.**
@@ -82,6 +109,15 @@ cd packages/desktop && node inject-resources.js
 they already are and writes nothing.
 
 ### Notes for forks
+
+`agent-skills.js` now has two mechanisms, and the distinction matters when you
+add to either. `inlineReferencedDefinitions` resolves names to **files** — a
+project edits `.claude/commands/qa.md` once and all three CLIs see it, which is
+the property to preserve. `translateClaudeOnlyCapabilities` is the fallback for
+capabilities that have no file because they live inside the Claude binary; it
+rewrites the reference into prose. Prefer the first whenever a file exists, and
+when adding to `CLAUDE_ONLY_TRANSLATIONS` match only the affirmative form — a
+prompt that says "do NOT use X" must not be rewritten into a description of X.
 
 `spec-human-gates.js` is pattern-based and deliberately conservative. Two
 invariants if you extend `PATTERNS`: a phrase must be specific enough that
