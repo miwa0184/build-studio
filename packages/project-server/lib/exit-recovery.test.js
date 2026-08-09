@@ -2,7 +2,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { hasRecoverableWork, buildWorkSummary } = require('./exit-recovery');
+const { hasRecoverableWork, buildWorkSummary, isPlanningRole } = require('./exit-recovery');
 
 // Modelled on the real case: a codex QA agent that wrote and committed eight
 // test files, then exited without reporting.
@@ -23,6 +23,30 @@ test('commits are what make an exited agent recoverable', () => {
   assert.equal(hasRecoverableWork({ commits: [] }), false);
   assert.equal(hasRecoverableWork({}), false);
   assert.equal(hasRecoverableWork(null), false);
+});
+
+test('a planner is never git-recoverable, however many commits sit on the branch', () => {
+  // The dead end this guard exists for: the branch is full of commits, none of
+  // them the planner's, and a summary of them can never satisfy the fix_plan
+  // approval gate — leaving the step done with no way forward.
+  assert.equal(hasRecoverableWork(FACTS, 'Fix Planner'), false);
+  assert.equal(hasRecoverableWork(FACTS, 'Planner'), false);
+  // Everyone else is judged on the commits alone, exactly as before.
+  assert.equal(hasRecoverableWork(FACTS, 'iOS Dev'), true);
+  assert.equal(hasRecoverableWork(FACTS, 'Code Reviewer'), true);
+  // Omitting the role keeps the original two-argument-free behaviour.
+  assert.equal(hasRecoverableWork(FACTS), true);
+});
+
+test('planning roles are matched however the role is spelled', () => {
+  // Must agree with the workflow API's normalizeRole, or a role that routes
+  // feedback fine would slip past this guard.
+  for (const r of ['Fix Planner', 'fix_planner', 'fix-planner', 'FIXPLANNER', ' Planner ']) {
+    assert.equal(isPlanningRole(r), true, r);
+  }
+  for (const r of ['iOS Dev', 'QA', 'Planner Reviewer', '', null, undefined]) {
+    assert.equal(isPlanningRole(r), false, String(r));
+  }
 });
 
 test('the summary is labelled as reconstructed, not as the agent speaking', () => {

@@ -10,6 +10,7 @@ interface Detail { id: string; project: string | null; kind: string; durationMs:
 interface PendingEdit { from: number; to: number; factor?: number; cut?: boolean; label: string }
 
 const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`
+const fmtBytes = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b >= 1e6 ? `${Math.round(b / 1e6)} MB` : `${Math.round(b / 1e3)} KB`)
 const mono = 'var(--mono)'
 
 export function DemosTab() {
@@ -18,6 +19,10 @@ export function DemosTab() {
   const [detail, setDetail] = useState<Detail | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [err, setErr] = useState<string | null>(null)
+  const [confirmDel, setConfirmDel] = useState<RecSummary | null>(null)
+  const [delBusy, setDelBusy] = useState(false)
+  const [delErr, setDelErr] = useState<string | null>(null)
+  const [flash, setFlash] = useState<string | null>(null)
 
   const loadList = useCallback(async () => {
     const r = await fetch('/api/demos').then((x) => x.json()).catch(() => ({ recordings: [] }))
@@ -31,6 +36,22 @@ export function DemosTab() {
   }, [])
   useEffect(() => { if (sel) loadDetail(sel) }, [sel, loadDetail])
 
+  async function doDelete(id: string) {
+    setDelBusy(true); setDelErr(null)
+    try {
+      const r = await fetch(`/api/demos/${id}`, { method: 'DELETE' }).then((x) => x.json())
+      if (r.error) { setDelErr(r.error); return }
+      setConfirmDel(null)
+      if (sel === id) { setSel(null); setDetail(null) }
+      await loadList()
+      const mb = r.removed?.bytes ? ` · freed ${fmtBytes(r.removed.bytes)}` : ''
+      setFlash(`Deleted ${id}${mb}`)
+      setTimeout(() => setFlash(null), 4000)
+    } catch (e) {
+      setDelErr(e instanceof Error ? e.message : 'delete failed')
+    } finally { setDelBusy(false) }
+  }
+
   return (
     <div style={{ display: 'grid', gridTemplateColumns: '260px 1fr', height: 'calc(100vh - 124px)' }}>
       {/* recordings list */}
@@ -40,22 +61,38 @@ export function DemosTab() {
           Recordings ({recs.length})
         </div>
         {recs.length === 0 && <div style={{ fontFamily: mono, fontSize: 11, color: 'var(--muted)', padding: 8 }}>No recordings yet. Record a demo from a project's Development tab.</div>}
+        {flash && <div style={{ fontFamily: mono, fontSize: 10, color: 'var(--green)', padding: '4px 8px', marginBottom: 6 }}>{flash}</div>}
         {recs.map((r) => (
-          <button key={r.id} onClick={() => setSel(r.id)} style={{
-            display: 'block', width: '100%', textAlign: 'left', marginBottom: 6, padding: '8px 10px',
-            borderRadius: 'var(--radius)', border: '1px solid var(--border)',
-            background: sel === r.id ? 'var(--surface2)' : 'transparent', cursor: 'pointer',
-            fontFamily: mono, color: 'var(--text)',
-          }}>
-            <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 3 }}>{r.project || r.id.slice(0, 16)}</div>
-            <div style={{ fontSize: 9, color: 'var(--muted)', display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-              <span>{r.id.slice(0, 10)}</span>
-              {r.durationMs ? <span>· {fmt(r.durationMs / 1000)}</span> : null}
-              <span>· {r.kind}</span>
-              {r.cutCount > 0 && <span style={{ color: 'var(--green)' }}>· {r.cutCount} cut{r.cutCount > 1 ? 's' : ''}</span>}
-              {r.hasMaster && <span style={{ color: 'var(--accent)' }}>· master</span>}
-            </div>
-          </button>
+          <div key={r.id} style={{ position: 'relative', marginBottom: 6 }}>
+            <button onClick={() => setSel(r.id)} style={{
+              display: 'block', width: '100%', textAlign: 'left', padding: '8px 34px 8px 10px',
+              borderRadius: 'var(--radius)', border: '1px solid var(--border)',
+              background: sel === r.id ? 'var(--surface2)' : 'transparent', cursor: 'pointer',
+              fontFamily: mono, color: 'var(--text)',
+            }}>
+              <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 3 }}>{r.project || r.id.slice(0, 16)}</div>
+              <div style={{ fontSize: 9, color: 'var(--muted)', display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                <span>{r.id.slice(0, 10)}</span>
+                {r.durationMs ? <span>· {fmt(r.durationMs / 1000)}</span> : null}
+                <span>· {r.kind}</span>
+                {r.cutCount > 0 && <span style={{ color: 'var(--green)' }}>· {r.cutCount} cut{r.cutCount > 1 ? 's' : ''}</span>}
+                {r.hasMaster && <span style={{ color: 'var(--accent)' }}>· master</span>}
+              </div>
+            </button>
+            <button
+              onClick={() => { setDelErr(null); setConfirmDel(r) }}
+              title={`Delete ${r.id}`}
+              aria-label={`Delete recording ${r.project || r.id}`}
+              style={{
+                position: 'absolute', top: 6, right: 6, width: 22, height: 22, lineHeight: 1,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                background: 'none', border: 'none', borderRadius: 4, cursor: 'pointer',
+                color: 'var(--muted)', fontFamily: mono, fontSize: 12,
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--red)'; e.currentTarget.style.background = 'var(--surface2)' }}
+              onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--muted)'; e.currentTarget.style.background = 'none' }}
+            >🗑</button>
+          </div>
         ))}
       </div>
 
@@ -66,6 +103,84 @@ export function DemosTab() {
           <Editor key={sel} detail={detail} busy={busy} setBusy={setBusy} err={err} setErr={setErr}
             reload={async () => { await loadDetail(sel); await loadList() }} />
         )}
+      </div>
+
+      {confirmDel && (
+        <ConfirmDelete
+          rec={confirmDel}
+          busy={delBusy}
+          err={delErr}
+          onCancel={() => { if (!delBusy) { setConfirmDel(null); setDelErr(null) } }}
+          onConfirm={() => doDelete(confirmDel.id)}
+        />
+      )}
+    </div>
+  )
+}
+
+/**
+ * Delete confirmation.
+ *
+ * Deleting a recording is unbacked and irreversible — the source clips exist
+ * nowhere else, and every rendered cut goes with them. So the dialog names what
+ * is about to go rather than asking a generic "are you sure": which recording,
+ * how many cuts, whether a master exists. Cancel is the default focus and Escape
+ * cancels, so the destructive button is never the one you hit by reflex.
+ */
+function ConfirmDelete({ rec, busy, err, onCancel, onConfirm }: {
+  rec: RecSummary; busy: boolean; err: string | null; onCancel: () => void; onConfirm: () => void
+}) {
+  const cancelRef = useRef<HTMLButtonElement>(null)
+  useEffect(() => { cancelRef.current?.focus() }, [])
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => { if (e.key === 'Escape' && !busy) onCancel() }
+    document.addEventListener('keydown', h)
+    return () => document.removeEventListener('keydown', h)
+  }, [busy, onCancel])
+
+  const loses = [
+    rec.kind === 'dashboard' ? 'source clips' : 'the source clip',
+    rec.cutCount > 0 ? `${rec.cutCount} rendered cut${rec.cutCount > 1 ? 's' : ''}` : null,
+    rec.hasMaster ? 'the upload master' : null,
+    rec.hasNotes ? 'your notes' : null,
+  ].filter(Boolean) as string[]
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Confirm delete recording"
+      onClick={() => { if (!busy) onCancel() }}
+      style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+    >
+      <div onClick={(e) => e.stopPropagation()} style={{ background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, padding: 18, width: 420, maxWidth: '90vw' }}>
+        <div style={{ fontFamily: mono, fontSize: 12, fontWeight: 700, color: 'var(--text)', marginBottom: 10 }}>Delete this recording?</div>
+
+        <div style={{ background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 6, padding: 10, marginBottom: 12 }}>
+          <div style={{ fontFamily: mono, fontSize: 11, fontWeight: 600, color: 'var(--text)' }}>{rec.project || rec.id}</div>
+          <div style={{ fontFamily: mono, fontSize: 9, color: 'var(--muted)', marginTop: 3 }}>
+            {rec.id} · {rec.kind}{rec.durationMs ? ` · ${fmt(rec.durationMs / 1000)}` : ''}
+          </div>
+        </div>
+
+        <div style={{ fontFamily: mono, fontSize: 11, color: 'var(--text-dim)', lineHeight: 1.6, marginBottom: 14 }}>
+          This permanently deletes {loses.join(', ')}. There is no undo and nothing is moved to the Trash.
+        </div>
+
+        {err && <div style={{ fontFamily: mono, fontSize: 11, color: 'var(--red)', background: 'rgba(255,95,95,0.08)', border: '1px solid rgba(255,95,95,0.2)', borderRadius: 4, padding: '6px 10px', marginBottom: 10 }}>{err}</div>}
+
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+          <button ref={cancelRef} onClick={onCancel} disabled={busy} style={{
+            padding: '5px 11px', borderRadius: 'var(--radius)', border: '1px solid var(--border)',
+            background: 'var(--surface2)', color: 'var(--text)', fontFamily: mono, fontSize: 11, fontWeight: 600,
+            cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.5 : 1,
+          }}>Cancel</button>
+          <button onClick={onConfirm} disabled={busy} style={{
+            padding: '5px 11px', borderRadius: 'var(--radius)', border: 'none',
+            background: 'var(--red)', color: '#fff', fontFamily: mono, fontSize: 11, fontWeight: 600,
+            cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.6 : 1,
+          }}>{busy ? 'Deleting…' : 'Delete permanently'}</button>
+        </div>
       </div>
     </div>
   )

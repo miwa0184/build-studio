@@ -14,6 +14,8 @@ const limitBlock = require('../limit-block');
 const memoryGuard = require('../memory-guard');
 const transcriptRecovery = require('../transcript-recovery');
 const exitRecovery = require('../exit-recovery');
+const agentSkills = require('../agent-skills');
+const specHumanGates = require('../spec-human-gates');
 
 // Common instruction fragments injected into all agent prompts.
 // Placeholders {{CONTEXT_BUDGET}} and {{SOFT_THRESHOLD}} are replaced
@@ -1966,7 +1968,17 @@ ${EFFICIENCY_INSTRUCTIONS}`,
       // when Codex (which has its own ~258K window) is the implementer.
       const ctx = contextBudgetFor(modelId, agentCli);
       const interpolate = (s) => s.replace(/\{\{CONTEXT_BUDGET\}\}/g, ctx.budget).replace(/\{\{SOFT_THRESHOLD\}\}/g, ctx.softThreshold);
-      const prompt = interpolate(`${agent.instruction}${extraInstructions}${learningsResult.text}${history}${feedbackCurl}`);
+      // `/qa`, `` `qa-browser-testing` `` and friends live under `.claude/`,
+      // which only the claude CLI loads. Resolve them here — the one place the
+      // agent's CLI is known — so a codex/opencode agent gets the definition
+      // rather than inventing a substitute for it (see agent-skills.js).
+      const inlinedSkills = agentSkills.inlineReferencedDefinitions(agent.instruction, {
+        cli: agentCli, roots: [agentCwd, projectRoot], fs,
+      });
+      if (inlinedSkills) {
+        console.log(`[workflow] inlined .claude definitions for ${agent.role} (${agentCli}): ${inlinedSkills.length} chars`);
+      }
+      const prompt = interpolate(`${agent.instruction}${extraInstructions}${inlinedSkills}${learningsResult.text}${history}${feedbackCurl}`);
 
       const baseWindow = (agent.window || agent.role).replace(/[^a-zA-Z0-9_-]/g, '-').slice(0, 12).replace(/-+$/, '');
       const windowName = wf.round > 1 ? `${baseWindow}-r${wf.round}` : baseWindow;
@@ -3666,6 +3678,38 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     let dirty = false;
     try { dirty = g(['status', '--porcelain']).length > 0; } catch (_) {}
     const active = state.loadWorkflow();
+
+    // Human gates written into the item's spec set, listed BEFORE the run.
+    // Advisory — never blocks a start. A requirement only a person can
+    // discharge is legitimate, but an agent handed one can only refuse it, and
+    // the refusal reads downstream as an ordinary blocking finding: eight fix
+    // rounds against "a second person reviews the fixture diff", zero product
+    // defects found (fazon PRD-105, 2026-08-09). Surfacing it up front costs a
+    // glance; discovering it at the round cap cost a day.
+    let humanGates = null;
+    const gateItem = String(req.query.item || '').trim();
+    if (gateItem) {
+      try {
+        const itemFile = path.join(docsPath, 'backlog', `${gateItem}.md`);
+        const paths = [path.relative(projectRoot, itemFile)];
+        // The PRD named by the item, plus whatever companion specs it lists —
+        // that is where an agent-authored gate actually lands.
+        try {
+          const raw = fs.readFileSync(itemFile, 'utf8');
+          const prdMatch = raw.match(/^prd:\s*(.+)$/m);
+          const prd = prdMatch && prdMatch[1].trim().replace(/^['"]|['"]$/g, '');
+          if (prd && prd !== 'null') {
+            paths.push(prd);
+            const prdAbs = path.join(docsPath, path.basename(path.dirname(prd)), path.basename(prd));
+            const prdText = fs.existsSync(prdAbs) ? fs.readFileSync(prdAbs, 'utf8') : '';
+            for (const m of prdText.matchAll(/\b(docs\/[\w./-]+\.md)\b/g)) paths.push(m[1]);
+          }
+        } catch (_) { /* item unreadable — scan what we have */ }
+        const scan = specHumanGates.scanSpecsForHumanGates([...new Set(paths)], fs, projectRoot);
+        if (scan.total > 0) humanGates = scan;
+      } catch (_) { humanGates = null; }
+    }
+
     // needsAttention distinguishes "a run is working" from "a run is finished
     // but still holding the slot" — both block a start, but only the second one
     // clears when the owner does something.
@@ -3676,6 +3720,7 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
       defaultBranch,
       onDefaultBranch: !!branch && branch === defaultBranch,
       dirty,
+      humanGates,
     });
   });
 
@@ -3869,7 +3914,7 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
         continue;
       }
       const facts = gitWorkFacts(wf, agent);
-      if (!exitRecovery.hasRecoverableWork(facts)) continue;
+      if (!exitRecovery.hasRecoverableWork(facts, agent.role)) continue;
       const summary = exitRecovery.buildWorkSummary({
         role: agent.role, cli: agent.cli, step: wf.currentStep, ...facts,
       });
@@ -3904,8 +3949,18 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     let origin = found ? found.transcript : null;
     let source = found ? 'transcript' : null;
     if (!text) {
+      // A planner leaves nothing in git to reconstruct from, so say that
+      // instead of the generic "no commits" message — the branch usually HAS
+      // commits, they just belong to earlier rounds' Dev agents.
+      if (exitRecovery.isPlanningRole(agent.role)) {
+        return res.status(404).json({
+          error: `nothing to recover for ${role} — a planner's output is the JSON plan it posts, and that never lands in git, `
+            + `so there is nothing to reconstruct from (any commits on this branch are earlier agents' work). `
+            + `Relaunch ${wf.currentStep} instead — a planner that produced no report produced nothing to lose.`,
+        });
+      }
       const facts = gitWorkFacts(wf, agent);
-      if (!exitRecovery.hasRecoverableWork(facts)) {
+      if (!exitRecovery.hasRecoverableWork(facts, agent.role)) {
         return res.status(404).json({
           error: `nothing to recover for ${role} — no final report in its transcript and no commits on this branch. `
             + 'There is no evidence it produced anything; relaunch the step instead.',
@@ -6054,6 +6109,48 @@ Fix only the issues raised. Commit your changes.`,
       launchFindingsProposal(wf, sourceStep, body.note || notes || null);
       return res.json({ workflow: wf });
     }
+    // ── Leaving the fix-loop round cap ────────────────────────────────────────
+    // The execution flow PARKS a run here (two sites in the fix_execution
+    // handler) but had no transition out of it: only handleReviewAdvance
+    // implemented one, and it routes to `reviewing`/`companion_specs`, steps
+    // that do not exist in an execution run. So an execution workflow that hit
+    // the cap was stuck — every action answered "no valid transition for
+    // step=review_cap_reached" (fazon PRD-105, 2026-08-09: eight rounds against
+    // a blocking finding no agent could ever clear, then no way forward).
+    //
+    // `approve` re-enters the source review step's own approve path rather than
+    // duplicating its routing, so wherever an approved code_review goes
+    // (coverage_matrix, or qa_validation) it goes from here too, and keeps going
+    // there if that routing changes.
+    if (wf.currentStep === 'review_cap_reached') {
+      const rounds = (wf.steps.review_cap_reached && wf.steps.review_cap_reached.rounds) || wf.round;
+      const source = wf.fixSource || wf.returnTo || 'code_review';
+      if (action === 'another_round') {
+        wf.steps.review_cap_reached.status = 'skipped';
+        wf.round = 1; // the cap counts rounds since the loop began; restart the budget
+        wf.currentStep = source;
+        wf.steps[source] = { status: 'pending', agents: [] };
+        state.saveWorkflow(wf);
+        return res.json({ workflow: wf, needsAdvance: true });
+      }
+      if (action === 'approve' || action === 'skip') {
+        wf.steps.review_cap_reached.status = 'skipped';
+        wf.capOverrides = wf.capOverrides || [];
+        wf.capOverrides.push({
+          step: source, rounds, at: new Date().toISOString(),
+          reason: body.overrideReason || notes || null,
+        });
+        wf.currentStep = source;
+        state.saveWorkflow(wf);
+        return handleExecutionAdvance(wf, 'approve', notes, res, body);
+      }
+      return res.status(400).json({
+        error: `The ${source} fix loop reached its round cap at round ${rounds}. `
+          + `Choose "Another round" to keep fixing, or approve to accept the outstanding findings and move on `
+          + `(the override is recorded on wf.capOverrides).`,
+      });
+    }
+
     if (action === 'discard_findings') {
       try { fs.rmSync(FINDINGS_PROPOSAL_DIR, { recursive: true, force: true }); } catch (_) {}
       delete wf.findingsProposal;
@@ -7345,8 +7442,19 @@ Report honestly. Note: this step does NOT block — even Approved: no advances t
       // suite (e.g. Playwright `_electron`, run in step 3) instead of this step
       // trying to launch something ad hoc.
       const hasVisualSmokeTarget2 = !!(hasBrowserTesting2 || (config.simulator && config.simulator.destination));
+      // Name the tool, do not just say "capture screenshots". An agent given a
+      // requirement with no runnable command attached picks its own way to
+      // satisfy it, and the one it picks is whatever its CLI advertises: the
+      // hello-world HW-003 QA agent (codex) reached for its built-in
+      // `agent.browsers` runtime — which its own bundled skill tells it to try
+      // "before falling back to standalone Playwright" — got "No browser is
+      // available" in a headless tmux pane, and filed that as a BLOCKING defect.
+      // playwright-cli was installed the whole time and never invoked once.
+      const visualSmokeTool = hasBrowserTesting2
+        ? `\n   - **Use \`playwright-cli\` for this** (it is installed and is the only browser this environment has). Point it at the dev-server URL above: \`playwright-cli open <url>\`, \`playwright-cli resize 1440 900\` / \`resize 390 844\`, \`playwright-cli screenshot --filename <path>\`. Do NOT use a CLI-native or in-app browser tool (\`agent.browsers\`, Computer Use, an "in-app browser" skill) — there is no such browser in this session and it will fail with "No browser is available". That failure is an environment characteristic, NOT a defect: if you hit it, you used the wrong tool — switch to \`playwright-cli\` rather than reporting a finding.`
+        : '';
       const visualSmokeSection2 = hasVisualSmokeTarget2
-        ? `\n4. **Visual smoke — REQUIRED for visual PRDs** (see your /${skill} role's "Visual smoke" section for the full protocol).\n   - If this PRD ships any visible UI surface, capture simulator/device screenshots of every AC surface and inspect for: fallback colors (e.g. system-blue tab tint, system-gray text), missing UI elements (gear icons rendering as blurred backgrounds, empty MetricRow cards, missing empty-state copy), letterbox / safe-area breaks, layout regressions vs the design bundle reference at \`design-system/project/<screen>.html\` if the project has one.\n   - Visual regressions are **BLOCKING** even if the XCUITest / Playwright suite is green. Accessibility queries return matches for invisible text — the visual smoke is the only check that catches "tests pass but the user sees a blank screen".\n   - Commit screenshots to \`docs/pr-evidence/<PRD-basename>/visual/\`. The AC verification gate will look for them; a missing directory blocks the AC verifier from marking visual ACs as MET.\n   - **Scope evidence to THIS PRD only.** Capture or regenerate evidence ONLY under \`docs/pr-evidence/<PRD-basename>/\`. Do NOT run other PRDs' screenshot/evidence-capture tests. If a test run leaves OTHER PRDs' committed evidence modified (PDFs/PNGs drift byte-wise even when visually identical), \`git checkout --\` those files before finishing — never commit cross-PRD evidence churn into this run.\n   - **Brand-token check (mechanical)**: for each visible color in your screenshots, confirm it appears in \`docs/brand/brand-guidelines.md\` or the project's locked palette. Any color NOT in the locked palette is a fallback render — BLOCKING (even if the asset catalog has the right hex values committed; namespace mismatches mean the production code reaches nil at runtime and tests don't catch it).\n5. **Runtime warnings are BLOCKING.** Scan the launch console output for warnings like \`[Invalid Configuration]\`, \`No color named\`, \`Could not load nib\`, asset-not-found patterns. Any such warning that fires on every app launch means the implementation has a structural bug that the test suite doesn't catch. Report as **Approved: no**, **Blocking: <n>**, NOT as a Medium finding.`
+        ? `\n4. **Visual smoke — REQUIRED for visual PRDs** (see your /${skill} role's "Visual smoke" section for the full protocol).${visualSmokeTool}\n   - If this PRD ships any visible UI surface, capture simulator/device screenshots of every AC surface and inspect for: fallback colors (e.g. system-blue tab tint, system-gray text), missing UI elements (gear icons rendering as blurred backgrounds, empty MetricRow cards, missing empty-state copy), letterbox / safe-area breaks, layout regressions vs the design bundle reference at \`design-system/project/<screen>.html\` if the project has one.\n   - Visual regressions are **BLOCKING** even if the XCUITest / Playwright suite is green. Accessibility queries return matches for invisible text — the visual smoke is the only check that catches "tests pass but the user sees a blank screen".\n   - Commit screenshots to \`docs/pr-evidence/<PRD-basename>/visual/\`. The AC verification gate will look for them; a missing directory blocks the AC verifier from marking visual ACs as MET.\n   - **Scope evidence to THIS PRD only.** Capture or regenerate evidence ONLY under \`docs/pr-evidence/<PRD-basename>/\`. Do NOT run other PRDs' screenshot/evidence-capture tests. If a test run leaves OTHER PRDs' committed evidence modified (PDFs/PNGs drift byte-wise even when visually identical), \`git checkout --\` those files before finishing — never commit cross-PRD evidence churn into this run.\n   - **Brand-token check (mechanical)**: for each visible color in your screenshots, confirm it appears in \`docs/brand/brand-guidelines.md\` or the project's locked palette. Any color NOT in the locked palette is a fallback render — BLOCKING (even if the asset catalog has the right hex values committed; namespace mismatches mean the production code reaches nil at runtime and tests don't catch it).\n5. **Runtime warnings are BLOCKING.** Scan the launch console output for warnings like \`[Invalid Configuration]\`, \`No color named\`, \`Could not load nib\`, asset-not-found patterns. Any such warning that fires on every app launch means the implementation has a structural bug that the test suite doesn't catch. Report as **Approved: no**, **Blocking: <n>**, NOT as a Medium finding.`
         : `\n4. **Visual smoke / launch-console check — NOT APPLICABLE to this project.** No browser (\`features.playwright_cli\` is false/unset) or iOS simulator target is configured, so there is no way to launch a browser or device here — do NOT attempt to (e.g. via a generic browser tool); it will fail with something like "No browser is available". That failure is an environment characteristic of this project, NOT a defect — do NOT report it as a blocking (or any) finding. If this project has its own launch/console verification (e.g. an Electron E2E suite using Playwright \`_electron\`), that already ran as part of step 3 — rely on its output instead. Any console/runtime warnings surfaced by the test suite itself in steps 1-3 are still BLOCKING; only the ad hoc "launch it and look" check is skipped.`;
 
       // iOS-specific QA guidance — injected only when the project has a pinned

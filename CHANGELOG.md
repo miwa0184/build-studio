@@ -21,6 +21,226 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-09 — Human gates are listed before a run, not discovered at the round cap
+
+### Added
+
+- **Requirements only a person can discharge are surfaced on the Start click.**
+  Starting a run from the Backlog now scans that item's spec set — the item
+  file, its PRD, and the docs the PRD links — for requirements no agent can
+  satisfy: a second person, a manual review, a recorded reviewer identity, a
+  sign-off, an owner decision. If any are found, the first click lists them with
+  file, line and the sentence itself, and offers **Start anyway** or **Cancel**.
+
+  It is advisory and never blocks a start. The point is not to forbid human
+  gates — they are legitimate, and an agent should not be making those calls on
+  the owner's behalf — but to have them resolved up front rather than found
+  eight rounds in. The prompt for this: a QA spec required "a second person
+  reviews the fixture diff for sensitive data and records reviewer/date in the
+  manifest". No agent can do that. It was reported BLOCKING in all seven
+  code-review rounds of one run, the developer correctly refused to fabricate a
+  reviewer every time, and the run hit its round cap having found **zero**
+  product defects.
+
+  A spec that has already *replaced* its gate is not reported as having one —
+  "enforced mechanically, not by attestation" reads as a negation, because a
+  list that cries wolf gets ignored.
+
+### Fixed
+
+- **An execution run that hit the fix-loop round cap could not be moved at all.**
+  The execution flow parks a run at `review_cap_reached` but implemented no
+  transition out of it — only the *review* flow had one, and it routes to steps
+  (`reviewing`, `companion_specs`) that do not exist in an execution run. Every
+  action answered "no valid transition for step=review_cap_reached", including
+  the Force Continue button the UI offers. The run was unmovable without editing
+  state by hand.
+
+  Both ways out now work: **Another round** restarts the round budget and
+  re-enters the source step, **Force Continue** re-enters that step's own
+  approve path (so it routes wherever an approved review routes, and keeps
+  doing so if that changes) and records the override on `wf.capOverrides`.
+
+- **Expanding a backlog item could send the view back to the top**, putting the
+  body you just asked for off screen. Expanding a row now pins that row in
+  place. Note this was not reproducible from a browser against the same build —
+  several rows, a full poll cycle, and both synthetic and real click paths all
+  held position — so this anchors the symptom rather than claiming to have
+  found the trigger. Pinning the clicked row is right regardless of cause.
+
+### Upgrade steps
+
+**In Build Studio** — hub and project-server both changed, so a full rebuild,
+inject and app restart:
+
+```bash
+cd packages/hub && npx next build
+cd packages/desktop && node inject-resources.js
+```
+
+**In each managed project** — nothing to do. The gate scan reads specs where
+they already are and writes nothing.
+
+### Notes for forks
+
+`spec-human-gates.js` is pattern-based and deliberately conservative. Two
+invariants if you extend `PATTERNS`: a phrase must be specific enough that
+ordinary spec prose does not trip it (plain "review" is hopeless — every spec
+says it about agents), and every addition needs a matching consideration in
+`NEGATIONS`, or a spec that has removed its gate starts reporting one. The scan
+result reports `total` and `truncated` alongside the capped list; keep that —
+a silently truncated list reads as the whole list.
+
+---
+
+## 2026-08-09 — Non-Claude agents can finally read their own role definitions
+
+### Added
+
+- **Delete a recording from Home → Demos.** Each row in the recordings list has
+  a delete button, behind a confirmation that names what is about to go — the
+  recording, its rendered cuts, the upload master and your notes, whichever of
+  those exist. Cancel holds focus and Escape closes, so the destructive button is
+  never the one you hit by reflex. Deletion is permanent and nothing is moved to
+  the Trash, which the dialog says outright. A recording that is still being
+  written is refused rather than deleted: the recorder holds an open handle
+  inside that folder, and pulling it out from under a live capture corrupts the
+  take instead of cancelling it.
+
+### Changed
+
+- **Codex and OpenCode agents now receive the role definitions and skills their
+  prompts refer to.** Build Studio scaffolds roles into `.claude/commands/` and
+  skills into `.claude/skills/`, and the step prompts name them — "Use the /qa
+  skill", "Use the `qa-browser-testing` skill". Those are Claude Code paths.
+  Every non-Claude agent has therefore been running **without its role
+  definition** and without any skill it was pointed at, silently, for as long as
+  the CLI picker has existed.
+
+  What such an agent does is not nothing — it substitutes something of its own,
+  chosen with no knowledge of what the project provides. Those names now resolve
+  at launch, at the one point where the agent's CLI is known, and the file
+  contents are appended to the prompt for any CLI that cannot load them. Only
+  names that actually exist on disk in that project are inlined, so a reference
+  to a Claude Code built-in (`/code-review`) adds nothing rather than inventing
+  something.
+
+  Expect non-Claude prompts to grow by roughly the size of one role file plus
+  any referenced skill — about 12 KB on a QA step here.
+
+- **The QA visual-smoke step now names `playwright-cli` instead of describing
+  the goal.** When a browser target is configured, the instruction gives the
+  actual commands and explicitly rules out CLI-native browser tools
+  (`agent.browsers`, Computer Use, in-app browser skills), including the standing
+  rule that "No browser is available" means the wrong tool was used and is never
+  a finding to report.
+
+### Fixed
+
+- **A codex QA agent could fail a run over a screenshot it was never able to
+  take.** On a hello-world bugfix (a one-character Swedish typo, fixed correctly
+  in the very first commit), QA needed a visual smoke, could not see the
+  `qa-browser-testing` skill, and reached for codex's own in-app browser runtime
+  — whose bundled instructions tell it to try that *before* falling back to
+  standalone Playwright. In a headless tmux pane that runtime does not exist, so
+  it got `No browser is available` and filed the gap as a **blocking defect**.
+  Code review inherited the blocker, fix_plan planned work no developer could do,
+  and the run reached round 2 with zero code defects ever found. `playwright-cli`
+  was installed throughout and never invoked once.
+
+  There was already a guard for this loop, added for an Electron project in
+  July — but it only fires when `features.playwright_cli` is **false**. It
+  covered "no browser configured" and missed "browser configured, but this agent
+  cannot reach it". Both changes above close that second case.
+
+### Known issues
+
+- An environmental block and a real defect still reach the workflow through the
+  same signal (`**Approved:** no` + a blocking count), so a gate that *cannot
+  run* is indistinguishable downstream from one that ran and failed, and can
+  still enter the fix pipeline as work no developer can complete. Giving QA a
+  distinct "gate could not run" channel is the real repair; the changes above
+  remove the cause that has actually fired, not the class.
+
+### Upgrade steps
+
+**In Build Studio** — this touches both the hub and the project-server, so it
+needs a full rebuild and inject, then an app restart:
+
+```bash
+cd packages/hub && npx next build
+cd packages/desktop && node inject-resources.js
+```
+
+Running project-servers need restarting too, or agents launched from them keep
+using the old prompt assembly.
+
+**In each managed project** — nothing to do. The role and skill files are read
+where they already are; nothing is copied, moved or rewritten.
+
+### Notes for forks
+
+`agent-skills.js` resolves the names by **existence on disk**, never from a
+list — `.claude/commands/<name>.md` for a `/name` reference, and
+`.claude/skills/<name>/SKILL.md` for a backticked `` `name` skill `` reference.
+Two invariants to preserve if you extend it:
+
+- The command pattern is anchored on a word boundary before the slash, so path
+  segments (`docs/qa/…`, `e2e/support/…`) cannot match. Loosening that inlines
+  role files into prompts that never asked for them.
+- If a CLI gains native `.claude/` loading, add it to `NATIVE_CLAUDE_DIR_CLIS`
+  or its agents get the definitions twice.
+
+Oversized files are skipped and *named* as skipped in the prompt rather than
+truncated — an agent handed a silently-cut role definition treats the fragment
+as the whole thing.
+
+---
+
+## 2026-08-09 — Recover no longer strands a planner step
+
+### Fixed
+
+- **Recovering a planner that died without reporting left the step with no way
+  forward.** When an agent exits without posting its feedback, Recover falls
+  back to reconstructing a report from the commits on the branch. That is right
+  for a Dev agent, whose deliverable *is* the diff — and structurally wrong for
+  a planner, whose entire output is the JSON task list it posts and which never
+  touches git. So Recover filed a prose summary of *other* agents' commits under
+  the planner's name, marked the step `done`, and reaped its window. The
+  `fix_plan` approval gate then rejected it — correctly, since it parses planner
+  feedback for a ```json block — and the run was stuck: the step could be
+  neither approved nor recovered again.
+
+  Recover now refuses the git fallback for `Planner` and `Fix Planner` and says
+  why, pointing at Relaunch. A planner that reported nothing produced nothing to
+  lose, so relaunching costs only the re-run. Transcript recovery is unchanged
+  and still preferred for both roles — a planner's own words *do* contain its
+  plan; only the commit-based reconstruction was ever incapable of recovering
+  one.
+
+### Upgrade steps
+
+**In Build Studio** — sync the project-server into the app bundle and restart
+it, then restart any running project-servers:
+
+```bash
+cd packages/desktop && node inject-resources.js --sync-only
+```
+
+**In each managed project** — nothing to do.
+
+### Notes for forks
+
+`exit-recovery.js` now exports `isPlanningRole()` and `PLANNING_ROLES`, and
+`hasRecoverableWork(facts, role)` takes the role as an optional second argument
+(omitting it keeps the old behaviour). If you add a role whose deliverable is a
+plan rather than a diff, add it to `PLANNING_ROLES` — the matching uses the same
+normalisation as the workflow API's `normalizeRole`, so spelling variants are
+already covered.
+
+---
+
 ## 2026-08-07 — Make the learnings system measurable per project
 
 A review of the knowledge/learning system asked three questions: is it used,

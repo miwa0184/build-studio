@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
+import { useEffect, useLayoutEffect, useState, useCallback, useMemo, useRef } from 'react'
 import { useProjectApi } from '@/lib/use-project-api'
 import {
   DndContext, DragOverlay, PointerSensor, useSensor, useSensors,
@@ -138,7 +138,23 @@ export function BacklogTab({
   // both the rows and the readiness need re-reading.
   const [starting, setStarting] = useState<string | null>(null)
   const [startError, setStartError] = useState<{ id: string; message: string } | null>(null)
-  const startRun = useCallback(async (id: string, run: RunType) => {
+  // Human gates found in this item's spec set, surfaced on the FIRST Start
+  // click. Confirming starts the run; the panel exists so a requirement only a
+  // person can discharge is seen before the run, not discovered by an agent
+  // that can only refuse it eight rounds later.
+  const [pendingGates, setPendingGates] = useState<{ id: string; run: RunType; gates: HumanGate[]; total: number; truncated: boolean } | null>(null)
+
+  const startRun = useCallback(async (id: string, run: RunType, opts: { skipGateCheck?: boolean } = {}) => {
+    if (!opts.skipGateCheck) {
+      try {
+        const r: Readiness = await api.get(`/workflow/start-readiness?item=${encodeURIComponent(id)}`)
+        if (r?.humanGates?.total) {
+          setPendingGates({ id, run, gates: r.humanGates.gates, total: r.humanGates.total, truncated: r.humanGates.truncated })
+          return
+        }
+      } catch { /* the scan is advisory — never let it stop a start */ }
+    }
+    setPendingGates(null)
     setStarting(id)
     setStartError(null)
     try {
@@ -159,7 +175,56 @@ export function BacklogTab({
     }
   }, [api, load, loadReadiness])
 
+  // ── Keep the clicked row under the cursor when it expands ────────────────
+  //
+  // Reported 2026-08-09: scrolling down to an item and clicking it to read it
+  // sent the view back to the top, so the body you just asked for was off
+  // screen. The trigger was not reproducible from Chrome against the same
+  // build — several rows, a full 30s poll cycle and both synthetic and real
+  // click paths all held their position — so this does not claim to remove a
+  // root cause. It removes the symptom by pinning the thing the user was
+  // looking at.
+  //
+  // That is worth doing on its own merits regardless of the trigger: expanding
+  // a row should never move that row. Measuring before the state change and
+  // correcting in a layout effect (before paint) also wins against anything
+  // that resets scrollTop during the same commit, since this runs after it.
+  const scrollAnchor = useRef<{ id: string; top: number } | null>(null)
+
+  // Attribute match rather than a `[data-item-id="…"]` selector: `CSS` is
+  // dnd-kit's export in this module, so `CSS.escape` is not the DOM one, and an
+  // unescaped id would be a selector-injection waiting for the first item id
+  // with a quote in it.
+  function rowElement(id: string): HTMLElement | null {
+    for (const el of document.querySelectorAll<HTMLElement>('[data-item-id]')) {
+      if (el.dataset.itemId === id) return el
+    }
+    return null
+  }
+
+  function scrollParentOf(el: HTMLElement | null): HTMLElement | null {
+    for (let p = el?.parentElement; p; p = p.parentElement) {
+      const oy = getComputedStyle(p).overflowY
+      if ((oy === 'auto' || oy === 'scroll') && p.scrollHeight > p.clientHeight) return p
+    }
+    return null
+  }
+
+  useLayoutEffect(() => {
+    const anchor = scrollAnchor.current
+    if (!anchor) return
+    scrollAnchor.current = null
+    const row = rowElement(anchor.id)
+    const scroller = scrollParentOf(row)
+    if (!row || !scroller) return
+    const delta = row.getBoundingClientRect().top - anchor.top
+    // Sub-pixel jitter is not worth a write; anything larger is a real jump.
+    if (Math.abs(delta) > 1) scroller.scrollTop += delta
+  }, [expanded])
+
   function toggle(id: string) {
+    const row = rowElement(id)
+    if (row) scrollAnchor.current = { id, top: row.getBoundingClientRect().top }
     setExpanded(prev => {
       const next = new Set(prev)
       if (next.has(id)) next.delete(id); else next.add(id)
@@ -478,7 +543,7 @@ export function BacklogTab({
       overflow: 'hidden',
     }
     return (
-      <div ref={setNodeRef} style={rowStyle} {...attributes}>
+      <div ref={setNodeRef} data-item-id={id} style={rowStyle} {...attributes}>
         <div style={{
           // Third column is the Start button — a sibling of the expand button,
           // never a child of it (nested <button> is invalid and swallows clicks).
@@ -546,6 +611,52 @@ export function BacklogTab({
             fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--red)',
             padding: '6px 12px 8px 64px', lineHeight: 1.45,
           }}>{startError.message}</div>
+        )}
+
+        {pendingGates && pendingGates.id === id && (
+          <div style={{
+            margin: '0 12px 10px 64px', padding: '10px 12px',
+            background: 'rgba(245,158,11,0.08)', border: '1px solid var(--orange)',
+            borderRadius: 4, fontFamily: 'var(--mono)', fontSize: 11, lineHeight: 1.55,
+          }}>
+            <div style={{ color: 'var(--orange)', fontWeight: 700, marginBottom: 6 }}>
+              ⏸ {pendingGates.total} thing{pendingGates.total === 1 ? '' : 's'} in this item&rsquo;s specs need{pendingGates.total === 1 ? 's' : ''} a person
+            </div>
+            <div style={{ color: 'var(--text-dim)', marginBottom: 8 }}>
+              No agent can discharge these. Left in place they are reported as blocking findings
+              round after round, and the run cannot close. Resolve them first, or start knowing the
+              run will stop on them.
+            </div>
+            {pendingGates.gates.map((g, i) => (
+              <div key={i} style={{ marginBottom: 6 }}>
+                <div style={{ color: 'var(--text)' }}>&ldquo;{g.quote}&rdquo;</div>
+                <div style={{ color: 'var(--muted)', fontSize: 10 }}>{g.path}:{g.line} — {g.why}</div>
+              </div>
+            ))}
+            {pendingGates.truncated && (
+              <div style={{ color: 'var(--muted)', fontSize: 10, marginBottom: 6 }}>
+                Showing {pendingGates.gates.length} of {pendingGates.total}.
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+              <button
+                onClick={(e) => { e.stopPropagation(); startRun(pendingGates.id, pendingGates.run, { skipGateCheck: true }) }}
+                style={{
+                  padding: '4px 10px', borderRadius: 'var(--radius)', border: '1px solid var(--orange)',
+                  background: 'transparent', color: 'var(--orange)', fontFamily: 'var(--mono)',
+                  fontSize: 10, fontWeight: 700, cursor: 'pointer',
+                }}
+              >Start anyway</button>
+              <button
+                onClick={(e) => { e.stopPropagation(); setPendingGates(null) }}
+                style={{
+                  padding: '4px 10px', borderRadius: 'var(--radius)', border: '1px solid var(--border)',
+                  background: 'var(--surface2)', color: 'var(--text)', fontFamily: 'var(--mono)',
+                  fontSize: 10, fontWeight: 700, cursor: 'pointer',
+                }}
+              >Cancel</button>
+            </div>
+          </div>
         )}
 
         {isExpanded && item && (
@@ -734,7 +845,12 @@ interface Readiness {
   defaultBranch: string
   onDefaultBranch: boolean
   dirty: boolean
+  /** Requirements found in the item's spec set that only a person can
+   *  discharge. Advisory: present or not, the run can still be started. */
+  humanGates?: { gates: HumanGate[]; total: number; truncated: boolean } | null
 }
+
+interface HumanGate { path: string; line: number; quote: string; why: string }
 
 /** The run this item's (type, status) makes it eligible for, or null. */
 function plannedRunFor(item?: Item): RunType | null {
