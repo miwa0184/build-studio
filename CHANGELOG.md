@@ -52,6 +52,21 @@ that move underneath you without your having edited anything.
 
 ### Added
 
+- **Human gates are now reported on every way a run can start, including from
+  no UI at all.** The first version of this checked only the Backlog tab's Start
+  button — one of three entry points. The Workflow tab has its own start path,
+  and an automated caller posts to the API directly. A run started from either of
+  those saw nothing.
+
+  That gap had teeth: an unattended job started an item carrying six gates,
+  including an owner decision, then rewrote the spec to declare the gate
+  automated and marked the item Reviewed — while the test underneath was
+  unchanged. The scan now runs server-side on `POST /workflow/start`, so the
+  gates come back in the response for **any** caller and are written to the
+  server log for the ones with no screen. The Workflow tab renders them as a
+  dismissible notice beside the run. Both endpoints share one helper rather than
+  the copy the first version inlined.
+
 - **Requirements only a person can discharge are surfaced on the Start click.**
   Starting a run from the Backlog now scans that item's spec set — the item
   file, its PRD, and the docs the PRD links — for requirements no agent can
