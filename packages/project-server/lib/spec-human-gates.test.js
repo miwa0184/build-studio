@@ -100,3 +100,60 @@ test('the cap is reported rather than silently applied', () => {
   assert.equal(r.total, 30);
   assert.equal(r.truncated, true);
 });
+
+// ── Path containment ─────────────────────────────────────────────────────────
+// Every path handed to the scanner is untrusted: a request query parameter, a
+// `prd:` frontmatter value, and a regex over PRD body text — all repo content
+// that agents write. Reading is this module's whole job, so the guard lives
+// here and not only at the caller that happens to exist today.
+
+const realFs = require('fs');
+
+test('an absolute path outside the root is refused, not read', () => {
+  // The original bug: `isAbsolute(rel) ? rel : join(root, rel)` honoured
+  // absolute paths as given, so `prd: /etc/hosts` was read and its matching
+  // lines returned in the API response.
+  let read = null;
+  const fs2 = { existsSync: () => true, readFileSync: (p) => { read = p; return 'A second person approves.'; } };
+  const r = scanSpecsForHumanGates(['/etc/hosts'], fs2, '/proj');
+  assert.equal(r.total, 0);
+  assert.equal(read, null, 'the file must never be opened');
+});
+
+test('a traversing relative path is refused, not read', () => {
+  let read = null;
+  const fs2 = { existsSync: () => true, readFileSync: (p) => { read = p; return 'A second person approves.'; } };
+  const r = scanSpecsForHumanGates(['../../../../etc/hosts.md', 'docs/../../escape.md'], fs2, '/proj');
+  assert.equal(r.total, 0);
+  assert.equal(read, null);
+});
+
+test('traversal that stays inside the root is still allowed', () => {
+  // Containment, not paranoia about the `..` character: this resolves to
+  // /proj/docs/a.md and is legitimate.
+  const fs2 = { existsSync: () => true, readFileSync: () => 'A second person approves.' };
+  const r = scanSpecsForHumanGates(['docs/sub/../a.md'], fs2, '/proj');
+  assert.equal(r.total, 1);
+});
+
+test('a sibling directory sharing the root prefix does not count as inside', () => {
+  // /proj-evil must not pass a naive startsWith('/proj') check.
+  const fs2 = { existsSync: () => true, readFileSync: () => 'A second person approves.' };
+  assert.equal(scanSpecsForHumanGates(['../proj-evil/x.md'], fs2, '/proj').total, 0);
+});
+
+test('one refused path does not abort the scan of the others', () => {
+  const fs2 = {
+    existsSync: () => true,
+    readFileSync: (p) => (String(p).endsWith('ok.md') ? 'A second person approves.' : 'nothing here'),
+  };
+  const r = scanSpecsForHumanGates(['/etc/passwd', 'docs/ok.md'], fs2, '/proj');
+  assert.equal(r.total, 1);
+  assert.equal(r.gates[0].path, 'docs/ok.md');
+});
+
+test('the guard uses the real fs semantics, not a stub-only path', () => {
+  // Guards that only hold against a fake fs are the ones that regress.
+  const r = scanSpecsForHumanGates(['/etc/hosts'], realFs, '/proj');
+  assert.equal(r.total, 0);
+});

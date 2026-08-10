@@ -16,6 +16,7 @@ const transcriptRecovery = require('../transcript-recovery');
 const exitRecovery = require('../exit-recovery');
 const agentSkills = require('../agent-skills');
 const specHumanGates = require('../spec-human-gates');
+const { assertInside } = require('../path-guard');
 
 // Common instruction fragments injected into all agent prompts.
 // Placeholders {{CONTEXT_BUDGET}} and {{SOFT_THRESHOLD}} are replaced
@@ -2937,9 +2938,15 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
    */
   function scanItemHumanGates(item) {
     const id = String(item || '').trim();
-    if (!id) return null;
+    // A backlog id is an id, not a path. This value arrives from a request
+    // query parameter and from `wf.input`, and is interpolated into a filename,
+    // so anything with a separator or a `..` segment is rejected outright
+    // rather than normalised — `FAZ-243` and `../../../../etc/hosts` must not
+    // both be accepted. `spec-human-gates` enforces containment again on every
+    // path it reads; this is the cheaper, earlier half of the same guard.
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id) || id.includes('..')) return null;
     try {
-      const itemFile = path.join(docsPath, 'backlog', `${id}.md`);
+      const itemFile = assertInside(path.join('backlog', `${id}.md`), docsPath);
       const paths = [path.relative(projectRoot, itemFile)];
       try {
         const raw = fs.readFileSync(itemFile, 'utf8');
@@ -2947,11 +2954,15 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
         const prd = prdMatch && prdMatch[1].trim().replace(/^['"]|['"]$/g, '');
         if (prd && prd !== 'null') {
           paths.push(prd);
-          const prdAbs = path.join(projectRoot, prd);
+          // The `prd:` value is repo content an agent wrote — untrusted for the
+          // same reason the id is. assertInside throws on anything escaping the
+          // project, and the catch below leaves `paths` with what was already
+          // collected rather than failing the whole scan.
+          const prdAbs = assertInside(prd, projectRoot);
           const prdText = fs.existsSync(prdAbs) ? fs.readFileSync(prdAbs, 'utf8') : '';
           for (const m of prdText.matchAll(/\b(docs\/[\w./-]+\.md)\b/g)) paths.push(m[1]);
         }
-      } catch (_) { /* item unreadable — scan what we have */ }
+      } catch (_) { /* item unreadable, or a path escaping the project — scan what we have */ }
       const scan = specHumanGates.scanSpecsForHumanGates([...new Set(paths)], fs, projectRoot);
       return scan.total > 0 ? scan : null;
     } catch (_) {

@@ -27,6 +27,8 @@
  * eight rounds of an unwinnable loop.
  */
 
+const { assertInside } = require('./path-guard');
+
 /**
  * Phrases that mark a requirement only a person can discharge.
  *
@@ -124,11 +126,21 @@ function findHumanGates(text, path) {
  * @param {number} [limit]        cap on reported gates (the rest are counted)
  */
 function scanSpecsForHumanGates(paths, fs, rootDir, limit = 20) {
-  const nodePath = require('path');
   const gates = [];
   for (const rel of paths || []) {
     if (!rel) continue;
-    const abs = nodePath.isAbsolute(rel) ? rel : nodePath.join(rootDir, rel);
+    // Every path here is untrusted. The list is built from a request parameter,
+    // from a `prd:` frontmatter value, and from a regex over PRD body text —
+    // all of them repo content that agents write. An earlier revision resolved
+    // absolute paths as given and joined relative ones without a containment
+    // check, so `prd: ../../../../etc/hosts.md` or an absolute path read that
+    // file and returned every matching LINE in the API response. Reading is the
+    // whole job of this module, so the guard has to be here rather than at the
+    // one caller that happens to exist today.
+    let abs;
+    try {
+      abs = assertInside(rel, rootDir);
+    } catch { continue; }   // outside the project — not a gate, not an error
     let text;
     try {
       if (!fs.existsSync(abs)) continue;

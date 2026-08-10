@@ -90,6 +90,21 @@ that move underneath you without your having edited anything.
 
 ### Fixed
 
+- **Security: the human-gate scan could be pointed at files outside the project.**
+  Introduced and fixed the same day, but it was on `main` in between — pull if you
+  took `aab0a0b`. The scan built its file list from three untrusted sources: the
+  `item` request parameter, a backlog item's `prd:` frontmatter value, and a regex
+  over PRD body text. It resolved absolute paths as given and joined relative ones
+  with no containment check, so `prd: /etc/hosts` or `?item=../../../../etc/hosts`
+  read that file and returned every line matching a gate pattern in the API
+  response — an information-disclosure primitive driven by repo content that
+  agents write.
+
+  Now guarded at both layers: the item id must match `^[A-Za-z0-9][A-Za-z0-9._-]*$`
+  with no `..`, and every path the scanner reads goes through `assertInside`
+  against the project root. A refused path is skipped rather than failing the
+  scan, so one bad `prd:` value does not hide the gates in the other files.
+
 - **QA was told dev servers were running when none were, and given a port the
   project does not use.** The QA prompt asserted "Worktree dev servers are
   already running on offset ports" unconditionally, falling back to a hardcoded
