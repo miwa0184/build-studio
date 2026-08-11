@@ -335,6 +335,22 @@ const BUILD_STUDIO_GITIGNORE_PATTERNS = [
   '# Claude Code runtime — per-machine, regenerated, do not commit',
   '.claude/scheduled_tasks.lock',
   '.claude/settings.local.json',
+  '',
+  // Visual smoke evidence is a RUN artifact, not a source artifact: the AC
+  // verifier resolves cited paths with exists() against the working tree, so
+  // the files only need to be on disk in the worktree that produced them.
+  // Committing them was the dominant repository cost where visual PRDs run
+  // often — screenshots do not delta-compress, so every regeneration is a full
+  // blob retained forever, and one measured project reached 1 060 MB of
+  // evidence in a 1.5 GB .git with a fifth of that added in a fortnight.
+  // The prose beside them (.md/.txt/.json) is kept: it is small and it is the
+  // part anyone actually reads. See docs/plans/pr-evidence-is-a-run-artifact.md.
+  '# Visual smoke evidence — regenerated per run, kept on disk, never committed',
+  'docs/pr-evidence/**/*.png',
+  'docs/pr-evidence/**/*.jpg',
+  'docs/pr-evidence/**/*.jpeg',
+  'docs/pr-evidence/**/*.gif',
+  'docs/pr-evidence/**/*.pdf',
 ];
 
 /**

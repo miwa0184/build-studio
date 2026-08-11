@@ -21,6 +21,101 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-11 — Visual smoke evidence is no longer committed
+
+### Changed
+
+- **Workflow runs no longer commit their screenshots.** Visual smoke evidence is
+  written to `docs/pr-evidence/<PRD>/visual/` exactly as before and is still
+  required — the AC verifier resolves cited paths against the working tree, so a
+  missing directory still blocks a visual AC from being marked MET. What changed
+  is that the files are now **gitignored**: they are a run artifact that needs to
+  exist on disk, not a source artifact that needs to exist forever.
+
+  Screenshots do not delta-compress, so every regeneration was a full blob
+  retained permanently. Measured across the projects here before the change: one
+  repository held **1 060 MB of evidence PNGs in a 1.5 GB `.git`**, with 368 MB
+  of that added in a single fortnight and up to **21 committed versions of one
+  ~2 MB screenshot**. A second was 92% evidence by size. Nothing read any of it —
+  every reference to the directory outside `docs/` is a writer.
+
+  The prose beside the images (`.md`, `.txt`, `.json`) is still tracked. It is
+  small, and it is the part that gets read.
+
+### Upgrade steps
+
+**In Build Studio** — rebuild, inject, restart:
+
+```bash
+cd packages/hub && npx next build
+cd packages/desktop && node inject-resources.js
+```
+
+**In each managed project** — add the ignore rule and untrack the images. This
+stops the growth; it changes no history and is reversible. Run per project:
+
+```bash
+cat >> .gitignore <<'EOF'
+
+# Visual smoke evidence — regenerated per run, kept on disk, never committed
+docs/pr-evidence/**/*.png
+docs/pr-evidence/**/*.jpg
+docs/pr-evidence/**/*.jpeg
+docs/pr-evidence/**/*.gif
+docs/pr-evidence/**/*.pdf
+EOF
+
+git ls-files 'docs/pr-evidence' | grep -iE '\.(png|jpg|jpeg|gif|pdf)$' \
+  | tr '\n' '\0' | xargs -0 --no-run-if-empty git rm --cached --
+git add .gitignore && git commit -m "chore(git): stop committing visual smoke evidence"
+```
+
+The files stay on disk — only the tracking stops. Re-running onboarding on an
+existing project also adds the ignore rule (it is idempotent and appends only
+what is missing), but it will not untrack what is already committed; the command
+above is what does that.
+
+### Known issues
+
+- **Untracking does not shrink your repository.** The blobs stay in every commit
+  that already contains them, so `.git` will not get smaller — the growth stops,
+  the weight remains. Expect no change from `du -sh .git` after the upgrade
+  steps; that is correct, not a failed upgrade.
+
+  To size your own situation:
+
+  ```bash
+  git rev-list --objects --all \
+    | git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)' \
+    | awk '$1=="blob" && $3 ~ /pr-evidence/ {s+=$2} END {printf "%.0f MB\n", s/1048576}'
+  ```
+
+  Reclaiming that space requires rewriting history (`git-filter-repo` or
+  equivalent), which **changes every commit id**. Everyone with a clone must
+  re-clone or hard-reset, open PRs need rebasing, and any unpushed work must be
+  replayed. That is a deliberate, coordinated operation — it is intentionally not
+  part of these upgrade steps, and it is not recommended unless the measurement
+  above shows a number worth the disruption. A few hundred MB of static dead
+  weight is usually cheaper to live with than a rewrite.
+
+  If you do rewrite: push everything you care about first, and tell anyone else
+  with a clone before you force-push.
+
+### Notes for forks
+
+The ignore list lives in two places that must stay in step —
+`BUILD_STUDIO_GITIGNORE_PATTERNS` in `lib/onboard.js` (applied when onboarding an
+existing repository) and `templates/default/.gitignore` (applied when scaffolding
+a new one). Adding a pattern to only one leaves half the projects unprotected.
+
+The directory itself is deliberately **not** ignored wholesale, and neither are
+`.md`/`.txt`/`.json`. If you ignore the whole directory you also lose the
+evidence notes, and the AC verifier will still pass because it only checks that
+cited paths exist on disk — so the loss is silent. There is a test pinning both
+halves of this in `onboard.test.js`.
+
+---
+
 ## 2026-08-09 — Human gates are listed before a run, not discovered at the round cap
 
 ### Changed

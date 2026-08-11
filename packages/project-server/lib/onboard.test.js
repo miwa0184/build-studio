@@ -285,7 +285,7 @@ test('onboardProject: appends build-studio runtime patterns to existing .gitigno
 test('onboardProject: idempotent — re-adding patterns already present does not duplicate', async () => {
   const root = makeRepo({
     ...EXAMPLE_APP_SHAPE,
-    '.gitignore': 'node_modules\n.build-studio/workflow-state.json\n.build-studio/snapshots/\ndocs/agent-status.json\nprompt-*.txt\nstart-*.sh\nstart.sh\nTASK.md\ntmp/\n.build-studio/run-state.json\n.build-studio/*.bak*\n.build-studio/local.json\n.build-studio/*-cache.json\n.claude/scheduled_tasks.lock\n.claude/settings.local.json\n',
+    '.gitignore': 'node_modules\n.build-studio/workflow-state.json\n.build-studio/snapshots/\ndocs/agent-status.json\nprompt-*.txt\nstart-*.sh\nstart.sh\nTASK.md\ntmp/\n.build-studio/run-state.json\n.build-studio/*.bak*\n.build-studio/local.json\n.build-studio/*-cache.json\n.claude/scheduled_tasks.lock\n.claude/settings.local.json\ndocs/pr-evidence/**/*.png\ndocs/pr-evidence/**/*.jpg\ndocs/pr-evidence/**/*.jpeg\ndocs/pr-evidence/**/*.gif\ndocs/pr-evidence/**/*.pdf\n',
   });
   try {
     const result = await onboardProject(root, { name: 'desk', port: 3099 });
@@ -316,4 +316,21 @@ test('previewOnboard: refuses with same shape errors as onboardProject', async (
     previewOnboard('/tmp/nope-this-does-not-exist'),
     /does not exist/i
   );
+});
+
+test('onboardProject: gitignores visual evidence but keeps the prose beside it', async () => {
+  // Evidence is a run artifact — the AC verifier checks the working tree, so the
+  // files only need to exist on disk. Committing them is what grew one measured
+  // repository to 1 060 MB of screenshots. The .md/.txt/.json notes stay tracked:
+  // they are small and they are the part that gets read.
+  const root = makeRepo(EXAMPLE_APP_SHAPE);
+  try {
+    await onboardProject(root, { name: 'desk', port: 3098 });
+    const gi = fs.readFileSync(path.join(root, '.gitignore'), 'utf8');
+    for (const ext of ['png', 'jpg', 'jpeg', 'gif', 'pdf']) {
+      assert.ok(gi.includes(`docs/pr-evidence/**/*.${ext}`), `missing ignore for .${ext}`);
+    }
+    assert.ok(!/docs\/pr-evidence\/\*\*\/\*\.md/.test(gi), 'evidence prose must stay tracked');
+    assert.ok(!/^docs\/pr-evidence\/?$/m.test(gi), 'the directory itself must not be ignored wholesale');
+  } finally { clean(root); }
 });

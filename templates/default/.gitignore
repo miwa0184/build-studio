@@ -25,3 +25,14 @@ prompt-*.txt
 # Test runner artifacts
 test-results/
 playwright-report/
+
+# Visual smoke evidence — regenerated per run, kept on disk, never committed.
+# The AC verifier checks the working tree with exists(), so these only need to
+# be present in the worktree that produced them. Screenshots do not
+# delta-compress, so committing them grows history without bound.
+# The prose beside them (.md/.txt/.json) is deliberately still tracked.
+docs/pr-evidence/**/*.png
+docs/pr-evidence/**/*.jpg
+docs/pr-evidence/**/*.jpeg
+docs/pr-evidence/**/*.gif
+docs/pr-evidence/**/*.pdf
