@@ -141,6 +141,25 @@ function deriveNeedsAttention(wf) {
     }
   }
 
+  // 4b. An agent that is ALIVE but will never progress — an expired login, or
+  //     one that finished and never posted its report. The process checks above
+  //     say "healthy", because it is; the watchdog derives this second axis onto
+  //     the agent (agent-stalled.js) and it is surfaced here so every consumer
+  //     sees one answer. Advisory: nothing halts, the owner decides.
+  for (const [key, st] of Object.entries(wf.steps || {})) {
+    for (const a of st.agents || []) {
+      if (a && a.stalled && a.status === 'running') {
+        return {
+          reason: a.stalled.reason,
+          step: key,
+          title: a.stalled.title,
+          detail: `${a.role}: ${a.stalled.detail}`,
+          action: a.stalled.action,
+        };
+      }
+    }
+  }
+
   // 5. A gate that exists to wait for a person. Not a failure — but the run is
   //    stopped and will stay stopped, which is what a caller needs to know.
   //    demo_review is only a gate when the owner has not opted out of it.

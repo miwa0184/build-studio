@@ -192,3 +192,32 @@ test('a capped execution fix loop keeps its own wording', () => {
   assert.match(n.title, /Fix loop/);
   assert.match(n.action, /approve, override, or cancel/);
 });
+
+// ── Alive but not progressing (2026-08-12) ─────────────────────────────────
+// The process checks answer "is it alive?" correctly; this is the second axis.
+
+function wfWithStalled(reason, status = 'running') {
+  return {
+    currentStep: 'reviewing',
+    steps: { reviewing: { status: 'running', agents: [
+      { role: 'Security', status, feedback: null,
+        stalled: { reason, title: 'T', detail: 'D', action: 'A' } },
+    ] } },
+  };
+}
+
+test('a stalled-but-alive agent surfaces as needsAttention', () => {
+  const n = deriveNeedsAttention(wfWithStalled('finished_not_reported'));
+  assert.equal(n.reason, 'finished_not_reported');
+  assert.equal(n.step, 'reviewing');
+  assert.match(n.detail, /^Security: /);   // names WHICH agent
+});
+
+test('auth_blocked surfaces the same way', () => {
+  assert.equal(deriveNeedsAttention(wfWithStalled('auth_blocked')).reason, 'auth_blocked');
+});
+
+test('a stalled marker on an agent that is no longer running is ignored', () => {
+  // Stale state is worse than none — the flag must not outlive the condition.
+  assert.equal(deriveNeedsAttention(wfWithStalled('agent_waiting', 'done')), null);
+});

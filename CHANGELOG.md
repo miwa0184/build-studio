@@ -21,6 +21,45 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-12 — Agents that are alive but stuck now say so
+
+### Added
+
+- **The watchdog now detects agents that are running yet will never finish.**
+  The existing checks ask *is the process alive?* and answer correctly — which
+  is exactly why three failures in one day went unsurfaced. All three left a
+  healthy, repainting process, so the idle-stall timer never fired:
+
+  - an expired CLI login blocked three reviewers for **39 minutes** while the
+    three that had already reported looked fine;
+  - an agent wrote a complete review and stopped without posting it (twice in
+    five days) — the step waits forever for a report that exists but was never
+    sent;
+  - an agent sitting at a prompt with nothing behind it.
+
+  Liveness and progress are different axes. The discriminator is what the pane
+  ends with: a working agent shows a spinner and `esc to interrupt`, a blocked
+  one shows a bare prompt. Three conditions are reported —
+  **`auth_blocked`** (login expired, invalid key, credit or usage limit — fires
+  immediately, since the message is terminal), **`finished_not_reported`** (bare
+  prompt, no feedback, and a recoverable report already in the transcript), and
+  **`agent_waiting`** (bare prompt, nothing recoverable — deliberately the
+  weakest claim, with no automatic action offered).
+
+  Advisory, never a halt: it appears as the same ⏸ banner human gates use, with
+  the remedy stated. A false positive costs a glance; a false halt costs a run.
+
+### Notes for forks
+
+`agent-stalled.js` is pure — pane text in, verdict out — so the rules are
+testable without a tmux session. Two invariants: absence of the *working*
+marker is what indicates waiting (positive evidence of working, rather than
+enumerating every prompt shape), and an unreadable pane returns null, because it
+is not evidence of anything. The marker is cleared when an agent recovers on its
+own; a stale "needs you" is worse than none.
+
+---
+
 ## 2026-08-12 — Re-review rounds verify fixes instead of re-reading the PRD
 
 ### Changed

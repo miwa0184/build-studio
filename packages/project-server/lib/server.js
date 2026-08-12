@@ -420,6 +420,8 @@ function startServer(projectRoot, opts = {}) {
   const AGENT_RESUME_GRACE_MS = 3 * 60 * 1000;  // after firing a resume, let the CLI boot before re-judging
   const AGENT_MAX_AUTO_RESUMES = 2;             // then fall through to the loud halt
   const agentRecovery = require('./agent-recovery');
+  const agentStalled = require('./agent-stalled');
+  const transcriptRecovery = require('./transcript-recovery');
   // Provider usage limits (see lib/limit-block.js). Capped so a limit that keeps
   // re-blocking surfaces instead of being hammered the instant each reset lands.
   const limitBlock = require('./limit-block');
@@ -675,6 +677,41 @@ function startServer(projectRoot, opts = {}) {
               : `Stalled — no log activity for ${Math.round(idleMs / 60000)} minutes (total elapsed ${Math.round(elapsed / 60000)}m). Agent may be stuck (waiting for input, crashed, or context exhausted). Cancel and re-launch.`;
             changed = true;
             console.log(`[workflow] Agent ${agent.role} stalled — log idle for ${Math.round(idleMs / 60000)}m in step ${activeWf.currentStep}`);
+          }
+
+          // ── Alive, but will never progress ────────────────────────────────
+          // The checks above answer "is the process alive?" and answer it
+          // correctly. That is a different axis from "is it making progress":
+          // an agent blocked on an expired login, or one that finished and
+          // never posted its report, stays alive and keeps repainting, so the
+          // idle-stall timer above never fires. Three such failures in one day
+          // went entirely unsurfaced. Read the pane and say so.
+          //
+          // Derived onto the agent, never a halt — the owner decides.
+          if (agent.status === 'running' && !agent.feedback) {
+            try {
+              const stalled = agentStalled.classifyStalledAgent({
+                paneText: tmuxOps.capturePane(target, 40),
+                idleMs,
+                hasFeedback: !!agent.feedback,
+                hasRecoverableReport: !!transcriptRecovery.recoverAgentOutput(agent),
+                waitConfirmMs: AGENT_DEAD_CONFIRM_MS,
+              });
+              if (stalled) {
+                if (agent.stalledReason !== stalled.reason) {
+                  console.warn(`[agent-stalled] ${agent.role} in ${activeWf.currentStep}: ${stalled.reason} — ${stalled.action}`);
+                  changed = true;
+                }
+                agent.stalled = stalled;
+                agent.stalledReason = stalled.reason;
+              } else if (agent.stalledReason) {
+                // It recovered on its own — clear rather than leave a stale
+                // "needs you", which is worse than none.
+                delete agent.stalled;
+                delete agent.stalledReason;
+                changed = true;
+              }
+            } catch (_) { /* advisory — never let detection break the tick */ }
           }
         }
       }
