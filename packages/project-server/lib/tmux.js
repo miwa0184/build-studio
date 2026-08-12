@@ -292,11 +292,17 @@ function createTmuxOps(config) {
  * drawing and section marks that carry meaning here.
  */
 function renderPipePaneLog(str) {
+  // ECMA-48 CSI is `ESC [`, parameter bytes 0x30-0x3F (which include < = > ?),
+  // intermediate bytes 0x20-0x2F (which include $), then a final 0x40-0x7E.
+  // A narrower `[0-9;?]*[a-zA-Z]` misses everything a modern terminal
+  // negotiates — `ESC[>1u`, `ESC[>4;2m`, `ESC[?2026$p`, `ESC[<u` — which then
+  // survives into the rendered log as leading garbage. Two-character escapes
+  // (ESC 7 / ESC 8 save+restore cursor) need their own pass for the same reason.
   return String(str || '')
-    .replace(/\x1b\[[0-9]*[GC]/g, ' ')
-    .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
-    .replace(/\x1b\][^\x07]*\x07/g, '')
-    .replace(/\x1b[=>]/g, '')
+    .replace(/\x1b\[[\x30-\x3F]*[\x20-\x2F]*[GC]/g, ' ')
+    .replace(/\x1b\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]/g, '')
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b[78=>MDEHc]/g, '')
     .split(/[\r\n]+/)
     .map(l => l.replace(/\s+$/, ''))
     .filter(l => l.trim())

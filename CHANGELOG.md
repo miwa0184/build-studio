@@ -33,7 +33,10 @@ that move underneath you without your having edited anything.
   agent's log looked alike because they share a banner and prompt preamble with
   nothing after it delimited. Logs now split on `\r` too, and cursor-column
   escapes become spacing instead of being dropped (which was gluing words
-  together). Unicode is preserved.
+  together). Unicode is preserved, and escape stripping now follows ECMA-48
+  properly — the previous pattern missed every sequence a current terminal
+  negotiates at startup (`ESC[>1u`, `ESC[?2026$p`, `ESC 7`/`ESC 8`), which
+  survived as literal garbage on the first lines of every log.
 
 - **Clicking Log on a completed agent said "No output yet — agent starting…".**
   Exactly backwards: the agent had finished, and the more cleanly a step ran the

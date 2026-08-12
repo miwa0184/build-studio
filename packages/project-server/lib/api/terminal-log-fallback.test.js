@@ -98,3 +98,16 @@ test('stripAnsi is NOT usable here — it deletes the line breaks', () => {
   // every \r-delimited line, which is where the content actually is.
   assert.ok(renderPipePaneLog(RAW).split('\n').length > stripAnsi(RAW).split('\n').length);
 });
+
+test('modern terminal negotiation sequences are stripped, not left as garbage', () => {
+  // A narrower CSI pattern ([0-9;?]*[a-zA-Z]) misses every sequence a current
+  // terminal negotiates on startup, and they surfaced as literal junk at the
+  // top of the log: "78[<u[>1u[>4;2m[>0q[?2026$p".
+  const junk = '\x1b[>1u\x1b[>4;2m\x1b[>0q\x1b[?2026$p\x1b[<u\x1b7\x1b8real text\r';
+  assert.equal(renderPipePaneLog(junk), 'real text');
+});
+
+test('OSC terminated by ST as well as BEL', () => {
+  assert.equal(renderPipePaneLog('\x1b]0;title\x07kept\r'), 'kept');
+  assert.equal(renderPipePaneLog('\x1b]0;title\x1b\\kept\r'), 'kept');
+});
