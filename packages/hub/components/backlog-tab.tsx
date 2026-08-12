@@ -439,10 +439,10 @@ export function BacklogTab({
         </div>
       )}
 
-      {/* Filter-active hint */}
-      {(typeFilter !== 'all' || hideDone || search.length > 0) && (
+      {/* Only search disables reordering — see the dragDisabled comment below. */}
+      {search.length > 0 && (
         <div style={{ fontSize: 10, color: 'var(--muted)', marginTop: -8 }}>
-          Drag-to-reorder disabled while a filter is active — clear filters to reorder.
+          Drag-to-reorder disabled while searching — the visible set changes as you type. Clear the search to reorder.
         </div>
       )}
 
@@ -458,7 +458,20 @@ export function BacklogTab({
           const visibleIds = g.items.filter(id => shouldShow(items[id]))
           if (visibleIds.length === 0 && search) return null
           const isCurrent = /current/i.test(g.release)
-          const dragDisabled = typeFilter !== 'all' || hideDone || search.length > 0
+          // Reordering under a filter is safe, because the reorder never works
+          // on visible indices: onDragEnd resolves BOTH endpoints against the
+          // full `g.items` array and persist() sends the complete group
+          // structure, not a delta. "Move A to where B is" is well-defined
+          // however many rows are hidden between them — with
+          // [A(done), B, C(done), D] and hide-done on, dragging D above B gives
+          // [A, D, B, C], i.e. exactly the visible order asked for. Where the
+          // hidden rows land relative to the moved one is undefined, but the
+          // drag expressed no preference about that.
+          //
+          // Search is the exception and stays disabled: its visible set changes
+          // as you type, so a drag begun under one result set can end under
+          // another — the endpoints are resolved against a list that moved.
+          const dragDisabled = search.length > 0
           return (
             <section key={`${g.release}-${gi}`} style={{ marginTop: 8 }}>
               <div style={{
@@ -561,7 +574,7 @@ export function BacklogTab({
               cursor: dragDisabled ? 'default' : (isDragging ? 'grabbing' : 'grab'),
               userSelect: 'none', touchAction: 'none',
             }}
-            aria-label={dragDisabled ? 'drag disabled while filter active' : 'drag to reorder'}
+            aria-label={dragDisabled ? 'drag disabled while searching' : 'drag to reorder'}
           >⋮⋮</span>
           <button
             onClick={() => onToggle(id)}

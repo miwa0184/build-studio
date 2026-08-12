@@ -21,6 +21,39 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-12 — Reorder the backlog while filtered
+
+### Changed
+
+- **Drag-to-reorder now works with Hide done and the type filters on.** It was
+  disabled whenever any filter was active. That turned out to be caution rather
+  than a constraint: the reorder never works on visible indices — both endpoints
+  are resolved against the full item list and the complete group structure is
+  persisted, not a delta. "Move A to where B is" is well-defined however many
+  rows are hidden between them.
+
+  Verified against a group holding 72 items of which 3 were visible: dragging
+  the last visible item to the top moved it from index 43 to 10, shifted the 33
+  hidden rows it passed by one, kept all 72 ids, and persisted exactly the
+  visible order shown on screen.
+
+  **Search still disables it**, deliberately — its visible set changes as you
+  type, so a drag begun under one result set can end under another. The hint and
+  the drag handle's accessible label now say that instead of the old, broader
+  "while a filter is active".
+
+### Known issues
+
+- **An item still cannot be dropped into a release group with no visible rows.**
+  Nothing registers a release as a drop target — there are no `useDroppable`
+  calls in the tab — so the `overIsRelease` branch in `onDragOver` has never been
+  reachable. This is pre-existing and unchanged, but enabling filtered reordering
+  makes it easier to meet: Hide done can empty a group that previously showed
+  rows. Wiring a release-level droppable would change collision detection for
+  every drag, so it is left as its own change rather than a rider on this one.
+
+---
+
 ## 2026-08-11 — Visual smoke evidence is no longer committed
 
 ### Changed
