@@ -1906,7 +1906,10 @@ ${EFFICIENCY_INSTRUCTIONS}`,
         : '';
 
       // Build feedback history from previous rounds
-      const history = buildFeedbackHistory(wf);
+      // A re-reviewing role gets its OWN findings + PM's fix reports instead of
+      // all six roles' feedback (review-rereview.js). Set per agent, because
+      // every other step still wants the full cross-role history.
+      const history = agent.historyOverride !== undefined ? agent.historyOverride : buildFeedbackHistory(wf);
 
       // Inject known learnings for this role, scored by relevance to current task
       const taskDesc = `${wf.input || ''} ${agent.instruction || ''}`;
@@ -5749,6 +5752,12 @@ Fix only the issues raised. Commit your changes.`,
       // review-wrapup.js was written for, which until now only reached
       // final_review and only past the cap (unreachable in practice).
       const { wrapupActive, buildWrapupBlock, freshLensRounds } = require('../review-wrapup');
+      const { roleHistory, buildRereviewInstruction } = require('../review-rereview');
+      // Round 1 sweeps the whole PRD; rounds 2+ verify that the fixes closed
+      // THIS role's findings. Without the split, every round re-read the entire
+      // document under an instruction to produce only NEW material — which is a
+      // finding generator, and the reason a review could never converge.
+      const rvRereview = (wf.round || 1) > 1;
       const rvThreshold = freshLensRounds(config, MAX_REVIEW_ROUNDS, 'reviewing');
       const rvClosure = wrapupActive(wf.round || 1, rvThreshold, config, 'reviewing')
         ? buildWrapupBlock(wf.round || 1, rvThreshold, 'reviewing')
@@ -5759,7 +5768,10 @@ Fix only the issues raised. Commit your changes.`,
           const agents = reviewRoles.map(r => ({
             role: r.role, window: r.role.toLowerCase().slice(0, 15), status: 'pending',
             feedback: null, reportFeedback: true,
-            instruction: `You are a ${r.role} reviewer. Review this PRD and provide structured feedback from a ${r.role} perspective. Use your /${r.skill} skill.\n\nPRD path: ${wf.prdPath}\n\nRead the PRD file, then analyze it.\n\n## REVIEW FORMAT — MANDATORY\n\nUse this exact format (it is machine-parsed by the dashboard):\n\n## Review: ${r.role}\n\n**Approved:** yes | no\n**Blocking:** N  |  **Medium:** N  |  **Low:** N\n\n### Summary\n[1-3 sentences — overall assessment]\n\n### Findings\n[Details grouped by topic. Mark each: BLOCKING, MEDIUM, or LOW.]\n\n### Action Items\n- [ ] [assignee_role] — description\n\n## REVIEW SCOPE RULES\n\n1. **Only review what the PRD covers.** If the PRD is about landing page polish, do not raise issues about backend storage architecture, payment flows, or other systems outside scope.\n2. **Check the "Out of scope" section** — anything listed there is explicitly excluded. Do not raise issues about excluded items.\n3. **Companion specs are OUT OF SCOPE for this review.** Companion-spec files (UX-XXX, ADRs, copy specs, and anything in docs/ux/, docs/brand/, docs/adrs/, etc.) are written and refined in the dedicated \`companion_specs\` step that runs AFTER this PRD review approves. Do NOT raise BLOCKING findings about missing or incomplete content inside companion-spec files — those gaps will be closed by the spec owner in the next step. If the PRD itself fails to anchor a decision that the companion spec needs, raise it as a NON-BLOCKING action item for the \`companion_specs\` step instead of blocking PRD approval.\n4. **Do not introduce new features.** Your job is to verify the proposed scope is correct and complete, not to expand it.\n5. **After round 2, only raise genuinely new issues.** If your concern was addressed in a previous round, confirm it is resolved — do not re-raise it or raise tangential follow-ups.\n6. **Classify each finding** as BLOCKING (must fix before implementation) or NON-BLOCKING (observation, can fix later). Be conservative with BLOCKING — most issues are non-blocking.\n7. **If you have no issues, set Approved: yes and all counts to 0.** Do not invent concerns to justify your review.\n\nThis is round ${wf.round}.${rvClosure}`,
+            ...(rvRereview ? { historyOverride: roleHistory(wf, r.role) } : {}),
+            instruction: rvRereview
+              ? buildRereviewInstruction(r.role, r.skill, wf.prdPath, wf.round) + rvClosure
+              : `You are a ${r.role} reviewer. Review this PRD and provide structured feedback from a ${r.role} perspective. Use your /${r.skill} skill.\n\nPRD path: ${wf.prdPath}\n\nRead the PRD file, then analyze it.\n\n## REVIEW FORMAT — MANDATORY\n\nUse this exact format (it is machine-parsed by the dashboard):\n\n## Review: ${r.role}\n\n**Approved:** yes | no\n**Blocking:** N  |  **Medium:** N  |  **Low:** N\n\n### Summary\n[1-3 sentences — overall assessment]\n\n### Findings\n[Details grouped by topic. Mark each: BLOCKING, MEDIUM, or LOW.]\n\n### Action Items\n- [ ] [assignee_role] — description\n\n## REVIEW SCOPE RULES\n\n1. **Only review what the PRD covers.** If the PRD is about landing page polish, do not raise issues about backend storage architecture, payment flows, or other systems outside scope.\n2. **Check the "Out of scope" section** — anything listed there is explicitly excluded. Do not raise issues about excluded items.\n3. **Companion specs are OUT OF SCOPE for this review.** Companion-spec files (UX-XXX, ADRs, copy specs, and anything in docs/ux/, docs/brand/, docs/adrs/, etc.) are written and refined in the dedicated \`companion_specs\` step that runs AFTER this PRD review approves. Do NOT raise BLOCKING findings about missing or incomplete content inside companion-spec files — those gaps will be closed by the spec owner in the next step. If the PRD itself fails to anchor a decision that the companion spec needs, raise it as a NON-BLOCKING action item for the \`companion_specs\` step instead of blocking PRD approval.\n4. **Do not introduce new features.** Your job is to verify the proposed scope is correct and complete, not to expand it.\n5. **After round 2, only raise genuinely new issues.** If your concern was addressed in a previous round, confirm it is resolved — do not re-raise it or raise tangential follow-ups.\n6. **Classify each finding** as BLOCKING (must fix before implementation) or NON-BLOCKING (observation, can fix later). Be conservative with BLOCKING — most issues are non-blocking.\n7. **If you have no issues, set Approved: yes and all counts to 0.** Do not invent concerns to justify your review.\n\nThis is round ${wf.round}.${rvClosure}`,
           }));
           launchedAgents = launchWorkflowAgents(wf, agents, { useWorktrees: false });
         } else {

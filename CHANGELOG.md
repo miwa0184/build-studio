@@ -21,6 +21,59 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-12 — Re-review rounds verify fixes instead of re-reading the PRD
+
+### Changed
+
+- **From round 2, PRD reviewers verify their own prior findings rather than
+  sweeping the document again.** Until now the reviewing instruction was
+  byte-identical every round — *"Read the PRD file, then analyze it"* — with no
+  diff and no changed-section scoping. The only round-awareness was a rule
+  saying *"after round 2, only raise genuinely new issues"*.
+
+  That combination is a finding generator, not a review: a round-3 reviewer
+  opens the whole PRD, is told the only acceptable output is NEW material, and
+  has a fresh lens to apply. On a real run a reviewer reported "the round-2
+  blocker is resolved" and then raised three findings from a surface no earlier
+  round had touched. It did what it was asked.
+
+  Rounds 2+ now get a targeted contract: locate the fix for each of your prior
+  findings and mark it CLOSED / NOT CLOSED / REGRESSED; read the sections the
+  fixes touched; do not re-assess sections no fix touched and you did not
+  previously flag. An unclosed finding or a regression **still blocks** — what
+  is ruled out is treating an already-reviewed document as unread.
+
+  `code_review` has worked this way for implementation review since it was
+  written ("do not re-audit code that was already approved in round 1"); PRD
+  review simply never got the same treatment.
+
+- **A re-reviewing role now sees only its own prior findings, plus PM's fix
+  reports.** The shared history handed all six roles' feedback to every
+  reviewer, which was the bulk of the prompt and invited anchoring — Brand
+  reading Architect's blocking finding before forming its own view. PM's fix
+  report is always included, because it is the claim being verified. Every other
+  step keeps the full cross-role history.
+
+### Upgrade steps
+
+**In Build Studio** — sync and restart:
+
+```bash
+cd packages/desktop && node inject-resources.js --sync-only
+```
+
+**In each managed project** — nothing to do.
+
+### Notes for forks
+
+This narrows what a re-review LOOKS at; closure mode (above) changes what
+happens to findings that still surface. They are complementary and a run wants
+both — verification first, and a contract for the residue. Per-agent history is
+overridden through `agent.historyOverride`; leave it unset and the agent gets
+the shared cross-role history as before.
+
+---
+
 ## 2026-08-12 — PRD review converges on its own
 
 ### Changed
