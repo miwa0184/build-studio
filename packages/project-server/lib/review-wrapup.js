@@ -20,20 +20,65 @@
  * Opt-out: config `final_review.wrapup_past_cap: false`.
  */
 
-/** Is wrap-up mode active for this round? */
-function wrapupActive(round, maxRounds, config) {
-  if (config && config.final_review && config.final_review.wrapup_past_cap === false) return false;
-  if (!Number.isFinite(round) || !Number.isFinite(maxRounds)) return false;
-  return round > maxRounds;
+/**
+ * How many rounds a step may sweep with fresh lenses before the contract
+ * switches to closure.
+ *
+ * `final_review` keeps its original trigger — the round cap — because that flow
+ * reviews an implementation and its early rounds find real defects.
+ *
+ * `reviewing` (PRD review) gets its own, much lower threshold. Tying it to the
+ * cap made the mode unreachable in practice: with a cap of 5 it could not
+ * engage until round 6, so a run generating fresh lenses from round 3 spent
+ * three more full six-agent rounds before anything changed. Two sweeps is where
+ * the real defects surface; past that the reviewers are exploring, not finding.
+ *
+ * Config: `review.fresh_lens_rounds` (default 2). Set high to disable.
+ */
+function freshLensRounds(config, maxRounds, step) {
+  if (step === 'reviewing') {
+    const n = config && config.review && config.review.fresh_lens_rounds;
+    return Number.isFinite(n) ? n : 2;
+  }
+  return maxRounds;
+}
+
+/**
+ * Is wrap-up mode active for this round?
+ *
+ * @param {number} round
+ * @param {number} threshold  rounds allowed to sweep freely (see freshLensRounds)
+ * @param {object} config
+ * @param {string} [step]     which flow — selects the opt-out key
+ */
+function wrapupActive(round, threshold, config, step) {
+  // Opt-outs are per-flow: an owner who wants unbounded PRD review should not
+  // have to give up closure on final_review to get it.
+  if (step === 'reviewing') {
+    if (config && config.review && config.review.wrapup === false) return false;
+  } else if (config && config.final_review && config.final_review.wrapup_past_cap === false) {
+    return false;
+  }
+  if (!Number.isFinite(round) || !Number.isFinite(threshold)) return false;
+  return round > threshold;
 }
 
 /** The instruction block appended to the final_review agent prompt. */
-function buildWrapupBlock(round, maxRounds) {
+function buildWrapupBlock(round, threshold, step) {
+  // The heading has to be TRUE for the flow it lands in. Telling a round-3 PRD
+  // reviewer it is "past the owner-approved cap" is false, and a reviewer who
+  // catches the prompt lying to it has every reason to discount the rest.
+  const header = step === 'reviewing'
+    ? `## CLOSURE MODE — THE FRESH-LENS ROUNDS ARE DONE (round ${round}; first ${threshold} rounds sweep freely)`
+    : `## WRAP-UP MODE — THIS ROUND IS PAST THE OWNER-APPROVED REVIEW CAP (round ${round}, cap ${threshold})`;
+  const preamble = step === 'reviewing'
+    ? `The first ${threshold} rounds existed to sweep this document with fresh lenses, and they have run. Your job this round is CLOSURE, not fresh discovery — every previously flagged finding has been through a PM fix round. The bar for BLOCKING changes in this round:`
+    : `The owner explicitly chose to continue past the round cap. Your job this round is CLOSURE, not fresh discovery — this change has already been through ${threshold}+ full review rounds and every previously flagged finding has a landed, verified fix. The bar for BLOCKING changes in this round:`;
   return `
 
-## WRAP-UP MODE — THIS ROUND IS PAST THE OWNER-APPROVED REVIEW CAP (round ${round}, cap ${maxRounds})
+${header}
 
-The owner explicitly chose to continue past the round cap. Your job this round is CLOSURE, not fresh discovery — this change has already been through ${maxRounds}+ full review rounds and every previously flagged finding has a landed, verified fix. The bar for BLOCKING changes in this round:
+${preamble}
 
 **May still block (Approved: no):**
 - A REGRESSION — a fix round broke something that previously worked.
@@ -50,9 +95,9 @@ Report the follow-ups under this exact heading so the owner can file them as bac
 ### Follow-up proposals (file as backlog items)
 - [severity] <short title> — <one sentence: what + where (file:line)>
 
-State \`**Mode:** wrap-up (round ${round}, cap ${maxRounds})\` directly under the Approved/Blocking lines.
+State \`**Mode:** ${step === 'reviewing' ? `closure (round ${round}, fresh-lens rounds ${threshold})` : `wrap-up (round ${round}, cap ${threshold})`}\` directly under the Approved/Blocking lines.
 
 An **Approved: yes** carrying a rich follow-up list is the DESIGNED good outcome of a wrap-up round — it is not a rubber stamp, and nothing in that list is lost by approving: the owner files every proposal as a tracked backlog item.`;
 }
 
-module.exports = { wrapupActive, buildWrapupBlock };
+module.exports = { wrapupActive, buildWrapupBlock, freshLensRounds };

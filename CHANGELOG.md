@@ -21,6 +21,58 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-12 — PRD review converges on its own
+
+### Changed
+
+- **After two review rounds, reviewers switch from discovery to closure.** A PRD
+  review that keeps surfacing genuinely new material each round is progressing
+  yet can never approve — the reviewers' "fresh angle each round" method is an
+  unbounded lens generator, so round 3 raises three new blockers, round 4 raises
+  three more, and the run only stops at the cap with an owner reading six agent
+  transcripts to decide which findings were real.
+
+  From round 3 (configurable), the finding **contract** changes. Still blocking:
+  a regression, an incomplete fix citing a specific earlier finding, or a newly
+  found defect causing data loss, security exposure or corruption. No longer
+  blocking: anything from sweeping an angle no previous round examined, missing
+  tests for behaviour verified correct by other means, and polish or spec-letter
+  divergence without user-facing harm. Those are reported under a
+  **Follow-up proposals** heading to file as backlog items.
+
+  `Approved: yes` with a rich follow-up list is the designed good outcome —
+  nothing is lost, it moves from blocking the run to being tracked work.
+
+  This machinery already existed (`review-wrapup.js`) but reached only
+  `final_review`, and only past the round cap — which made it unreachable in
+  practice: with a cap of 5 it could not engage until round 6, three full
+  six-agent rounds after the problem starts.
+
+### Upgrade steps
+
+**In Build Studio** — sync and restart:
+
+```bash
+cd packages/desktop && node inject-resources.js --sync-only
+```
+
+**In each managed project** — nothing to do. Defaults apply; tune per project
+with `review.fresh_lens_rounds: N` in `.build-studio/config.yaml` (default 2 —
+raise for deeper review, set high to disable), or `review.wrapup: false` to opt
+out entirely. `final_review` is untouched and keeps its own cap-based trigger
+and its own `final_review.wrapup_past_cap` opt-out.
+
+### Notes for forks
+
+The two flows now have separate thresholds and separate opt-outs on purpose: an
+owner who wants unbounded PRD review should not have to give up closure on
+`final_review` to get it. `buildWrapupBlock` also takes the flow, because the
+heading has to be true for the round it lands in — telling a round-3 PRD
+reviewer it is "past the owner-approved cap" is false, and a reviewer that
+catches the prompt lying has every reason to discount the rest of it.
+
+---
+
 ## 2026-08-12 — A finished agent's log is readable again
 
 ### Fixed

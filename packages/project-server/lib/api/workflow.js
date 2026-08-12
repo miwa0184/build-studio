@@ -2272,7 +2272,7 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
   }
 
   // --- Orchestrator/Sequential review mode ---
-  function launchOrchestratorReview(wf, reviewRoles, prdPath, feedbackDir) {
+  function launchOrchestratorReview(wf, reviewRoles, prdPath, feedbackDir, closureBlock = '') {
     const mode = wf.reviewMode || config.review_mode || 'parallel';
     fs.mkdirSync(feedbackDir, { recursive: true });
 
@@ -2287,10 +2287,10 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     const companionScopeNote = `\n\n## SCOPE NOTE — pass this to every subagent/perspective\n\nCompanion-spec files (UX-XXX, ADRs, copy specs, anything in docs/ux/, docs/brand/, docs/adrs/, etc.) are written and refined in the dedicated \`companion_specs\` step that runs AFTER this PRD review approves. Reviewers must NOT raise BLOCKING findings about missing or incomplete content inside companion-spec files — those gaps will be closed by the spec owner in the next step. Surface them as NON-BLOCKING action items targeted at the \`companion_specs\` step.`;
     let instruction;
     if (mode === 'orchestrator') {
-      instruction = `You are a review orchestrator. ${docRef}\n\nLaunch parallel subagents (using the Agent tool) for each reviewer role below. Each subagent should read its role command file, review the document, and write structured feedback to its feedback file.\n\nRoles:\n${roleList}${companionScopeNote}\n\nAfter all subagents complete, report a summary of all feedback via curl:\ncurl -s -X POST http://localhost:${config.port}/api/workflow/feedback -H 'Content-Type: application/json' -d '{"role":"Orchestrator","step":"${wf.currentStep}","feedback":"<combined summary of all role feedback>"}'`;
+      instruction = `You are a review orchestrator. ${docRef}\n\nLaunch parallel subagents (using the Agent tool) for each reviewer role below. Each subagent should read its role command file, review the document, and write structured feedback to its feedback file.\n\nRoles:\n${roleList}${companionScopeNote}\n\nAfter all subagents complete, report a summary of all feedback via curl:\ncurl -s -X POST http://localhost:${config.port}/api/workflow/feedback -H 'Content-Type: application/json' -d '{"role":"Orchestrator","step":"${wf.currentStep}","feedback":"<combined summary of all role feedback>"}'${closureBlock}`;
     } else {
       // Sequential mode
-      instruction = `You are reviewing a document from multiple perspectives. ${docRef}\n\nFor EACH role below, in order:\n1. Read the role command file at .claude/commands/<command>\n2. Review the document from that role's perspective\n3. Write structured feedback to the specified file\n\nRoles:\n${roleList}${companionScopeNote}\n\nAfter completing all reviews, report a combined summary via curl:\ncurl -s -X POST http://localhost:${config.port}/api/workflow/feedback -H 'Content-Type: application/json' -d '{"role":"Reviewer","step":"${wf.currentStep}","feedback":"<combined summary of all role feedback>"}'`;
+      instruction = `You are reviewing a document from multiple perspectives. ${docRef}\n\nFor EACH role below, in order:\n1. Read the role command file at .claude/commands/<command>\n2. Review the document from that role's perspective\n3. Write structured feedback to the specified file\n\nRoles:\n${roleList}${companionScopeNote}\n\nAfter completing all reviews, report a combined summary via curl:\ncurl -s -X POST http://localhost:${config.port}/api/workflow/feedback -H 'Content-Type: application/json' -d '{"role":"Reviewer","step":"${wf.currentStep}","feedback":"<combined summary of all role feedback>"}'${closureBlock}`;
     }
 
     const agent = [{
@@ -5740,18 +5740,31 @@ Fix only the issues raised. Commit your changes.`,
       wf.currentStep = 'reviewing';
       const reviewRoles = (config.roles.review || []);
       const mode = wf.reviewMode || config.review_mode || 'parallel';
+      // Closure mode: after the fresh-lens rounds, the finding CONTRACT changes
+      // so the loop can converge without an owner adjudicating six transcripts.
+      // Fresh-lens discoveries become filed follow-up proposals; regressions,
+      // incomplete fixes and critical defects still block. Without this, a PRD
+      // review that keeps surfacing NEW material each round is genuinely
+      // progressing yet can never approve — the same unbounded-lens failure
+      // review-wrapup.js was written for, which until now only reached
+      // final_review and only past the cap (unreachable in practice).
+      const { wrapupActive, buildWrapupBlock, freshLensRounds } = require('../review-wrapup');
+      const rvThreshold = freshLensRounds(config, MAX_REVIEW_ROUNDS, 'reviewing');
+      const rvClosure = wrapupActive(wf.round || 1, rvThreshold, config, 'reviewing')
+        ? buildWrapupBlock(wf.round || 1, rvThreshold, 'reviewing')
+        : '';
       let launchedAgents;
       try {
         if (mode === 'parallel') {
           const agents = reviewRoles.map(r => ({
             role: r.role, window: r.role.toLowerCase().slice(0, 15), status: 'pending',
             feedback: null, reportFeedback: true,
-            instruction: `You are a ${r.role} reviewer. Review this PRD and provide structured feedback from a ${r.role} perspective. Use your /${r.skill} skill.\n\nPRD path: ${wf.prdPath}\n\nRead the PRD file, then analyze it.\n\n## REVIEW FORMAT — MANDATORY\n\nUse this exact format (it is machine-parsed by the dashboard):\n\n## Review: ${r.role}\n\n**Approved:** yes | no\n**Blocking:** N  |  **Medium:** N  |  **Low:** N\n\n### Summary\n[1-3 sentences — overall assessment]\n\n### Findings\n[Details grouped by topic. Mark each: BLOCKING, MEDIUM, or LOW.]\n\n### Action Items\n- [ ] [assignee_role] — description\n\n## REVIEW SCOPE RULES\n\n1. **Only review what the PRD covers.** If the PRD is about landing page polish, do not raise issues about backend storage architecture, payment flows, or other systems outside scope.\n2. **Check the "Out of scope" section** — anything listed there is explicitly excluded. Do not raise issues about excluded items.\n3. **Companion specs are OUT OF SCOPE for this review.** Companion-spec files (UX-XXX, ADRs, copy specs, and anything in docs/ux/, docs/brand/, docs/adrs/, etc.) are written and refined in the dedicated \`companion_specs\` step that runs AFTER this PRD review approves. Do NOT raise BLOCKING findings about missing or incomplete content inside companion-spec files — those gaps will be closed by the spec owner in the next step. If the PRD itself fails to anchor a decision that the companion spec needs, raise it as a NON-BLOCKING action item for the \`companion_specs\` step instead of blocking PRD approval.\n4. **Do not introduce new features.** Your job is to verify the proposed scope is correct and complete, not to expand it.\n5. **After round 2, only raise genuinely new issues.** If your concern was addressed in a previous round, confirm it is resolved — do not re-raise it or raise tangential follow-ups.\n6. **Classify each finding** as BLOCKING (must fix before implementation) or NON-BLOCKING (observation, can fix later). Be conservative with BLOCKING — most issues are non-blocking.\n7. **If you have no issues, set Approved: yes and all counts to 0.** Do not invent concerns to justify your review.\n\nThis is round ${wf.round}.`,
+            instruction: `You are a ${r.role} reviewer. Review this PRD and provide structured feedback from a ${r.role} perspective. Use your /${r.skill} skill.\n\nPRD path: ${wf.prdPath}\n\nRead the PRD file, then analyze it.\n\n## REVIEW FORMAT — MANDATORY\n\nUse this exact format (it is machine-parsed by the dashboard):\n\n## Review: ${r.role}\n\n**Approved:** yes | no\n**Blocking:** N  |  **Medium:** N  |  **Low:** N\n\n### Summary\n[1-3 sentences — overall assessment]\n\n### Findings\n[Details grouped by topic. Mark each: BLOCKING, MEDIUM, or LOW.]\n\n### Action Items\n- [ ] [assignee_role] — description\n\n## REVIEW SCOPE RULES\n\n1. **Only review what the PRD covers.** If the PRD is about landing page polish, do not raise issues about backend storage architecture, payment flows, or other systems outside scope.\n2. **Check the "Out of scope" section** — anything listed there is explicitly excluded. Do not raise issues about excluded items.\n3. **Companion specs are OUT OF SCOPE for this review.** Companion-spec files (UX-XXX, ADRs, copy specs, and anything in docs/ux/, docs/brand/, docs/adrs/, etc.) are written and refined in the dedicated \`companion_specs\` step that runs AFTER this PRD review approves. Do NOT raise BLOCKING findings about missing or incomplete content inside companion-spec files — those gaps will be closed by the spec owner in the next step. If the PRD itself fails to anchor a decision that the companion spec needs, raise it as a NON-BLOCKING action item for the \`companion_specs\` step instead of blocking PRD approval.\n4. **Do not introduce new features.** Your job is to verify the proposed scope is correct and complete, not to expand it.\n5. **After round 2, only raise genuinely new issues.** If your concern was addressed in a previous round, confirm it is resolved — do not re-raise it or raise tangential follow-ups.\n6. **Classify each finding** as BLOCKING (must fix before implementation) or NON-BLOCKING (observation, can fix later). Be conservative with BLOCKING — most issues are non-blocking.\n7. **If you have no issues, set Approved: yes and all counts to 0.** Do not invent concerns to justify your review.\n\nThis is round ${wf.round}.${rvClosure}`,
           }));
           launchedAgents = launchWorkflowAgents(wf, agents, { useWorktrees: false });
         } else {
           const feedbackDir = path.join(config.tmpPath, 'reviews');
-          launchedAgents = launchOrchestratorReview(wf, reviewRoles, wf.prdPath, feedbackDir);
+          launchedAgents = launchOrchestratorReview(wf, reviewRoles, wf.prdPath, feedbackDir, rvClosure);
         }
         wf.steps.reviewing = { status: 'running', agents: launchedAgents };
       } catch (e) {
@@ -8039,7 +8052,7 @@ This is round ${wf.round}.`,
       // switch the contract to closure (regressions/incomplete fixes block;
       // new-lens discoveries file as follow-up proposals). lib/review-wrapup.js.
       const { wrapupActive, buildWrapupBlock } = require('../review-wrapup');
-      const frWrapup = wrapupActive(wf.round || 1, MAX_REVIEW_ROUNDS, config);
+      const frWrapup = wrapupActive(wf.round || 1, MAX_REVIEW_ROUNDS, config, 'final_review');
       if (frWrapup) console.log(`[workflow] final_review launching in WRAP-UP mode (round ${wf.round}, cap ${MAX_REVIEW_ROUNDS})`);
       const frAgent = [{
         role: 'Final Reviewer', window: 'final-review', status: 'pending', reportFeedback: true,
@@ -8083,7 +8096,7 @@ Review the change for this PRD. Do not raise pre-existing issues outside the PRD
 ### Action Items
 - [ ] [role] — description
 
-Set **Approved: no** with **Blocking: N** when any BLOCKING finding exists; those route into the fix loop. Otherwise **Approved: yes**, **Blocking: 0** (Medium/Low are recorded but do not block).${frWrapup ? buildWrapupBlock(wf.round || 1, MAX_REVIEW_ROUNDS) : ''}`,
+Set **Approved: no** with **Blocking: N** when any BLOCKING finding exists; those route into the fix loop. Otherwise **Approved: yes**, **Blocking: 0** (Medium/Low are recorded but do not block).${frWrapup ? buildWrapupBlock(wf.round || 1, MAX_REVIEW_ROUNDS, 'final_review') : ''}`,
       }];
       wf.steps.final_review = { status: 'running', agents: launchWorkflowAgents(wf, frAgent, { useWorktrees: false, cwd: projectRoot }) };
       if (frWrapup) wf.steps.final_review.wrapupMode = true;
