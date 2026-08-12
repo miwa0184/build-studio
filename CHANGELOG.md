@@ -25,6 +25,16 @@ that move underneath you without your having edited anything.
 
 ### Fixed
 
+- **A completed agent's log rendered as one unreadable blob.** The fallback
+  below reads the `pipe-pane` file, which is the raw byte stream a TUI wrote —
+  not the rendered terminal `capture-pane` returns. In that stream `\r` is the
+  line break: one real 52 KB agent log contained **two** `\n` bytes total. Split
+  on `\n` it became ~3 "lines", i.e. the whole file run together, and every
+  agent's log looked alike because they share a banner and prompt preamble with
+  nothing after it delimited. Logs now split on `\r` too, and cursor-column
+  escapes become spacing instead of being dropped (which was gluing words
+  together). Unicode is preserved.
+
 - **Clicking Log on a completed agent said "No output yet — agent starting…".**
   Exactly backwards: the agent had finished, and the more cleanly a step ran the
   less of it you could see. An agent's tmux window is reaped the moment it

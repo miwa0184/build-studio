@@ -1,7 +1,7 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const { stripAnsi } = require('../tmux');
+const { stripAnsi, renderPipePaneLog } = require('../tmux');
 
 /**
  * Resolve a role name or tmux window name to the live tmux target of an
@@ -89,7 +89,9 @@ function createTerminalRouter(config, state, tmuxOps) {
     try {
       const file = path.join(config.logsPath, `${agent.window}-${wf.id}.log`);
       const text = fs.readFileSync(file, 'utf8');
-      const tail = stripAnsi(text).split('\n').slice(-lines).join('\n');
+      // renderPipePaneLog, NOT stripAnsi: this is the raw stream, where \r is
+      // the line break and stripAnsi deletes it (see tmux.js).
+      const tail = renderPipePaneLog(text).split('\n').slice(-lines).join('\n');
       return res.json({ log: tail, source: 'file' });
     } catch (_) {
       return res.json({ log: live || '', source: 'pane' });

@@ -58,3 +58,43 @@ test('no pane and no file degrades to empty rather than throwing', () => {
   const r = callRoute({ paneOutput: '', logsPath: path.join(os.tmpdir(), 'does-not-exist-'+Date.now()) });
   assert.equal(r.log, '');
 });
+
+// ── Raw pipe-pane stream rendering ──────────────────────────────────────────
+const { renderPipePaneLog } = require('../tmux');
+
+// A pipe-pane FILE is the raw stream a TUI wrote: \r is the line break and
+// cursor-column escapes carry the spacing. A 52 KB real log held TWO \n bytes,
+// so splitting on \n returned the whole file as one blob — which is what a
+// reader sees as "confusing", and why every agent's log looked alike.
+const RAW = '\x1b[?25lbanner\rline one\x1b[12Gtail\rline two\r\n\x1b[32mline three\x1b[0m\r';
+
+test('a raw stream splits on CR, not just LF', () => {
+  const out = renderPipePaneLog(RAW).split('\n');
+  assert.ok(out.length >= 4, `expected several lines, got ${out.length}`);
+  assert.ok(out.includes('line two'));
+  assert.ok(out.includes('line three'));
+});
+
+test('cursor-column escapes become spacing instead of running words together', () => {
+  // \x1b[12G positions the cursor — dropping it silently glues "one" to "tail".
+  assert.match(renderPipePaneLog(RAW), /line one\s+tail/);
+});
+
+test('escape sequences and empty lines are removed', () => {
+  const out = renderPipePaneLog(RAW);
+  assert.doesNotMatch(out, /\x1b/);
+  assert.ok(!out.split('\n').some(l => !l.trim()));
+});
+
+test('unicode survives — the agent UI carries meaning in it', () => {
+  // stripAnsi() drops non-ASCII; this renderer must not.
+  assert.match(renderPipePaneLog('⏺ Review: Brand §2.4\r'), /⏺ Review: Brand §2\.4/);
+});
+
+test('stripAnsi is NOT usable here — it deletes the line breaks', () => {
+  // Pins WHY a separate function exists, so nobody merges them back.
+  const { stripAnsi } = require('../tmux');
+  // stripAnsi keeps only the one real \n in the fixture; the renderer recovers
+  // every \r-delimited line, which is where the content actually is.
+  assert.ok(renderPipePaneLog(RAW).split('\n').length > stripAnsi(RAW).split('\n').length);
+});

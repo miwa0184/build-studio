@@ -270,6 +270,39 @@ function createTmuxOps(config) {
   };
 }
 
+/**
+ * Render a `pipe-pane` log file into readable lines.
+ *
+ * NOT the same problem as stripAnsi(). `capture-pane` hands back a terminal
+ * that tmux has already rendered — rows separated by \n, spacing materialised.
+ * A pipe-pane FILE is the raw byte stream the terminal received: a TUI moves
+ * the cursor instead of emitting newlines, so a 52 KB log can contain **two**
+ * \n characters. Splitting it on \n therefore yields ~3 "lines", i.e. the whole
+ * file as one run-together blob — which is what a reader sees as "confusing",
+ * and why every agent's log looks alike (they share the same banner and prompt
+ * preamble, and nothing after it is delimited).
+ *
+ * Two rules recover it:
+ *  - split on \r as well as \n — \r is the line break in this stream;
+ *  - turn cursor-column / cursor-forward escapes (CSI n G, CSI n C) into a
+ *    space BEFORE stripping, because in a TUI those carry the horizontal
+ *    spacing that would otherwise be lost, running words together.
+ *
+ * Unicode is preserved (stripAnsi drops it): the agent UI is full of box
+ * drawing and section marks that carry meaning here.
+ */
+function renderPipePaneLog(str) {
+  return String(str || '')
+    .replace(/\x1b\[[0-9]*[GC]/g, ' ')
+    .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
+    .replace(/\x1b\][^\x07]*\x07/g, '')
+    .replace(/\x1b[=>]/g, '')
+    .split(/[\r\n]+/)
+    .map(l => l.replace(/\s+$/, ''))
+    .filter(l => l.trim())
+    .join('\n');
+}
+
 function stripAnsi(str) {
   return str
     .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
@@ -279,4 +312,5 @@ function stripAnsi(str) {
     .split('\n').filter(l => l.trim()).join('\n');
 }
 
-module.exports = { createTmuxOps, stripAnsi };
+module.exports = {
+  renderPipePaneLog, createTmuxOps, stripAnsi };

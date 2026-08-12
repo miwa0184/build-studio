@@ -3,7 +3,7 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const { stripAnsi } = require('../tmux');
+const { stripAnsi, renderPipePaneLog } = require('../tmux');
 const opencodeTelemetry = require('../opencode-telemetry');
 const { transitionFeaturesForPRD, parseBacklogSection, writeBacklogSection, readItem, isValidId, writeItem } = require('../backlog');
 const { deriveNeedsAttention } = require('../needs-attention');
@@ -3879,7 +3879,7 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     try {
       const file = path.join(logsPath, `${window}-${wf.id}.log`);
       const text = fs.readFileSync(file, 'utf8');
-      const tail = stripAnsi(text).split('\n').slice(-lines).join('\n');
+      const tail = renderPipePaneLog(text).split('\n').slice(-lines).join('\n');
       return res.json({ log: tail, source: 'file' });
     } catch (_) {
       return res.json({ log: live || '', source: 'pane' });
