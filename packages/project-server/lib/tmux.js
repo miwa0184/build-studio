@@ -291,6 +291,8 @@ function createTmuxOps(config) {
  * Unicode is preserved (stripAnsi drops it): the agent UI is full of box
  * drawing and section marks that carry meaning here.
  */
+const SPINNER_GLYPHS = /[\u2732\u273B\u2736\u2733\u2722\u00B7\u23FA\u25D0\u25D3\u25D1\u25D2\u2026]/g;
+
 function renderPipePaneLog(str) {
   // ECMA-48 CSI is `ESC [`, parameter bytes 0x30-0x3F (which include < = > ?),
   // intermediate bytes 0x20-0x2F (which include $), then a final 0x40-0x7E.
@@ -306,6 +308,22 @@ function renderPipePaneLog(str) {
     .split(/[\r\n]+/)
     .map(l => l.replace(/\s+$/, ''))
     .filter(l => l.trim())
+    // Drop spinner frames. The CLI animates a status line in place, so every
+    // repaint becomes its own \r-delimited "line" — on a real review log that
+    // was 462 of 839 lines, and because the status text is drawn with cursor
+    // moves the fragments come out as vertical slices ("✽ u n" / " r i").
+    // Deliberately narrow: a line goes only if it is nothing but spinner glyphs,
+    // or a glyph plus a 1-3 character slice. Real short lines (" IDs.",
+    // "- [ ] (none)") are longer than that and survive.
+    .filter((l) => {
+      if (l.replace(SPINNER_GLYPHS, '').trim() === '') return false;   // glyphs only
+      // A vertical slice is a run of SINGLE-character tokens ("✶ P u 7"): the
+      // status text is drawn column by column, so splitting on \r cuts it into
+      // one-char columns. Real lines always carry at least one multi-char word
+      // (" IDs.", "- [ ] (none)"), so they are untouched.
+      const tok = l.trim().split(/\s+/);
+      return !(tok.length <= 6 && tok.every((t) => t.length === 1));
+    })
     .join('\n');
 }
 

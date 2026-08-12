@@ -111,3 +111,18 @@ test('OSC terminated by ST as well as BEL', () => {
   assert.equal(renderPipePaneLog('\x1b]0;title\x07kept\r'), 'kept');
   assert.equal(renderPipePaneLog('\x1b]0;title\x1b\\kept\r'), 'kept');
 });
+
+test('spinner frames are dropped, real short lines are not', () => {
+  // The CLI animates a status line in place, so every repaint becomes its own
+  // \r-delimited line — 462 of 839 on a real review log — and because the text
+  // is drawn column by column the fragments arrive as vertical slices.
+  const keep = ['⏺ Real content here', '  IDs.', '- [ ] (none)', '## Review: Brand', '✳ 10s · ↓ 3.7k tokens)'];
+  const drop = ['✽ u n', '  r i', '✻', '✶ P u 7', '✢ g', '· e', ' P'];
+  const out = renderPipePaneLog([...keep, ...drop].join('\r')).split('\n');
+  for (const k of keep) assert.ok(out.includes(k), `dropped real line: ${k}`);
+  for (const d of drop) assert.ok(!out.includes(d), `kept noise: ${d}`);
+});
+
+test('a line of glyphs alone is dropped even without the slice rule', () => {
+  assert.equal(renderPipePaneLog('✻\r✶\r·\r'), '');
+});
