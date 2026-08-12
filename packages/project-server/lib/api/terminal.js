@@ -1,4 +1,6 @@
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 const { stripAnsi } = require('../tmux');
 
 /**
@@ -71,7 +73,27 @@ function createTerminalRouter(config, state, tmuxOps) {
 
     if (!agent || !agent.window) return res.json({ log: '' });
     const target = `${wf.sessionName}:${agent.window}`;
-    res.json({ log: stripAnsi(tmuxOps.capturePane(target, lines)) });
+    const live = stripAnsi(tmuxOps.capturePane(target, lines));
+    if (live && live.trim()) return res.json({ log: live, source: 'pane' });
+
+    // The pane is gone — reaped as soon as the agent reported, or lost with the
+    // session. This endpoint used to stop here and return '', which the hub
+    // renders as "No output yet — agent starting..." — so a FINISHED agent's
+    // log read as one that had never begun, and the more successfully a step
+    // ran the less of it you could see. pipe-pane has been streaming to disk
+    // all along, so read the tail of that instead.
+    //
+    // `/workflow/log` already had this fallback; this route did not, and the
+    // hub calls THIS one. Any future log route needs the same treatment — the
+    // pane is the live view, the file is the record.
+    try {
+      const file = path.join(config.logsPath, `${agent.window}-${wf.id}.log`);
+      const text = fs.readFileSync(file, 'utf8');
+      const tail = stripAnsi(text).split('\n').slice(-lines).join('\n');
+      return res.json({ log: tail, source: 'file' });
+    } catch (_) {
+      return res.json({ log: live || '', source: 'pane' });
+    }
   });
 
   // Workflow message sending

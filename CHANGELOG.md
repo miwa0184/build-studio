@@ -21,6 +21,29 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-12 — A finished agent's log is readable again
+
+### Fixed
+
+- **Clicking Log on a completed agent said "No output yet — agent starting…".**
+  Exactly backwards: the agent had finished, and the more cleanly a step ran the
+  less of it you could see. An agent's tmux window is reaped the moment it
+  reports, so the pane is empty from then on — and the route the hub calls,
+  `GET /terminal/workflow/:role`, read only the pane and returned `''` when it
+  was gone.
+
+  It now falls back to the log file, which `pipe-pane` has been streaming to
+  disk all along. A sibling route (`/workflow/log`) already had this fallback;
+  this one did not, and the hub calls this one.
+
+### Notes for forks
+
+The pane is the live view; the file is the record. Any route serving agent
+output needs both — reading only the pane silently loses every agent that has
+already finished, which is the majority of them at any given moment.
+
+---
+
 ## 2026-08-12 — Reorder the backlog while filtered
 
 ### Changed
