@@ -1,5 +1,19 @@
 # Plan: treat PR evidence as a run artifact, not a source artifact
 
+> **Status: parts 1 and 2 implemented 2026-08-12; part 3 PARKED 2026-08-15.**
+> The ignore rule and the untracking landed here and in every managed project.
+> Four days later the growth is confirmed stopped — zero tracked evidence
+> binaries anywhere, and no commit has touched evidence since the untracking
+> commit itself, across several runs. `.git` is unchanged (1.5 GB and 206 MB in
+> the two worst cases), exactly as predicted.
+>
+> **Owner decision: do not rewrite history.** ~1 GB reclaimed against rewriting
+> every commit id in two repositories under active terminal work, plus re-clones
+> and rebases for anything in flight. Static dead weight is cheap; the
+> compounding was the problem and it is fixed. Revisit only if a hosting limit
+> or a clone time actually starts to hurt — and pick a moment with no work in
+> flight in those repos.
+>
 > **Status: proposed 2026-08-11.** Measured across the managed projects; the
 > verifier compatibility question below is answered, the history-rewrite half is
 > deliberately deferred.
