@@ -221,3 +221,19 @@ test('a stalled marker on an agent that is no longer running is ignored', () => 
   // Stale state is worse than none — the flag must not outlive the condition.
   assert.equal(deriveNeedsAttention(wfWithStalled('agent_waiting', 'done')), null);
 });
+
+test('a gate that could not run reaches the owner, not the fix loop', () => {
+  const wf = { currentStep: 'qa_validation', steps: { qa_validation: { status: 'running', agents: [
+    { role: 'QA', status: 'done', feedback: '**Tests passed:** 7/7\n**Gate could not run:** ERR_CONNECTION_REFUSED' },
+  ] } } };
+  const n = deriveNeedsAttention(wf);
+  assert.equal(n.reason, 'gate_blocked');
+  assert.match(n.detail, /nothing for a developer to fix/);
+});
+
+test('a completed step is not re-reported as gate-blocked', () => {
+  const wf = { currentStep: 'code_review', steps: { qa_validation: { status: 'completed', agents: [
+    { role: 'QA', status: 'done', feedback: '**Gate could not run:** old news' },
+  ] }, code_review: { status: 'running', agents: [] } } };
+  assert.equal(deriveNeedsAttention(wf), null);
+});

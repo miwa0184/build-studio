@@ -21,6 +21,56 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-15 — A check that cannot run is no longer reported as a defect
+
+### Added
+
+- **Gate agents can now say "the gate could not run".** One verdict channel
+  (`Approved: no` + a blocking count) carried two unrelated conditions: the gate
+  ran and the code failed it, and the gate never executed at all. Downstream they
+  were indistinguishable, so an environment problem entered the fix pipeline as
+  work no developer could complete — a QA agent that could not reach a browser
+  filed it as BLOCKING and the fix planner aimed a task at the project; another,
+  pointed at a dev-server port nobody was serving, did the same. Each cost a full
+  fix round.
+
+  Agents now report `**Gate could not run:** <what failed to execute>` instead of
+  a blocking verdict. It surfaces to the owner as `gate_blocked`, and
+  `send_to_devs` refuses to build a fix plan from it (override available). A
+  check that *ran* and failed is untouched — that is what the fix loop is for.
+
+### Changed
+
+- **Reviewers no longer read each other's findings when re-checking their own.**
+  Onboarding's `team_review` now scopes history the same way PRD re-review
+  already did: your own prior findings plus the fix reports, not all six roles'
+  verdicts. Less prompt, and no reading another reviewer's blocker before
+  forming your own view.
+
+- **An item can be dragged into a release group with no visible rows.** Nothing
+  registered a release as a drop target, so the branch handling it was
+  unreachable — with Hide done on, a group whose items are all done could not be
+  dropped into. The target is registered *only* while a group is empty, so
+  ordinary row-to-row drags see no new competing droppable.
+
+### Fixed
+
+- **Security: git operations no longer build shell strings.** Branch names come
+  from workflow state and backlog ids, and every git call interpolated them into
+  a shell command — two without even quoting. A branch named `x$(...)` was
+  command execution. All fifteen call sites now pass an argument list, with a
+  test asserting that a name containing `$(touch …)` creates nothing.
+
+### Notes for forks
+
+`gate-blocked.js` is deliberately narrow: it detects "did not execute", never
+"executed and I disliked the result". If you widen the marker, it becomes an
+escape hatch from real failures — the pattern is anchored to a line start and
+requires a reason, and the tests assert that an ordinary failing-test report is
+*not* diverted.
+
+---
+
 ## 2026-08-12 — Agents that are alive but stuck now say so
 
 ### Added

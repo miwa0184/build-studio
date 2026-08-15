@@ -3,7 +3,7 @@
 import { useEffect, useLayoutEffect, useState, useCallback, useMemo, useRef } from 'react'
 import { useProjectApi } from '@/lib/use-project-api'
 import {
-  DndContext, DragOverlay, PointerSensor, useSensor, useSensors,
+  DndContext, DragOverlay, PointerSensor, useSensor, useSensors, useDroppable,
   closestCorners, type DragStartEvent, type DragEndEvent,
 } from '@dnd-kit/core'
 import {
@@ -505,6 +505,13 @@ export function BacklogTab({
                   ))}
                 </div>
               </SortableContext>
+              {/* A release with no visible rows has nothing to drop ONTO, so an
+                  item could never be moved into it — onDragOver's release branch
+                  has always existed but nothing registered a release as a drop
+                  target. Registered only when the group is empty: a group that
+                  still shows rows adds no competing droppable, so collision
+                  detection for ordinary row-to-row drags is untouched. */}
+              {visibleIds.length === 0 && <EmptyReleaseDropZone release={g.release} dragging={!!activeId} />}
             </section>
           )
         })}
@@ -799,6 +806,26 @@ function StartRunButton({ state, busy, onStart }: {
         }}
       >{label}</button>
     </span>
+  )
+}
+
+/** Drop target for a release that currently shows no rows (see call site). */
+function EmptyReleaseDropZone({ release, dragging }: { release: string; dragging: boolean }) {
+  const { setNodeRef, isOver } = useDroppable({ id: release })
+  return (
+    <div ref={setNodeRef} style={{
+      // Reserves a real hit area while a drag is in flight, and collapses to a
+      // quiet placeholder otherwise so an empty release does not shout.
+      minHeight: dragging ? 44 : 24,
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      border: `1px dashed ${isOver ? 'var(--accent)' : 'var(--border)'}`,
+      borderRadius: 'var(--radius)',
+      background: isOver ? 'color-mix(in srgb, var(--accent) 12%, transparent)' : 'transparent',
+      color: isOver ? 'var(--accent)' : 'var(--muted)',
+      fontFamily: 'var(--mono)', fontSize: 10, transition: 'background 120ms',
+    }}>
+      {dragging ? `Drop here to move into ${release}` : 'No items'}
+    </div>
   )
 }
 

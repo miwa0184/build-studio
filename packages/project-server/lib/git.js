@@ -2,9 +2,11 @@ const fs = require('fs');
 const path = require('path');
 const { execSync, execFileSync } = require('child_process');
 
-// Note: This module uses execSync for git/tmux shell commands, matching the
-// existing example-web codebase patterns. All inputs are from project config
-// (not user input). A future improvement could migrate to execFile.
+// Commands carrying an interpolated value go through `execGit` (argv form, no
+// shell). `exec` — the shell form — is kept only for fixed command strings.
+// The old note here claimed all inputs came from project config; branch names
+// actually come from workflow state and backlog item ids, so a name containing
+// `;` or `$(…)` was command execution.
 
 /**
  * Parse `git status --porcelain` into counts and path lists.
@@ -57,6 +59,26 @@ function parsePorcelain(output) {
 function createGitOps(config) {
   const { projectRoot, worktreesPath } = config;
 
+  /**
+   * Run git with an ARGUMENT LIST — no shell, so no interpolation to escape.
+   *
+   * Every value these commands take is attacker-adjacent in the sense that
+   * matters here: branch names come from workflow state and item ids, and a
+   * name containing `;` or `$(…)` in a shell string is command execution. The
+   * quoting in the old call sites was also inconsistent — `git rev-list --count
+   * ${base}..${branch}` interpolated both unquoted.
+   *
+   * Prefer this for anything with an interpolated value. `exec` (shell form)
+   * remains for fixed command strings only.
+   */
+  function execGit(args, opts = {}) {
+    const { trim = true, ...execOpts } = opts;
+    const out = execFileSync('git', args, {
+      cwd: projectRoot, stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf8', ...execOpts,
+    });
+    return trim ? String(out).trim() : String(out);
+  }
+
   function exec(cmd, opts = {}) {
     // `trim` is ours, not execSync's — pull it out before spreading the rest.
     // Trimming is right for the single-value reads that dominate here (a branch
@@ -72,9 +94,9 @@ function createGitOps(config) {
       if (fs.existsSync(wtPath)) return wtPath;
       fs.mkdirSync(worktreesPath, { recursive: true });
       try {
-        exec(`git worktree add "${wtPath}" -b "${branch}"`);
+        execGit(['worktree', 'add', wtPath, '-b', branch]);
       } catch (_) {
-        exec(`git worktree add "${wtPath}" "${branch}"`);
+        execGit(['worktree', 'add', wtPath, branch]);
       }
       for (const envFile of config.worktree_env_files || []) {
         const src = path.join(projectRoot, envFile);
@@ -89,8 +111,8 @@ function createGitOps(config) {
 
     removeWorktree(branch) {
       const wtPath = path.join(worktreesPath, branch);
-      try { exec(`git worktree remove "${wtPath}" --force`); } catch (_) {}
-      try { exec(`git branch -D "${branch}"`); } catch (_) {}
+      try { execGit(['worktree', 'remove', wtPath, '--force']); } catch (_) {}
+      try { execGit(['branch', '-D', branch]); } catch (_) {}
     },
 
     listWorktrees() {
@@ -113,23 +135,23 @@ function createGitOps(config) {
     },
 
     branchExists(branch) {
-      try { exec(`git rev-parse --verify "${branch}"`); return true; } catch (_) { return false; }
+      try { execGit(['rev-parse', '--verify', branch]); return true; } catch (_) { return false; }
     },
 
     commitsAhead(branch, base = 'main') {
-      try { return parseInt(exec(`git rev-list --count ${base}..${branch}`)) || 0; } catch (_) { return 0; }
+      try { return parseInt(execGit(['rev-list', '--count', `${base}..${branch}`])) || 0; } catch (_) { return 0; }
     },
 
     lastCommit(branch, base = 'main') {
-      try { return exec(`git log --oneline -1 ${base}..${branch}`); } catch (_) { return ''; }
+      try { return execGit(['log', '--oneline', '-1', `${base}..${branch}`]); } catch (_) { return ''; }
     },
 
     deleteBranch(branch, force = false) {
-      try { exec(`git branch ${force ? '-D' : '-d'} "${branch}"`); } catch (_) {}
+      try { execGit(['branch', force ? '-D' : '-d', branch]); } catch (_) {}
     },
 
     mergeBranch(branch, cwd, message) {
-      execSync(`git merge "${branch}" --no-ff -m "${message}"`, { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+      execFileSync('git', ['merge', branch, '--no-ff', '-m', message], { cwd, stdio: ['pipe', 'pipe', 'pipe'] });
     },
 
     abortMerge(cwd) {
@@ -137,13 +159,13 @@ function createGitOps(config) {
     },
 
     createBranchFromMain(branch) {
-      try { exec(`git branch -D "${branch}"`); } catch (_) {}
-      exec(`git branch "${branch}" main`);
+      try { execGit(['branch', '-D', branch]); } catch (_) {}
+      execGit(['branch', branch, 'main']);
     },
 
     createBranchFrom(branch, source) {
-      try { exec(`git branch -D "${branch}"`); } catch (_) {}
-      exec(`git branch "${branch}" "${source}"`);
+      try { execGit(['branch', '-D', branch]); } catch (_) {}
+      execGit(['branch', branch, source]);
     },
 
     getStatus() {
@@ -161,8 +183,8 @@ function createGitOps(config) {
           git.clean = false;
           Object.assign(git, parsed);
         }
-        try { git.ahead = parseInt(exec(`git rev-list --count origin/${git.branch}..${git.branch}`)) || 0; } catch (_) {}
-        try { git.behind = parseInt(exec(`git rev-list --count ${git.branch}..origin/${git.branch}`)) || 0; } catch (_) {}
+        try { git.ahead = parseInt(execGit(['rev-list', '--count', `origin/${git.branch}..${git.branch}`])) || 0; } catch (_) {}
+        try { git.behind = parseInt(execGit(['rev-list', '--count', `${git.branch}..origin/${git.branch}`])) || 0; } catch (_) {}
         try {
           const wts = exec('git worktree list --porcelain');
           git.worktrees = Math.max(0, (wts.match(/^worktree /gm) || []).length - 1);
@@ -172,7 +194,7 @@ function createGitOps(config) {
     },
 
     getRecentCommits(count = 10) {
-      try { return exec(`git log --oneline -${count}`).split('\n').filter(Boolean); } catch (_) { return []; }
+      try { return execGit(['log', '--oneline', `-${count}`]).split('\n').filter(Boolean); } catch (_) { return []; }
     },
 
     /**

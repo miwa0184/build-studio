@@ -141,6 +141,28 @@ function deriveNeedsAttention(wf) {
     }
   }
 
+  // 4a. A verification gate that could not EXECUTE. Distinct from one that ran
+  //     and failed: the code is not at fault and no developer can fix it, so it
+  //     must reach the owner rather than the fix loop (gate-blocked.js).
+  {
+    const gb = require('./gate-blocked');
+    for (const [key, st] of Object.entries(wf.steps || {})) {
+      if (st && st.status === 'completed') continue;
+      for (const a of st.agents || []) {
+        const hit = a && a.feedback && gb.parseGateBlocked(a.feedback);
+        if (hit) {
+          return {
+            reason: 'gate_blocked',
+            step: key,
+            title: `${key} could not run a check`,
+            detail: `${a.role} reported: ${hit.reason}. The code is not implicated — a check could not execute, so there is nothing for a developer to fix.`,
+            action: 'Fix the environment and re-run the step, or override to route it to the devs anyway.',
+          };
+        }
+      }
+    }
+  }
+
   // 4b. An agent that is ALIVE but will never progress — an expired login, or
   //     one that finished and never posted its report. The process checks above
   //     say "healthy", because it is; the watchdog derives this second axis onto

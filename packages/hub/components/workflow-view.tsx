@@ -42,7 +42,7 @@ interface WorkflowAgent {
  *  the rest is prose meant to be shown verbatim. */
 interface NeedsAttention {
   reason: 'completed_not_finished' | 'review_cap_reached' | 'dead_step' | 'blocked' | 'human_gate'
-    | 'auth_blocked' | 'finished_not_reported' | 'agent_waiting'
+    | 'auth_blocked' | 'finished_not_reported' | 'agent_waiting' | 'gate_blocked'
   step: string | null
   title: string
   detail: string
@@ -1241,7 +1241,7 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
             fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--orange)',
             display: 'flex', alignItems: 'flex-start', gap: 10,
           }}>
-            <span style={{ flexShrink: 0 }}>{['human_gate', 'auth_blocked', 'finished_not_reported', 'agent_waiting'].includes(needsAttention.reason) ? '⏸' : '⚠'}</span>
+            <span style={{ flexShrink: 0 }}>{['human_gate', 'auth_blocked', 'finished_not_reported', 'agent_waiting', 'gate_blocked'].includes(needsAttention.reason) ? '⏸' : '⚠'}</span>
             <span style={{ flex: 1 }}>
               <b>{needsAttention.title}</b>
               <br />
