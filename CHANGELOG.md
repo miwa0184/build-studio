@@ -61,6 +61,15 @@ that move underneath you without your having edited anything.
   command execution. All fifteen call sites now pass an argument list, with a
   test asserting that a name containing `$(touch …)` creates nothing.
 
+### Fixed
+
+- **The human-gate panel no longer fires on decisions that were already made.**
+  A backlog item recording a decision uses the same words as one requiring it —
+  reported on an item whose only match was the heading
+  `## Owner decision (2026-08-15)`. A **dated** heading records; an undated
+  `## Owner decision needed on the schema` still reports. Prose pointing back at
+  a decision ("written per owner decision") is filtered too.
+
 ### Notes for forks
 
 `gate-blocked.js` is deliberately narrow: it detects "did not execute", never

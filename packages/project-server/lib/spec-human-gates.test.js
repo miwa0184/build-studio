@@ -157,3 +157,35 @@ test('the guard uses the real fs semantics, not a stub-only path', () => {
   const r = scanSpecsForHumanGates(['/etc/hosts'], realFs, '/proj');
   assert.equal(r.total, 0);
 });
+
+// ── Recorded decisions are not pending ones (2026-08-15) ───────────────────
+// A backlog item that RECORDS a decision uses the same words as one that
+// requires it. Reported as a false positive on a real item whose only match was
+// the heading "## Owner decision (2026-08-15)".
+
+test('a dated heading records a decision and is not a gate', () => {
+  for (const l of [
+    '## Owner decision (2026-08-15)',
+    '## Owner decision (2026-06-23) — drop the weigh-in notification entirely',
+    '## Closed without execution (2026-08-11) — owner decision, not a finding',
+    '## Disposition — owner decisions, 2026-07-06 (item CLOSED; AC 1–3 met)',
+  ]) {
+    assert.deepEqual(findHumanGates(l, 'p.md'), [], l);
+  }
+});
+
+test('prose pointing back at a decision is not a gate', () => {
+  for (const l of ['Written per owner decision.', 'Based on an owner decision, the gate was dropped.']) {
+    assert.deepEqual(findHumanGates(l, 'p.md'), [], l);
+  }
+});
+
+test('an UNDATED heading is still reported — it may be pending', () => {
+  // The date is the discriminator, not the fact of being a heading.
+  assert.equal(findHumanGates('## Owner decision needed on the schema', 'p.md').length, 1);
+});
+
+test('a real pending gate is untouched by the new negations', () => {
+  assert.equal(findHumanGates('AC-5 is an owner decision, not an agent one', 'p.md').length, 1);
+  assert.equal(findHumanGates('A second person reviews the fixture diff', 'p.md').length, 1);
+});

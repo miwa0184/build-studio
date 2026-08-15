@@ -63,6 +63,14 @@ const PATTERNS = [
  * missing one.
  */
 const NEGATIONS = [
+  // A DATED HEADING records a decision that was already made — "## Owner
+  // decision (2026-08-15)", "## Disposition — owner decisions, 2026-07-06". The
+  // date is what separates it from a pending one: an undated "## Open Questions
+  // (the two owner decisions)" is still a real gate and still reported.
+  /^#{1,6}\s.*\b(?:19|20)\d{2}-\d{2}-\d{2}\b/,
+  // Prose referring back to a decision rather than asking for one.
+  /\b(?:per|based on|following|records?|recorded|documented) (?:an? |the )?owner decision\b/i,
+  /\bowner decision,? not a\b/i,
   /\bnot by attestation\b/i,
   /\bno human attestation\b/i,
   /\bnone is required\b/i,
