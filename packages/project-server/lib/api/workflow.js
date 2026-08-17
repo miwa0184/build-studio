@@ -17,6 +17,7 @@ const exitRecovery = require('../exit-recovery');
 const agentSkills = require('../agent-skills');
 const specHumanGates = require('../spec-human-gates');
 const gateBlocked = require('../gate-blocked');
+const { extractFixPlan, checkFeedbackContract, rejectionOutcome, MAX_REJECTIONS } = require('../plan-contract');
 const { assertInside } = require('../path-guard');
 
 // Common instruction fragments injected into all agent prompts.
@@ -1512,6 +1513,19 @@ ${feedback}
 ${notes ? `\n## User Notes\n\n${notes}` : ''}
 
 Analyze the feedback and produce a JSON fix plan. Your final output MUST include a \`\`\`json code block containing a "tasks" array — this is machine-parsed.
+
+**POSTING THE PLAN — write it to a file, then send the file.** Build the JSON in
+a file and post it with \`--data-binary @<file>\`:
+
+    curl -s -X POST http://localhost:${config.port}/api/workflow/feedback \\
+      -H 'Content-Type: application/json' --data-binary @payload.json
+
+Do NOT assemble the payload inline in a shell string, a heredoc, or a multi-line
+\`python3 -c\`. Quoting has silently destroyed a real plan that way: the shell
+mangled the script, the POST still returned \`{"ok":true}\`, and only the prose
+summary arrived — the 4-task plan sat unread in the scratchpad while the run
+stalled. The server now rejects a plan-less POST, so a mangled payload costs you
+a retry rather than the run.
 
 ${EFFICIENCY_INSTRUCTIONS}`,
     }];
@@ -3630,6 +3644,30 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     const agent = step.agents.find(a => normalizeRole(a.role) === normalizeRole(role));
     if (!agent) return res.status(404).json({ error: `agent ${role} not found in current step` });
 
+    // Check the step's machine-parsed contract HERE, while the agent is still
+    // alive to fix it. Rejecting at approve time (the old behaviour) surfaced
+    // hours later as a dead approve button, long after the agent was reaped —
+    // see plan-contract.js for the incident.
+    const contract = checkFeedbackContract(wf.currentStep, feedback, tryParseJSON);
+    if (!contract.ok) {
+      const outcome = rejectionOutcome(agent.contractRejections, contract.error);
+      agent.contractRejections = outcome.rejections;
+      if (outcome.action === 'reject') {
+        // Keep the payload. It may be the only copy outside the transcript, and
+        // discarding it would trade one silent loss for another.
+        agent.rejectedFeedback = feedback;
+        state.saveWorkflow(wf);
+        console.warn(`[workflow] ${role} feedback rejected (${outcome.rejections}/${MAX_REJECTIONS}) — no parseable plan for step ${wf.currentStep}`);
+        return res.status(400).json({ error: outcome.error, rejections: outcome.rejections });
+      }
+      // At the cap: stop arguing, keep the content, and put it in front of the
+      // owner instead of leaving the agent to burn context retrying.
+      step.status = 'blocked';
+      step.error = outcome.error;
+      agent.contractViolation = true;
+      console.warn(`[workflow] ${role} feedback accepted after ${outcome.rejections} contract failures — step ${wf.currentStep} blocked for owner review`);
+    }
+
     agent.feedback = feedback;
     agent.status = 'done';
     agent.completedAt = new Date().toISOString();
@@ -3655,7 +3693,11 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     appendTelemetryLog(wf, feedbackEntry);
 
     // Auto-iterate: if all agents done and auto-iterate budget remains, auto-advance
-    const allDone = step.agents.every(a => a.status === 'done' || a.status === 'error');
+    // A step blocked by a guardrail must not auto-advance: advancing runs the
+    // approval path, which is exactly what the block says cannot succeed. It
+    // needs the owner, so leave it for needs-attention to surface.
+    const allDone = step.status !== 'blocked'
+      && step.agents.every(a => a.status === 'done' || a.status === 'error');
     const hasFeedback = step.agents.some(a => a.feedback && a.feedback.trim().length > 0);
     const autoRemaining = wf.autoIterateRemaining || 0;
 
@@ -8684,35 +8726,13 @@ Before adding new entries, scan existing files in docs/learnings/:
     // --- Fix plan: planner creates targeted fix tasks from review feedback ---
     if (wf.currentStep === 'fix_plan' && action === 'approve') {
       const plannerFeedback = (wf.steps.fix_plan.agents || []).map(a => a.feedback || '').join('\n');
-      // Try closed code fence first, then unclosed fence (agent forgot to close it), then anchored raw JSON
-      const jsonMatch = plannerFeedback.match(/```json\s*([\s\S]*?)```/) ||
-                        plannerFeedback.match(/```json\s*([\s\S]+)/);
-      let fixPlan = null;
-      if (jsonMatch) {
-        fixPlan = tryParseJSON(jsonMatch[1]);
-      }
-      // Fallback: agent may output raw JSON without a code fence — anchor on {"tasks"
-      // to avoid matching prose braces. Allow whitespace between { and "tasks" so a
-      // pretty-printed object ({\n  "tasks": [...]}) still matches (example-ios EX-107,
-      // 2026-06-18: planner emitted unfenced pretty JSON → "No valid fix plan" block).
-      if (!fixPlan) {
-        const rawMatch = plannerFeedback.match(/(\{\s*"tasks"[\s\S]*\})/);
-        if (rawMatch) { fixPlan = tryParseJSON(rawMatch[1]); }
-      }
-
-      // If no JSON block found, check if plain-text feedback says 0 tasks (false positive)
-      if (!fixPlan) {
-        const zeroTasksPlainText = /\b0\s+tasks?\b/i.test(plannerFeedback) || /\bno\s+tasks?\b/i.test(plannerFeedback);
-        if (zeroTasksPlainText) {
-          fixPlan = { tasks: [] };
-        }
-      }
-
-      // Normalize: agent may use "fix_plan" key instead of "tasks", or "role" instead of "roles"
-      if (fixPlan && !fixPlan.tasks) {
-        const arr = fixPlan.fix_plan || fixPlan.fixes || fixPlan.items;
-        if (Array.isArray(arr)) fixPlan = { tasks: arr };
-      }
+      // Extraction lives in plan-contract.js because the POST-time check must
+      // accept exactly what this path accepts — two implementations would move
+      // the stall rather than remove it. Handles: closed json fence, unclosed
+      // fence, unfenced object anchored on {"tasks" (example-ios EX-107,
+      // 2026-06-18: pretty-printed unfenced JSON → "No valid fix plan"), and
+      // plainly-stated empty plans.
+      let fixPlan = extractFixPlan(plannerFeedback, tryParseJSON);
       if (fixPlan && fixPlan.tasks) {
         // Normalize task fields. Planner output schema varies (observed shapes
         // use title/scope, name/description, or summary). Without these

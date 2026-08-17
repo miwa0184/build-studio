@@ -21,6 +21,66 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-17 — A fix plan that fails to arrive is caught while the agent can still fix it
+
+### Fixed
+
+- **A fix planner whose plan never reached the server no longer stalls the run
+  silently.** The failure looked like this: the planner did its job, wrote a
+  complete plan, then lost it building the HTTP request — a multi-line
+  `python3 -c` mangled by the shell, so only its prose summary was sent. The
+  server accepted the prose, answered `{"ok":true}`, marked the agent done and
+  closed its window. Nothing looked wrong until the owner clicked **Approve**
+  hours later and got *"No valid fix plan found in planner feedback"*, with a
+  dead button and a suggestion to relaunch a planner that had already done the
+  work correctly.
+
+  Feedback for `fix_plan` is now checked when it is POSTed, while the agent is
+  still alive. A post with no parseable task array is refused with the required
+  format, so the agent — which still holds its plan — retries and usually
+  succeeds. Rejected payloads are kept on the agent record rather than
+  discarded.
+
+### Changed
+
+- **A `fix_plan` step can now be blocked by the engine before you ever approve
+  it.** After three rejected posts the last payload is accepted anyway (nothing
+  is thrown away), the step is marked `blocked`, and it surfaces in **Needs
+  attention** with an explanation — instead of the agent burning context on a
+  format it cannot produce. The note points at the agent's scratchpad, because
+  in the observed case the plan existed on disk and only the POST failed.
+- **Blocked steps no longer auto-advance.** Auto-advance runs the approval path,
+  which is precisely what a blocked step says cannot succeed. It now waits for
+  you.
+- **Fix planner prompts now say to post the plan from a file** (`--data-binary
+  @payload.json`) rather than assembling JSON inline in a shell string or
+  heredoc. This is the root cause of the incident above, not a style
+  preference.
+
+### Notes for forks
+
+- Fix-plan extraction moved out of the approve handler into
+  `lib/plan-contract.js` (`extractFixPlan`). The POST-time check and the approve
+  path now share it deliberately — if they diverged, validation would move the
+  stall rather than remove it. A fork that patched the parsing cascade inline in
+  `api/workflow.js` needs to re-point that patch.
+- Validation is an allowlist and currently covers `fix_plan` only. `planning` is
+  deliberately excluded: its approve path can build a task plan out of markdown
+  role headers and numbered lists, so prose there is legitimate.
+
+### Upgrade steps
+
+**In Build Studio** — sync the project-server into the bundle, then restart the
+app and any running project-servers:
+
+```bash
+cd packages/desktop && node inject-resources.js --sync-only
+```
+
+**In each managed project** — nothing to do.
+
+---
+
 ## 2026-08-15 — A check that cannot run is no longer reported as a defect
 
 ### Added
