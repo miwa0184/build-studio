@@ -92,7 +92,7 @@ launchctl load -w "$PLIST"
 
 echo "Installed LaunchAgent $LABEL"
 echo "  clone reaper:       $NODE_BIN $CLEAN_SCRIPT --quiet --guard-minutes $GUARD_MINUTES"
-echo "  DerivedData reaper: $NODE_BIN $DERIVED_SCRIPT --quiet --guard-minutes $DD_GUARD_MINUTES"
+echo "  DerivedData reaper: $NODE_BIN $DERIVED_SCRIPT --quiet --guard-minutes $DD_GUARD_MINUTES --scan-projects"
 echo "  interval:           every ${INTERVAL_SECONDS}s (+ at load)"
 echo "  log:                $LOG"
 echo "  plist:              $PLIST"
