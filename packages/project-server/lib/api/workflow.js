@@ -87,6 +87,45 @@ For fix reports: **All issues addressed:** yes|no, **Committed:** hash, ### Chan
 // prd-031-r1-revisions and left main without the approved PRD revision).
 const COMMIT_ON_CURRENT_BRANCH = 'Commit on the currently checked-out branch — do NOT create a new branch or switch branches.';
 
+/**
+ * One DerivedData directory per RUN, reused by every agent in it.
+ *
+ * Isolating from the IDE's DerivedData is right and stays. What went wrong is
+ * that agents invented a NEW directory name per step and per round —
+ * `DerivedDataFix116Round2`, `DerivedDataReview116R3`, `DerivedDataQA116R3` —
+ * because nothing told them to reuse one. Two costs, both compounding: every
+ * such build is COLD (no cached modules to reuse, minutes of wall clock per
+ * round), and every directory is kept forever. One iOS project reached 41 dirs
+ * and 21.8 GB in-tree this way (2026-08-17).
+ *
+ * A per-run path keeps the IDE isolation, makes the second and later builds
+ * incremental, and bounds the leftovers to one directory per run — which the
+ * `--scan-projects` reaper then collects.
+ */
+const IOS_DERIVED_DATA_GUIDANCE = `
+
+## BUILDING AND TESTING — REUSE THIS RUN'S DerivedData
+
+If you run \`xcodebuild\`, pass \`-derivedDataPath ios/build/dd-{{RUN_ID}}\` — the
+same path for every build in this run, whichever step or round you are in.
+
+Do NOT invent a fresh directory name per step or per round. A new path forces a
+cold build (slow) and is never cleaned up (~0.3–1.7 GB each, kept forever). Reuse
+makes every build after the first incremental. Keep using this path even if a
+previous agent already built there — that cache is the point.
+
+Do NOT use the IDE's default DerivedData either; the isolation is deliberate, so
+an open Xcode does not fight the agent's builds.`;
+
+/** This run's shared DerivedData path, substituted into the guidance above. */
+function iosDerivedDataGuidance(config, wf) {
+  if (!config.simulator || !config.simulator.destination) return '';
+  // Sanitised: the id reaches a shell command line as a path segment.
+  const runId = String((wf && (wf.itemId || wf.input || wf.id)) || 'run')
+    .replace(/[^A-Za-z0-9._-]/g, '-').slice(0, 40) || 'run';
+  return IOS_DERIVED_DATA_GUIDANCE.replace('{{RUN_ID}}', runId);
+}
+
 // Agent-CLI plumbing (claude / codex / opencode) lives in @build-studio/shared/cli:
 // the role sets (developer → wf.developerCli, reviewer → wf.reviewerCli), the
 // per-role resolver (everything else → project default CLI), the OpenCode model
@@ -1980,7 +2019,13 @@ ${EFFICIENCY_INSTRUCTIONS}`,
       const hasEfficiency = agent.instruction.includes('CONTEXT BUDGET');
       const hasFeedback = agent.instruction.includes('FEEDBACK FORMAT');
       // Planner and fix_planner output JSON — don't inject the review feedback format
-      const extraInstructions = `${hasEfficiency ? '' : EFFICIENCY_INSTRUCTIONS}${(hasFeedback || isPlanner) ? '' : STRUCTURED_FEEDBACK_INSTRUCTIONS}`;
+      // On simulator projects every agent that MIGHT run xcodebuild gets the
+      // shared-DerivedData rule. Injected here rather than in each step's
+      // template because the builders turned out to be more roles than expected:
+      // dev agents, qa_validation, and code reviewers verifying a fix report's
+      // test claims all build. Planners never do.
+      const iosDD = isPlanner ? '' : iosDerivedDataGuidance(config, wf);
+      const extraInstructions = `${hasEfficiency ? '' : EFFICIENCY_INSTRUCTIONS}${(hasFeedback || isPlanner) ? '' : STRUCTURED_FEEDBACK_INSTRUCTIONS}${agent.instruction.includes('REUSE THIS RUN') ? '' : iosDD}`;
       // Replace the {{CONTEXT_BUDGET}} / {{SOFT_THRESHOLD}} placeholders with
       // values resolved from the actual model assigned to this agent — keeps
       // the prompts accurate when a project bumps to opus[1m] / sonnet[1m] or
@@ -9277,6 +9322,7 @@ function markPrdDoneContent(original, prdId, today) {
 module.exports = {
   createWorkflowRouter,
   // Exported for unit tests (pure helpers — no I/O).
+  iosDerivedDataGuidance,
   resolveReviewerCliAtStart,
   DEFAULT_BUGFIX_STEPS,
   bugfixDisciplineBlock,

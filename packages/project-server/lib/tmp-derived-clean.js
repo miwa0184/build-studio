@@ -1,23 +1,31 @@
 #!/usr/bin/env node
 /**
  * tmp-derived-clean — concurrency-safe reaper for leaked Xcode DerivedData dirs
- * left behind in /private/tmp by agent test builds.
+ * left behind by agent test builds.
  *
- * The dashboard's QA / Dev agents build with an isolated `-derivedDataPath` under
- * /private/tmp (e.g. `example-ios-dd-prd026`, `dr-dd`) — done deliberately to avoid
- * corrupting an open Xcode IDE's build.db — but they never delete these dirs
- * afterward. They accumulate (~0.3–0.5 GB each, one+ per PRD run × every fix
- * round × every project) and fill the internal data volume. macOS's own /tmp
- * cleaner won't remove them (background scans keep bumping their access time),
- * and the XCTest *clone* reaper (xctest-clean.js) does not cover them — so this
- * is the recurring disk-pressure leak.
+ * The dashboard's QA / Dev agents build with an isolated `-derivedDataPath` —
+ * done deliberately to avoid corrupting an open Xcode IDE's build.db — but they
+ * never delete these dirs afterward. They accumulate (~0.3–1.7 GB each, one+ per
+ * PRD run × every fix round × every project) and fill the internal data volume.
+ * macOS's own /tmp cleaner won't remove them (background scans keep bumping
+ * their access time), and the XCTest *clone* reaper (xctest-clean.js) does not
+ * cover them — so this is the recurring disk-pressure leak.
+ *
+ * TWO LOCATIONS, not one. Agents put these under /private/tmp (e.g.
+ * `example-ios-dd-prd026`) AND inside the project itself, under `ios/build/`,
+ * because a project's own build guidance tells them to isolate from the IDE and
+ * says nothing about where. Scanning only /private/tmp missed an iOS project
+ * holding 41 dirs / 21.8 GB in-tree (2026-08-17). `--scan-projects` reads the
+ * Build Studio registry at run time and covers both.
  *
  * SAFETY INVARIANT — a DerivedData dir is reaped only when ALL of these hold:
  *   1. It IS a DerivedData root — contains BOTH `info.plist` AND a `Build`
- *      subdirectory. This signature won't match arbitrary /tmp content.
+ *      subdirectory. This signature won't match arbitrary /tmp content, nor a
+ *      web project's `build/` output.
  *   2. No running `xcodebuild` references it via `-derivedDataPath` — an active
  *      build in ANY project keeps its dir (we parse the process table), so
- *      cleanup never disturbs a live run in another project.
+ *      cleanup never disturbs a live run in another project. Relative paths are
+ *      resolved against the BUILD PROCESS's cwd; see activeBuildDerivedPaths.
  *   3. Its last build is older than --guard-minutes (default 180), measured from
  *      the `Build` subdir's mtime (the last actual build) — NOT the top-level dir
  *      mtime, which Spotlight / backup scans bump and would otherwise make every
@@ -48,35 +56,77 @@ const CHILD_ENV = {
   PATH: `/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH || ''}`,
 };
 
+/** Build dirs a managed project keeps its isolated DerivedData in. */
+const PROJECT_BUILD_SUBDIRS = ['ios/build', 'build'];
+
+/**
+ * Scan targets derived from the Build Studio project registry.
+ *
+ * Agents do not always build under /private/tmp. An iOS project observed 41
+ * DerivedData dirs totalling 21.8 GB inside `<root>/ios/build` — one per agent
+ * per fix/review round, none ever removed — because the reaper only ever looked
+ * at /private/tmp (2026-08-17). Reading the registry at RUN time rather than
+ * baking paths into the LaunchAgent means projects added later are swept
+ * without reinstalling anything.
+ */
+function registryScanDirs(registryPath) {
+  const dirs = [];
+  let reg;
+  try { reg = JSON.parse(fs.readFileSync(registryPath, 'utf8')); } catch (_) { return dirs; }
+  for (const entry of Object.values((reg && reg.projects) || {})) {
+    const root = entry && entry.path;
+    if (!root) continue;
+    for (const sub of PROJECT_BUILD_SUBDIRS) {
+      const dir = path.join(root, sub);
+      if (fs.existsSync(dir)) dirs.push(dir);
+    }
+  }
+  return dirs;
+}
+
 function parseArgs(argv) {
   const opts = {
     dryRun: false,
     guardMinutes: 180,
     json: false,
     quiet: false,
-    tmpDir: '/private/tmp',
+    dirs: [],
+    scanProjects: false,
+    registry: path.join(os.homedir(), '.build-studio', 'registry.json'),
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--dry-run') opts.dryRun = true;
     else if (a === '--json') opts.json = true;
     else if (a === '--quiet') opts.quiet = true;
+    else if (a === '--scan-projects') opts.scanProjects = true;
     else if (a === '--guard-minutes') opts.guardMinutes = Number(argv[++i]);
-    else if (a === '--tmp-dir') opts.tmpDir = argv[++i];
+    else if (a === '--registry') opts.registry = argv[++i];
+    // --tmp-dir is the pre-multi-dir spelling, kept so existing LaunchAgents
+    // and any fork's wrapper keep working unchanged.
+    else if (a === '--tmp-dir' || a === '--dir') opts.dirs.push(argv[++i]);
     else if (a === '--help' || a === '-h') { printHelp(); process.exit(0); }
   }
   if (!Number.isFinite(opts.guardMinutes) || opts.guardMinutes < 0) opts.guardMinutes = 180;
+  if (opts.dirs.length === 0) opts.dirs.push('/private/tmp');
+  if (opts.scanProjects) opts.dirs.push(...registryScanDirs(opts.registry));
+  // A path listed twice (explicitly and via the registry) must not be scanned
+  // twice — the second pass would re-`du` dirs the first already removed.
+  opts.dirs = [...new Set(opts.dirs)];
   return opts;
 }
 
 function printHelp() {
   process.stdout.write(
-    'tmp-derived-clean — reap leaked Xcode DerivedData dirs from /private/tmp\n' +
+    'tmp-derived-clean — reap leaked Xcode DerivedData dirs\n' +
     '  --dry-run            report what would be deleted, delete nothing\n' +
     '  --guard-minutes N    skip dirs whose last build is within N minutes (default 180)\n' +
     '  --json               emit a JSON summary\n' +
     '  --quiet              suppress the human summary on no-op passes\n' +
-    '  --tmp-dir <path>     directory to scan (default /private/tmp)\n'
+    '  --dir <path>         directory to scan, repeatable (default /private/tmp)\n' +
+    '  --tmp-dir <path>     alias of --dir, kept for compatibility\n' +
+    '  --scan-projects      also scan ios/build and build/ of every registered project\n' +
+    '  --registry <path>    project registry (default ~/.build-studio/registry.json)\n'
   );
 }
 
@@ -119,21 +169,58 @@ function realpathOrSelf(p) {
   try { return fs.realpathSync(p); } catch (_) { return p; }
 }
 
-/** Absolute -derivedDataPath of every running xcodebuild (any project). */
+/** Working directory of a running process, or null. */
+function processCwd(pid) {
+  try {
+    const out = execFileSync('/usr/sbin/lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], {
+      env: CHILD_ENV, encoding: 'utf8', timeout: 10000,
+    });
+    const m = out.match(/^n(.+)$/m);
+    return m ? m[1] : null;
+  } catch (_) { return null; }
+}
+
+/**
+ * DerivedData paths of every running xcodebuild (any project).
+ *
+ * **Relative paths are the subtle case.** Agents routinely run
+ * `cd <project>/ios; xcodebuild … -derivedDataPath build/DerivedDataX`, so the
+ * value on the command line is relative to THAT process's cwd — not to the
+ * reaper's. Resolving it here with a bare `realpath` produced a path under the
+ * reaper's own directory, which matches nothing, so the "never touch a live
+ * build" invariant silently did not hold: a real run was observed protected
+ * only by the freshness guard, with the active-build count reporting zero
+ * (2026-08-17).
+ *
+ * Relative values are therefore resolved against the build process's own cwd.
+ * If that cannot be read (process exited mid-scan, lsof unavailable), the
+ * BASENAME is guarded instead — deliberately over-protective: keeping an
+ * unrelated dir of the same name costs disk until the next sweep, whereas
+ * deleting a live build's DerivedData corrupts a running test run.
+ *
+ * @returns {{paths:Set<string>, basenames:Set<string>}}
+ */
 function activeBuildDerivedPaths() {
   const paths = new Set();
+  const basenames = new Set();
   let out = '';
   try {
-    out = execFileSync('/bin/ps', ['-axww', '-o', 'command='], {
+    out = execFileSync('/bin/ps', ['-axww', '-o', 'pid=,command='], {
       env: CHILD_ENV, encoding: 'utf8', timeout: 15000, maxBuffer: 16 * 1024 * 1024,
     });
-  } catch (_) { return paths; }
+  } catch (_) { return { paths, basenames }; }
   for (const line of out.split('\n')) {
     if (!/xcodebuild\b/.test(line)) continue;
     const m = line.match(/-derivedDataPath(?:=|\s+)(\S+)/);
-    if (m) paths.add(realpathOrSelf(m[1]));
+    if (!m) continue;
+    const raw = m[1];
+    if (path.isAbsolute(raw)) { paths.add(realpathOrSelf(raw)); continue; }
+    const pidMatch = line.trim().match(/^(\d+)\s/);
+    const cwd = pidMatch ? processCwd(pidMatch[1]) : null;
+    if (cwd) paths.add(realpathOrSelf(path.resolve(cwd, raw)));
+    else basenames.add(path.basename(raw));
   }
-  return paths;
+  return { paths, basenames };
 }
 
 /** A dir is an Xcode DerivedData root iff it has both info.plist and Build/. */
@@ -165,7 +252,7 @@ function dirSizeKB(dir) {
 function main() {
   const opts = parseArgs(process.argv.slice(2));
   const result = {
-    tmpDir: opts.tmpDir,
+    dirs: opts.dirs,
     dryRun: opts.dryRun,
     guardMinutes: opts.guardMinutes,
     reaped: [],          // { dir, kb }
@@ -175,7 +262,8 @@ function main() {
     lockBusy: false,
   };
 
-  if (!fs.existsSync(opts.tmpDir)) {
+  const scanDirs = opts.dirs.filter((d) => fs.existsSync(d));
+  if (scanDirs.length === 0) {
     return finish(opts, result);
   }
 
@@ -187,30 +275,38 @@ function main() {
 
   try {
     const cutoffMs = Date.now() - opts.guardMinutes * 60 * 1000;
-    const activePaths = activeBuildDerivedPaths();
+    // Read the process table ONCE for the whole sweep. Re-reading per directory
+    // would let a build that starts mid-sweep be missed by an earlier scan.
+    const { paths: activePaths, basenames: activeNames } = activeBuildDerivedPaths();
 
-    let entries = [];
-    try { entries = fs.readdirSync(opts.tmpDir, { withFileTypes: true }); } catch (_) {}
+    for (const scanDir of scanDirs) {
+      let entries = [];
+      try { entries = fs.readdirSync(scanDir, { withFileTypes: true }); } catch (_) {}
 
-    for (const ent of entries) {
-      if (!ent.isDirectory()) continue;
-      const dir = path.join(opts.tmpDir, ent.name);
-      if (!isDerivedDataRoot(dir)) continue;
+      for (const ent of entries) {
+        if (!ent.isDirectory()) continue;
+        const dir = path.join(scanDir, ent.name);
+        if (!isDerivedDataRoot(dir)) continue;
 
-      // (2) An active build owns this dir — never touch a live run's DerivedData.
-      if (activePaths.has(realpathOrSelf(dir))) { result.skippedActive++; continue; }
+        // (2) An active build owns this dir — never touch a live run's DerivedData.
+        //     The basename check covers a build whose cwd could not be read.
+        if (activePaths.has(realpathOrSelf(dir)) || activeNames.has(ent.name)) {
+          result.skippedActive++;
+          continue;
+        }
 
-      // (3) Built recently — leave it (likely an in-flight or just-finished run).
-      const mtime = lastBuildMtime(dir);
-      if (mtime && mtime > cutoffMs) { result.skippedFresh++; continue; }
+        // (3) Built recently — leave it (likely an in-flight or just-finished run).
+        const mtime = lastBuildMtime(dir);
+        if (mtime && mtime > cutoffMs) { result.skippedFresh++; continue; }
 
-      const kb = dirSizeKB(dir);
-      if (!opts.dryRun) {
-        try { fs.rmSync(dir, { recursive: true, force: true }); }
-        catch (e) { logErr(opts, `rm ${dir} failed: ${e.message}`); continue; }
+        const kb = dirSizeKB(dir);
+        if (!opts.dryRun) {
+          try { fs.rmSync(dir, { recursive: true, force: true }); }
+          catch (e) { logErr(opts, `rm ${dir} failed: ${e.message}`); continue; }
+        }
+        result.reaped.push({ dir, kb });
+        result.reclaimedKB += kb;
       }
-      result.reaped.push({ dir, kb });
-      result.reclaimedKB += kb;
     }
   } finally {
     release();
@@ -251,4 +347,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { main };
+module.exports = { main, parseArgs, registryScanDirs, isDerivedDataRoot };

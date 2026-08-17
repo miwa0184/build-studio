@@ -21,6 +21,70 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-17 — Agent Xcode builds stop leaking gigabytes, and stop being cold
+
+### Fixed
+
+- **The DerivedData reaper now sweeps in-project build directories, not just
+  `/private/tmp`.** iOS agents isolate their builds from the IDE's DerivedData,
+  which is correct — but many put that directory inside the project
+  (`<root>/ios/build/…`), where the reaper never looked. One iOS project had
+  accumulated **41 directories totalling 21.8 GB** in-tree, one per agent per
+  fix and review round, going back months. Run `node
+  packages/project-server/lib/tmp-derived-clean.js --dry-run --scan-projects` to
+  size your own.
+- **The reaper's "never touch a live build" guard was not holding for relative
+  paths.** It read `-derivedDataPath` from the process table and resolved it
+  against its *own* working directory, so a build started as
+  `cd ios; xcodebuild … -derivedDataPath build/DerivedDataX` resolved to a
+  nonexistent path and matched nothing. Live builds were protected only by the
+  180-minute freshness guard. Relative paths are now resolved against the build
+  process's own cwd; if that cannot be read the directory name is guarded
+  instead, which errs toward keeping too much.
+
+### Changed
+
+- **iOS agents are told to reuse one DerivedData directory per run**
+  (`ios/build/dd-<item>`) instead of inventing a name per step and per round.
+  Two effects on an unmodified config: builds after the first in a run are
+  incremental rather than cold (minutes per review round), and a run leaves one
+  directory behind instead of one per agent. The isolation from an open Xcode is
+  unchanged — that part was always right.
+- **The installed sweep LaunchAgent now passes `--scan-projects`**, reading the
+  project registry at run time so projects added later are covered without
+  reinstalling.
+
+### Upgrade steps
+
+**In Build Studio** — reinstall the sweep so it picks up the new flag, then sync
+and restart:
+
+```bash
+./scripts/install-xctest-sweep.sh
+cd packages/desktop && node inject-resources.js --sync-only
+```
+
+**In each managed project** — nothing to do, but iOS projects may want to
+reclaim what has already accumulated. Check first, then delete:
+
+```bash
+node <build-studio>/packages/project-server/lib/tmp-derived-clean.js --dry-run --scan-projects
+node <build-studio>/packages/project-server/lib/tmp-derived-clean.js --scan-projects
+```
+
+Do this with no workflow running. DerivedData is a pure build cache — the only
+cost of deleting it is one cold rebuild.
+
+### Notes for forks
+
+- `tmp-derived-clean.js` takes `--dir` (repeatable) instead of a single scan
+  directory. `--tmp-dir` still works as an alias, so existing wrappers and
+  LaunchAgents keep running unchanged.
+- Its JSON output renames `tmpDir` (string) to `dirs` (array). A fork parsing
+  `--json` needs updating.
+
+---
+
 ## 2026-08-17 — A fix plan that fails to arrive is caught while the agent can still fix it
 
 ### Fixed

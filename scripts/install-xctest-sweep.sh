@@ -63,7 +63,7 @@ cat > "$PLIST" <<PLISTEOF
     <array>
         <string>/bin/sh</string>
         <string>-c</string>
-        <string>[ -f "$CLEAN_SCRIPT" ] &amp;&amp; "$NODE_BIN" "$CLEAN_SCRIPT" --quiet --guard-minutes $GUARD_MINUTES; [ -f "$DERIVED_SCRIPT" ] &amp;&amp; "$NODE_BIN" "$DERIVED_SCRIPT" --quiet --guard-minutes $DD_GUARD_MINUTES; exit 0</string>
+        <string>[ -f "$CLEAN_SCRIPT" ] &amp;&amp; "$NODE_BIN" "$CLEAN_SCRIPT" --quiet --guard-minutes $GUARD_MINUTES; [ -f "$DERIVED_SCRIPT" ] &amp;&amp; "$NODE_BIN" "$DERIVED_SCRIPT" --quiet --guard-minutes $DD_GUARD_MINUTES --scan-projects; exit 0</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
