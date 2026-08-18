@@ -15,15 +15,19 @@
  *    waste; the right move is an immediate `claude --resume <session-id>`,
  *    which restores the agent's full conversation context.
  *
- * The discriminator is tmux's `#{pane_current_command}`: a live agent pane
- * runs `claude`/`codex`/`node`; a dead one has fallen back to the interactive
- * login shell. Because Claude's Bash tool may briefly run `zsh -c` children in
- * the foreground process group, a shell alone is NOT proof of death — death is
- * only confirmed when the pane shows a shell AND the pipe-pane log has been
- * silent for `deadConfirmMs` (a live Claude repaints its UI constantly; even
- * its interactive dialogs were rendered moments before going idle, and its
- * pane command stays `claude` — so the alive-at-a-dialog case never classifies
- * as dead).
+ * The discriminator is tmux's `#{pane_current_command}` — but on its own it is
+ * WEAKER than it looks, and an earlier version of this comment overstated it.
+ * It reports the foreground process GROUP LEADER, and agents are launched as
+ * `bash start-<agent>.sh` without `exec`, so the leader is that wrapper script
+ * for the agent's whole life: the pane reads `bash` even while `claude` runs
+ * healthily beneath it as a non-leader member of the same group. The claim that
+ * "its pane command stays `claude`" was simply wrong, and every check that
+ * trusted the pane command alone misfired on live agents (2026-08-18).
+ *
+ * So a shell pane is NOT proof of death. Death needs all of: a shell pane, no
+ * live child process under the pane, AND a pipe-pane log silent for
+ * `deadConfirmMs`. `paneReturnedToShell()` is the single place that rule lives;
+ * use it rather than calling `isShellCommand()` directly.
  *
  * All functions here are pure — the tmux/fs I/O lives in server.js.
  */
@@ -35,6 +39,26 @@ function isShellCommand(cmd) {
   if (!cmd) return false;
   const base = String(cmd).trim().replace(/^-/, '').split('/').pop();
   return INTERACTIVE_SHELLS.has(base);
+}
+
+/**
+ * Has the pane genuinely fallen back to a shell with nothing running under it?
+ *
+ * The question every caller actually wants answered. `isShellCommand()` alone
+ * answers a narrower one — "is the foreground group leader a shell" — which is
+ * true for the entire life of a healthy agent, because the launcher's wrapper
+ * script is that leader. Consulting it without the live-child check reported
+ * running agents as exited: a fazon dev agent waiting at an interactive
+ * question was written off as "Process exited ... pane is back at a shell
+ * prompt" while its `claude` process had been up for 50 minutes holding
+ * uncommitted work (2026-08-18).
+ *
+ * @param {string|null} paneCommand   tmux #{pane_current_command}
+ * @param {boolean} hasLiveChild      does the pane process still have a live child?
+ */
+function paneReturnedToShell({ paneCommand, hasLiveChild = false }) {
+  if (hasLiveChild) return false;
+  return isShellCommand(paneCommand);
 }
 
 /**
@@ -60,8 +84,7 @@ function classifyAgentProcess({ paneCommand, idleMs, deadConfirmMs = 2 * 60 * 10
   // short-lived `zsh -c` tool children must never classify as dead.
   if (idleMs < deadConfirmMs) return 'alive';
   if (paneCommand === null || paneCommand === undefined || paneCommand === '') return 'gone';
-  if (hasLiveChild) return 'alive';
-  if (isShellCommand(paneCommand)) return 'dead';
+  if (paneReturnedToShell({ paneCommand, hasLiveChild })) return 'dead';
   return 'alive';
 }
 
@@ -80,10 +103,17 @@ function classifyAgentProcess({ paneCommand, idleMs, deadConfirmMs = 2 * 60 * 10
  * Approve, both of which would have moved the step and caused the agent's
  * eventual report to be REJECTED as belonging to a closed step.
  *
- * Revival needs BOTH signals, because either alone is weak: a non-shell pane
- * command could be a transient tool child, and recent log output could be a
- * dying process's last gasp. Together they mean a real agent process is running
- * AND producing output right now.
+ * Revival needs BOTH signals, because either alone is weak: a live process could
+ * be idle at a prompt, and recent log output could be a dying process's last
+ * gasp. Together they mean a real agent process is running AND producing output
+ * right now.
+ *
+ * **This was unreachable in practice until 2026-08-18.** It rejected any pane
+ * whose command was a shell, which — because the launcher's wrapper script is
+ * the foreground group leader — is every claude agent, always. So the exact
+ * scenario in the paragraph above (owner answers the question, agent resumes)
+ * could never clear the error it describes. It now asks whether a live process
+ * exists under the pane instead of what the pane is nominally running.
  *
  * Being wrong here is cheap and self-correcting in a way the old behaviour was
  * not: a falsely revived agent is re-judged dead on the next tick, whereas a
@@ -92,10 +122,11 @@ function classifyAgentProcess({ paneCommand, idleMs, deadConfirmMs = 2 * 60 * 10
  * @param {string|null} p.paneCommand  tmux #{pane_current_command}
  * @param {number} p.idleMs            ms since the agent's log last changed
  * @param {number} [p.deadConfirmMs]
+ * @param {boolean} [p.hasLiveChild]   live process under the pane
  */
-function isRevived({ paneCommand, idleMs, deadConfirmMs = 2 * 60 * 1000 }) {
+function isRevived({ paneCommand, idleMs, deadConfirmMs = 2 * 60 * 1000, hasLiveChild = false }) {
   if (!paneCommand) return false;            // window gone — nothing to revive
-  if (isShellCommand(paneCommand)) return false;  // still sitting at a prompt
+  if (paneReturnedToShell({ paneCommand, hasLiveChild })) return false;  // nothing running
   return idleMs < deadConfirmMs;             // ...and actively producing output
 }
 
@@ -116,8 +147,9 @@ function decideRecovery(agent, { maxAutoResumes = 2 } = {}) {
  * resume script) that give the fast dead-process halt its value?
  *
  * The shell-pane dead heuristic is tuned to the Claude CLI's behaviour:
- * claude repaints its UI constantly (so a live agent's log never goes silent)
- * and its pane_current_command stays `claude` even at interactive dialogs.
+ * claude repaints its UI constantly, so a live agent's log never goes silent.
+ * (Its pane_current_command does NOT stay `claude` — see the file header — so
+ * the pane signal is only meaningful alongside the live-child check.)
  * `opencode run` and codex agents do neither — print-mode output can pause
  * for minutes during long generations, and macOS pane_current_command is
  * flaky — which produced a false "process died" halt on a healthy opencode
@@ -171,6 +203,7 @@ function allAgentsOf(wf) {
 }
 
 module.exports = {
+  paneReturnedToShell,
   isRevived,
   isShellCommand, classifyAgentProcess, decideRecovery, hasResumeArtifacts,
   inResumeGrace, allAgentsOf,

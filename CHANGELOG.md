@@ -21,6 +21,65 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-18 — A live agent waiting on a question is no longer reported as dead
+
+### Fixed
+
+- **An agent waiting at a question prompt was reported as "Process exited ...
+  pane is back at a shell prompt", with advice to relaunch it.** Relaunching
+  would have killed a live process holding 50 minutes of context and uncommitted
+  work. Three checks were reading tmux's `#{pane_current_command}` as proof of
+  death, but that field names the foreground process-GROUP LEADER — and agents
+  launch as `bash start-<agent>.sh` without `exec`, so it reads `bash` for a
+  healthy agent's entire life. The rule now lives in one place
+  (`paneReturnedToShell`) and requires a shell pane **and** no live process
+  beneath it.
+- **An agent that resumed after you answered its question stayed stuck showing
+  the old error.** `isRevived` rejected any pane whose command was a shell,
+  which is every Claude agent, always — so the revival it was written for could
+  never happen, and the card kept offering Recover and Approve. Either would move
+  the step and cause the agent's real report to be rejected as belonging to a
+  closed step.
+- **The CLI's own question dialog was read as evidence the agent was busy.** Its
+  footer contains "Esc to cancel", which matched a *working* marker — so the most
+  common way an agent blocks on a human was invisible to the stall detector.
+  Dialog navigation markers ("Enter to select", "↑/↓ to navigate") now take
+  precedence.
+
+### Changed
+
+- **A stalled agent's card now says what is actually wrong.** The waiting/auth/
+  finished-without-reporting classifier used to run *after* the 15-minute idle
+  timeout and was guarded on the agent still being `running` — but the timeout
+  had already flipped it to `error`, so the one component that recognises
+  "waiting for input" never ran for its main case. It now runs first, and the
+  timeout reports its verdict ("An agent is waiting and will not proceed")
+  instead of a generic "may be stuck".
+- **Error text for a live-but-stalled agent no longer tells you to relaunch
+  without saying what it costs.** Where the process is still alive, the message
+  says so and notes that relaunching discards context and uncommitted work.
+
+### Upgrade steps
+
+**In Build Studio** — sync and restart:
+
+```bash
+cd packages/desktop && node inject-resources.js --sync-only
+```
+
+**In each managed project** — nothing to do.
+
+### Notes for forks
+
+- `agent-recovery.js` exports `paneReturnedToShell({paneCommand, hasLiveChild})`.
+  Call it instead of `isShellCommand()` for any liveness decision;
+  `isShellCommand()` remains but answers a narrower question than its name
+  suggests. `isRevived()` takes a new optional `hasLiveChild`, defaulting to
+  `false` so existing callers keep their current behaviour.
+- `agent-stalled.js` exports `WAITING_MARKERS`, checked before `WORKING_MARKERS`.
+
+---
+
 ## 2026-08-17 — Agent Xcode builds stop leaking gigabytes, and stop being cold
 
 ### Fixed

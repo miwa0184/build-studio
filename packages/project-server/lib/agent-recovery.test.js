@@ -2,7 +2,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { isShellCommand, classifyAgentProcess, decideRecovery, hasResumeArtifacts, inResumeGrace, allAgentsOf, isRevived } = require('./agent-recovery');
+const { isShellCommand, classifyAgentProcess, decideRecovery, hasResumeArtifacts, inResumeGrace, allAgentsOf, isRevived, paneReturnedToShell } = require('./agent-recovery');
 
 const MIN2 = 2 * 60 * 1000;
 
@@ -157,4 +157,54 @@ test('revival and death are exact opposites on the same inputs', () => {
       if (revived) assert.equal(cls, 'alive', `${paneCommand}@${idleMs} revived but classified ${cls}`);
     }
   }
+});
+
+// ─── The pane command alone is not evidence of death (fazon FAZ-261) ─────────
+//
+// Agents launch as `bash start-<agent>.sh` without `exec`, so that wrapper is
+// the foreground process-GROUP LEADER for the agent's whole life and tmux
+// reports `bash` even while claude runs healthily beneath it. Any check that
+// read the pane command on its own therefore misfired on live agents.
+
+test('paneReturnedToShell: a live child means the agent has NOT exited', () => {
+  // The exact shape of the FAZ-261 stall: pane says bash, claude alive beneath.
+  assert.equal(paneReturnedToShell({ paneCommand: 'bash', hasLiveChild: true }), false);
+  assert.equal(paneReturnedToShell({ paneCommand: '-zsh', hasLiveChild: true }), false);
+});
+
+test('paneReturnedToShell: a shell with nothing under it is a real exit', () => {
+  assert.equal(paneReturnedToShell({ paneCommand: 'bash', hasLiveChild: false }), true);
+  assert.equal(paneReturnedToShell({ paneCommand: '-zsh', hasLiveChild: false }), true);
+});
+
+test('paneReturnedToShell: a non-shell pane is never an exit', () => {
+  for (const cmd of ['claude', 'node', 'codex', 'xcodebuild']) {
+    assert.equal(paneReturnedToShell({ paneCommand: cmd, hasLiveChild: false }), false, cmd);
+  }
+});
+
+test('an agent waiting at a prompt is not reported as exited', () => {
+  // What the owner saw: "Process exited ... pane is back at a shell prompt"
+  // for a claude process that had been up for 50 minutes holding uncommitted
+  // work, because only the pane command was consulted.
+  assert.equal(isShellCommand('bash'), true, 'the weaker signal still says shell');
+  assert.equal(
+    paneReturnedToShell({ paneCommand: 'bash', hasLiveChild: true }), false,
+    'the signal the callers use must disagree',
+  );
+});
+
+test('revival now works for the case its own docs describe', () => {
+  // isRevived rejected every shell pane, which is every claude agent always —
+  // so "owner answers the prompt, agent resumes" could never clear the error.
+  assert.equal(isRevived({ paneCommand: 'bash', idleMs: 1000, hasLiveChild: true }), true);
+  // Still requires fresh output: a live but silent process is not revived.
+  assert.equal(isRevived({ paneCommand: 'bash', idleMs: 5 * MIN, hasLiveChild: true }), false);
+  // And a shell with nothing under it stays dead.
+  assert.equal(isRevived({ paneCommand: 'bash', idleMs: 1000, hasLiveChild: false }), false);
+});
+
+test('classify: unchanged — a live child still outranks a shell pane', () => {
+  assert.equal(classifyAgentProcess({ paneCommand: 'bash', idleMs: MIN2, hasLiveChild: true }), 'alive');
+  assert.equal(classifyAgentProcess({ paneCommand: 'bash', idleMs: MIN2, hasLiveChild: false }), 'dead');
 });

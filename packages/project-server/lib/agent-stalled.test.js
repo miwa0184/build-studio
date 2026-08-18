@@ -63,3 +63,43 @@ test('isAwaitingInput keys off positive evidence of working', () => {
   assert.equal(isAwaitingInput(WAITING), true);
   assert.equal(isAwaitingInput(''), false);   // no evidence either way
 });
+
+// ─── A selection dialog is waiting, not working (fazon FAZ-261, 2026-08-18) ──
+//
+// The CLI's question prompt draws a footer containing "Esc to cancel", which
+// WORKING_MARKERS matches — so the single most common way an agent blocks on a
+// human read as proof it was busy, and nothing surfaced it.
+
+const QUESTION_MENU = [
+  ' ☐ FAZ-261 scope',
+  'Widening the field turns two currently-green gates red. How should I proceed?',
+  '❯ 1. Full fix incl. version bump (Recommended)',
+  '  2. Land gates only, schema fix deferred',
+  '  5. Type something.',
+  '  6. Chat about this',
+  'Enter to select · ↑/↓ to navigate · Esc to cancel',
+].join('\n');
+
+const DIALOG_WORKING_PANE = [
+  '⏺ Running cd /Volumes/Extern/projects/fazon; git status --short',
+  '✢ Moseying… (27m 24s · ↓ 50.7k tokens)',
+  '❯ ',
+  '  ⏵⏵ bypass permissions on · 1 shell · esc to interrupt · ← for agents · ↓ to manage',
+].join('\n');
+
+test('a question dialog is recognised as waiting despite its "Esc to cancel"', () => {
+  assert.equal(isAwaitingInput(QUESTION_MENU), true);
+  const v = classifyStalledAgent({ paneText: QUESTION_MENU, idleMs: 20 * 60 * 1000, hasFeedback: false });
+  assert.equal(v && v.reason, 'agent_waiting');
+});
+
+test('a genuinely working agent is still not flagged', () => {
+  // Captured from a live agent mid-run. The false-positive direction matters:
+  // this fires on every tick, and crying wolf trains the owner to ignore it.
+  assert.equal(isAwaitingInput(DIALOG_WORKING_PANE), false);
+  assert.equal(classifyStalledAgent({ paneText: DIALOG_WORKING_PANE, idleMs: 20 * 60 * 1000, hasFeedback: false }), null);
+});
+
+test('an agent that already reported is never flagged, dialog or not', () => {
+  assert.equal(classifyStalledAgent({ paneText: QUESTION_MENU, idleMs: 20 * 60 * 1000, hasFeedback: true }), null);
+});

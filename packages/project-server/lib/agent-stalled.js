@@ -54,6 +54,30 @@ const WORKING_MARKERS = [
 ];
 
 /**
+ * Positive evidence that the pane is at a DIALOG, checked before the working
+ * markers and overriding them.
+ *
+ * The absence-of-working-marker rule below is right in general but has one
+ * systematic blind spot: a selection dialog draws its own footer, and that
+ * footer says "Esc to cancel" — which `WORKING_MARKERS` matches. So the single
+ * most common way an agent blocks on a human, the CLI's own question prompt,
+ * was read as proof it was busy.
+ *
+ * That is exactly what happened on fazon FAZ-261 (2026-08-18): a dev agent hit
+ * a genuine design fork, drew a six-option menu, and waited. Nothing surfaced
+ * it — the idle timeout eventually fired and reported the process as EXITED,
+ * while it sat holding 50 minutes of context and uncommitted work.
+ *
+ * These markers are the dialog's navigation affordances, which no working
+ * spinner prints.
+ */
+const WAITING_MARKERS = [
+  /enter to select/i,
+  /↑\/↓ to navigate/i,
+  /\bto navigate\b.*\bto cancel\b/i,
+];
+
+/**
  * Is the pane sitting at an input prompt rather than working?
  *
  * Deliberately positive-evidence-based: we look for the WORKING marker and
@@ -63,6 +87,8 @@ const WORKING_MARKERS = [
 function isAwaitingInput(paneText) {
   const t = String(paneText || '');
   if (!t.trim()) return false;
+  // A dialog's own footer beats the working markers it happens to contain.
+  if (WAITING_MARKERS.some((re) => re.test(t))) return true;
   return !WORKING_MARKERS.some((re) => re.test(t));
 }
 
@@ -123,4 +149,4 @@ function classifyStalledAgent({
   };
 }
 
-module.exports = { classifyStalledAgent, isAwaitingInput, AUTH_PATTERNS };
+module.exports = { classifyStalledAgent, isAwaitingInput, AUTH_PATTERNS, WAITING_MARKERS };
