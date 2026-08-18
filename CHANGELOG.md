@@ -21,6 +21,37 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-18 — The execution timeline shows Code Review before the run starts
+
+### Fixed
+
+- **The workflow panel omitted Code Review from the execution timeline until a
+  run reached it.** `merge_for_review` hands off to `code_review`
+  unconditionally, so it always runs — but no preset lists it in its
+  `execution` array (each one comments it as "runtime-inserted"). The hub
+  compensated by injecting it from live workflow state, and that injection was
+  guarded on a workflow existing, so an idle panel advertised a seven-step run
+  that would really be eight, hiding the review gate. It is now shown whenever
+  the timeline is for an execution workflow.
+
+  Bugfix timelines were never affected: `code_review` is listed explicitly in
+  their resolved step list, and that list is still authoritative — a project
+  that removes it from a `workflow.bugfix` override still sees it removed.
+
+### Upgrade steps
+
+**In Build Studio** — this is a hub change, so it needs the Next build and a
+full inject, not `--sync-only`:
+
+```bash
+cd packages/hub && npx next build
+cd packages/desktop && node inject-resources.js
+```
+
+**In each managed project** — nothing to do.
+
+---
+
 ## 2026-08-18 — A live agent waiting on a question is no longer reported as dead
 
 ### Fixed

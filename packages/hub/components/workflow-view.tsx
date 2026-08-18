@@ -655,9 +655,27 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
       : (WF_STEPS[wfType] || [])  // fallback: no preset data yet, use catalog
   const steps = (() => {
     const s = [...baseSteps]
+    // ── code_review: always part of an execution run, even before one starts ──
+    // `merge_for_review` hands off to `code_review` unconditionally, but no
+    // preset lists it (every preset comments it as "runtime-inserted"). This
+    // injection used to sit inside the `&& wf` block below, so an IDLE panel —
+    // which has no workflow — showed a timeline with the review gate missing,
+    // and the step only appeared once a run had already reached it.
+    //
+    // Bugfix is deliberately NOT included here: its canonical order comes from
+    // the resolved `projectWorkflowSteps.bugfix` (which does list code_review),
+    // so a project that removed it from that list means it.
+    if (wfType === 'execution' && !s.find(x => x.key === 'code_review')) {
+      const qaIdx = s.findIndex(x => x.key === 'qa_validation')
+      const mfrIdx = s.findIndex(x => x.key === 'merge_for_review')
+      const at = qaIdx >= 0 ? qaIdx : mfrIdx >= 0 ? mfrIdx + 1 : -1
+      // Only with a known anchor. Appending to the end would claim code review
+      // runs after capture_learnings, which is worse than omitting it.
+      if (at >= 0) s.splice(at, 0, { key: 'code_review', name: 'Code Review' })
+    }
     if ((wfType === 'execution' || wfType === 'bugfix') && wf) {
-      // code_review is post-merge_for_review and not in any preset's array.
-      // Inject it just before qa_validation if it exists in wf.steps.
+      // A bugfix run whose resolved list somehow lacks code_review, but whose
+      // live state has it, still gets it placed correctly.
       if (wf.steps?.code_review && !s.find(x => x.key === 'code_review')) {
         const qaIdx = s.findIndex(x => x.key === 'qa_validation')
         const mfrIdx = s.findIndex(x => x.key === 'merge_for_review')
