@@ -21,6 +21,41 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-19 — Capture Learnings shows what the run captured, not the whole archive
+
+### Changed
+
+- **The Capture Learnings review panel now lists only the learnings this run
+  wrote or updated.** It was loading every learning in the project — 293 of them
+  in one case — under the heading "Review Learnings Before Approving", so the
+  two or three the run actually produced were buried in years of history. A
+  review surface nobody can read is not a review surface.
+
+  A learning carries no run id, so "this run's" is decided by file mtime against
+  the capture agent's start time. That deliberately includes **updated**
+  learnings as well as new ones: the capture step appends evidence to existing
+  files at least as often as it creates them, and an updated learning is just as
+  much a product of the run.
+
+  The full corpus is one click away — **Show all N** — rather than hidden, since
+  mtime is a heuristic and a merge or checkout can touch a file. If the run
+  captured nothing, the panel says so plainly instead of showing an unfiltered
+  list. When neither an agent start time nor a run timestamp is available (very
+  old runs), nothing is filtered and the previous behaviour stands.
+
+### Upgrade steps
+
+**In Build Studio** — hub change, so it needs the Next build and a full inject:
+
+```bash
+cd packages/hub && npx next build
+cd packages/desktop && node inject-resources.js
+```
+
+**In each managed project** — nothing to do.
+
+---
+
 ## 2026-08-18 — The execution timeline shows Code Review before the run starts
 
 ### Fixed

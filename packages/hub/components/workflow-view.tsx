@@ -35,6 +35,8 @@ interface WorkflowAgent {
    *  (e.g. the routed model behind openrouter/auto); absent → badge shows the configured string. */
   actualModel?: string
   tokenUsage?: { inputTokens: number; outputTokens: number; cacheCreate: number; cacheRead: number; costUSD: number }
+  /** ISO time the agent launched (server-set). */
+  startedAt?: string
 }
 
 /** Server-derived halt reason — project-server/lib/needs-attention.js.
@@ -150,6 +152,8 @@ interface Workflow {
   fixTaskIndex?: number
   fixSource?: string
   overseer?: OverseerState
+  /** ISO time the run was created (server-set). */
+  createdAt?: string
 }
 
 const WF_STEPS: Record<string, { key: string; name: string; loopHint?: string }[]> = {
@@ -1631,7 +1635,18 @@ function StepDetail({
 
       {/* Learnings preview — show what the agent wrote before approving */}
       {activeKey === 'capture_learnings' && allDone && (
-        <LearningsPreview />
+        // Anchor on when the capture agent started, not on the run's creation:
+        // it is the step that writes learnings, and a long run would otherwise
+        // sweep in anything else that touched the directory.
+        <LearningsPreview
+          since={(step.agents || []).reduce(
+            (min, a) => {
+              const t = a.startedAt ? Date.parse(a.startedAt) : NaN
+              return Number.isFinite(t) ? Math.min(min, t) : min
+            },
+            wf?.createdAt ? Date.parse(wf.createdAt) : Number.POSITIVE_INFINITY,
+          )}
+        />
       )}
 
 
@@ -2360,6 +2375,8 @@ function AgentLog({ logText, onClose, windowName }: { logText: string; onClose: 
 
 interface ParsedLearning {
   path: string
+  /** File mtime (ms). Used to tell this run's learnings from the back catalogue. */
+  mtime: number
   title: string
   date: string
   severity: string
@@ -2369,7 +2386,7 @@ interface ParsedLearning {
   category: string
 }
 
-function parseLearningFrontmatter(filePath: string, raw: string): ParsedLearning | null {
+function parseLearningFrontmatter(filePath: string, raw: string, mtime = 0): ParsedLearning | null {
   const m = raw.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/)
   if (!m) return null
   const fm: Record<string, string> = {}
@@ -2390,6 +2407,7 @@ function parseLearningFrontmatter(filePath: string, raw: string): ParsedLearning
 
   return {
     path: filePath,
+    mtime,
     title: fm.title || filePath.split('/').pop()?.replace('.md', '') || '',
     date: fm.date || '',
     severity: fm.severity || 'medium',
@@ -2400,10 +2418,29 @@ function parseLearningFrontmatter(filePath: string, raw: string): ParsedLearning
   }
 }
 
-function LearningsPreview() {
+/**
+ * The learnings this run produced — not the whole back catalogue.
+ *
+ * This panel exists to be READ before approving the step, and it was rendering
+ * every learning the project had ever captured (293 in one project), so the
+ * handful the run actually wrote were indistinguishable from years of history.
+ * A review surface nobody can read is not a review surface.
+ *
+ * "This run's" is decided by file mtime against the capture agent's start,
+ * because a learning carries no run id in its frontmatter. That also correctly
+ * catches an UPDATED learning: the capture step appends evidence to existing
+ * files as often as it writes new ones, and an updated one is just as much a
+ * product of this run.
+ *
+ * The full corpus stays one click away rather than being hidden — mtime is a
+ * heuristic (a merge or a checkout can touch a file), so the owner keeps a way
+ * to see everything if the filter looks wrong.
+ */
+function LearningsPreview({ since }: { since: number }) {
   const { baseUrl } = useProject()
   const [learnings, setLearnings] = useState<ParsedLearning[]>([])
   const [loading, setLoading] = useState(true)
+  const [showAll, setShowAll] = useState(false)
 
   useEffect(() => {
     async function load() {
@@ -2414,9 +2451,9 @@ function LearningsPreview() {
           (f: { path: string }) => f.path.match(/^learnings\/\w+\/.*\.md$/)
         )
         const parsed = await Promise.all(
-          learningFiles.map(async (f: { path: string }) => {
+          learningFiles.map(async (f: { path: string; mtime?: number }) => {
             const fileData = await fetch(`${baseUrl}/api/file?path=${encodeURIComponent(f.path)}`).then(r => r.json())
-            return parseLearningFrontmatter(f.path, fileData.content || '')
+            return parseLearningFrontmatter(f.path, fileData.content || '', f.mtime ?? fileData.mtime ?? 0)
           })
         )
         setLearnings(parsed.filter((l): l is ParsedLearning => l !== null))
@@ -2442,9 +2479,29 @@ function LearningsPreview() {
     )
   }
 
+  // Written or updated since the capture agent started. A non-finite `since`
+  // (no agent timestamp and no run createdAt) means we cannot tell, so nothing
+  // is filtered — better the old noisy list than a confidently empty one.
+  const canFilter = Number.isFinite(since)
+  const fromThisRun = canFilter ? learnings.filter(l => l.mtime >= since) : learnings
+  const visible = showAll || !canFilter ? learnings : fromThisRun
+
+  if (canFilter && fromThisRun.length === 0 && !showAll) {
+    return (
+      <div style={{ padding: 16, marginBottom: 16, border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-lg)', background: 'var(--surface)' }}>
+        <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--muted)', marginBottom: 8 }}>
+          This run captured no new learnings.
+        </div>
+        <button onClick={() => setShowAll(true)} className="wf-btn secondary" style={{ fontSize: 11 }}>
+          Show all {learnings.length} project learnings
+        </button>
+      </div>
+    )
+  }
+
   // Group by category
   const grouped: Record<string, ParsedLearning[]> = {}
-  for (const l of learnings) {
+  for (const l of visible) {
     if (!grouped[l.category]) grouped[l.category] = []
     grouped[l.category].push(l)
   }
@@ -2452,11 +2509,29 @@ function LearningsPreview() {
   return (
     <div style={{ marginBottom: 16 }}>
       <div style={{
-        fontFamily: 'var(--mono)', fontSize: 10, fontWeight: 600,
-        textTransform: 'uppercase', letterSpacing: '0.06em',
-        color: 'var(--accent)', marginBottom: 10,
+        display: 'flex', alignItems: 'baseline', justifyContent: 'space-between',
+        gap: 12, marginBottom: 10, flexWrap: 'wrap',
       }}>
-        Review Learnings Before Approving ({learnings.length} total)
+        <div style={{
+          fontFamily: 'var(--mono)', fontSize: 10, fontWeight: 600,
+          textTransform: 'uppercase', letterSpacing: '0.06em',
+          color: 'var(--accent)',
+        }}>
+          {showAll || !canFilter
+            ? `All Project Learnings (${learnings.length})`
+            : `Review Learnings Before Approving (${fromThisRun.length} from this run)`}
+        </div>
+        {canFilter && learnings.length > fromThisRun.length && (
+          <button
+            onClick={() => setShowAll(v => !v)}
+            className="wf-btn secondary"
+            style={{ fontSize: 11 }}
+          >
+            {showAll
+              ? `Show only this run (${fromThisRun.length})`
+              : `Show all ${learnings.length}`}
+          </button>
+        )}
       </div>
       {Object.entries(grouped).sort().map(([cat, entries]) => (
         <LearningsCategoryGroup key={cat} category={cat} entries={entries} />
