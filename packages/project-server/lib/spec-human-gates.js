@@ -71,6 +71,27 @@ const NEGATIONS = [
   // Prose referring back to a decision rather than asking for one.
   /\b(?:per|based on|following|records?|recorded|documented) (?:an? |the )?owner decision\b/i,
   /\bowner decision,? not a\b/i,
+  // A NUMBERED decision is one that has already been made. Specs cite them
+  // constantly — "owner decision 2, as clarified", "Owner decision 4 resolves
+  // it", "(PRD-124 §2.5, owner decision 3)" — because numbering them is how
+  // they get recorded. This was the single largest source of noise: one item's
+  // specs produced 31 gates, 18 of which were citations of four decisions the
+  // owner had already made (fazon FAZ-265, 2026-08-20).
+  /\bowner decisions?\s+\d+/i,
+  /\bdecisions?\s+\d+(?:\s*\(|\s+(?:was|is|were|now|as|resolves|solves|binds))/i,
+  // An invitation to PROPOSE something for approval is ordinary authoring flow,
+  // not a gate: the spec is telling an agent to do work, and the approval is
+  // the normal end of it.
+  /\bmay (?:now )?propose\b[^.]*\bfor owner approval\b/i,
+  /\ban? \w+ proposal for owner approval\b/i,
+  // A pending approval that NAMES ITS FALLBACK cannot block the run — which is
+  // the only thing this scan exists to prevent. "Awaiting owner approval. Until
+  // it is given, /ios_dev ships the fallback pair" is a spec doing the right
+  // thing, and reporting it trains the owner to ignore the list.
+  /\brecorded fallback\b/i,
+  /\bships? the fallback\b/i,
+  /\bfallback\b[^.]*\b(?:until|while|pending|in the meantime)\b/i,
+  /\b(?:until|while|pending)\b[^.]*\bfallback\b/i,
   /\bnot by attestation\b/i,
   /\bno human attestation\b/i,
   /\bnone is required\b/i,

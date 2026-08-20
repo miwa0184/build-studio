@@ -21,6 +21,53 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-20 — The human-gate scan stops reporting decisions you already made
+
+### Fixed
+
+- **The "needs a person" list was mostly citations of settled decisions.** One
+  item opened with *"31 things in this item's specs need a person"*; **18 of the
+  31 were references to four owner decisions already made and recorded.** Specs
+  cite decisions by number — "owner decision 2, as clarified", "Owner decision 4
+  resolves it", "(PRD-124 §2.5, owner decision 3)" — because numbering them is
+  how they get recorded, and the scan read every citation as a fresh gate. A
+  numbered decision is now treated as a citation.
+
+  Two narrower classes were also removed: an invitation to *propose* something
+  for approval ("`/brand` may propose the SV wording for owner approval") is
+  ordinary authoring work rather than a gate; and a pending approval that names
+  its fallback ("Awaiting owner approval. Until it is given, `/ios_dev` ships
+  the fallback pair") cannot block a run, which is the only thing this scan
+  exists to prevent.
+
+  On the item that prompted this, the list drops from **31 to 8**, and what
+  remains is genuinely owed: an SV label pair awaiting approval, a manual QA
+  reading-order sign-off, and a brand sign-off required to remove a pattern.
+
+  The scan stays advisory — it reports, it has never blocked a run.
+
+### Upgrade steps
+
+**In Build Studio** — project-server change:
+
+```bash
+cd packages/desktop && node inject-resources.js --sync-only
+```
+
+Then restart the app and any running project-servers.
+
+**In each managed project** — nothing to do. The change is in the scanner, not
+in your specs, and it re-runs from scratch on every workflow start.
+
+### Known issues
+
+- The remaining findings still count *mentions*, not distinct gates: one pending
+  approval quoted in four files reports four times. Worth collapsing, but the
+  file and line of each mention are what make a finding actionable, so it needs
+  a design rather than a filter.
+
+---
+
 ## 2026-08-19 — Capture Learnings shows what the run captured, not the whole archive
 
 ### Changed

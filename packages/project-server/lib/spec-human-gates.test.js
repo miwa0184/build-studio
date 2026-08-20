@@ -189,3 +189,61 @@ test('a real pending gate is untouched by the new negations', () => {
   assert.equal(findHumanGates('AC-5 is an owner decision, not an agent one', 'p.md').length, 1);
   assert.equal(findHumanGates('A second person reviews the fixture diff', 'p.md').length, 1);
 });
+
+// ─── Citations of decisions already made (fazon FAZ-265, 2026-08-20) ─────────
+//
+// One item's specs produced 31 gates under "31 things in this item's specs need
+// a person". Eighteen were citations of four decisions the owner had ALREADY
+// made: numbering a decision is how it gets recorded, so specs reference
+// "owner decision 3" constantly. A list that is mostly noise trains the owner
+// to dismiss it, which costs more than the list is worth.
+
+test('a numbered owner decision is a citation, not a pending gate', () => {
+  const cites = [
+    'Per owner decision 2, as clarified, the first-run default is the full scope.',
+    'Owner decision 4 resolves it: the two outputs are two export types.',
+    '##### The persistence surface (PRD-124 §2.5, owner decision 3)',
+    'shape in owner decision 4 as revised. The token is its own constant.',
+    '— decision 1 was narrowed on 2026-08-20 and /brand may now propose it.',
+    'Superseded by owner decision 3 (2026-08-20).',
+  ];
+  for (const line of cites) {
+    assert.deepEqual(findHumanGates(line, 'x.md'), [], line.slice(0, 60));
+  }
+});
+
+test('an invitation to propose for approval is authoring work, not a gate', () => {
+  for (const line of [
+    '`/brand` may propose the SV wording for owner approval, alongside the EN pair.',
+    'helper text, and an SV proposal for owner approval. The framing is binding.',
+  ]) {
+    assert.deepEqual(findHumanGates(line, 'x.md'), [], line.slice(0, 60));
+  }
+});
+
+// The scan exists to stop a gate coming back as a blocking finding every round
+// until the run cannot close. A gate that names its fallback cannot do that.
+test('a pending approval that names its fallback is not a blocker', () => {
+  for (const line of [
+    'Awaiting owner approval. Until it is given, /ios_dev ships the fallback pair.',
+    'The SV label pair is pending owner approval with the recorded fallback shipping until then.',
+  ]) {
+    assert.deepEqual(findHumanGates(line, 'x.md'), [], line.slice(0, 60));
+  }
+});
+
+test('the founding case and other genuinely pending gates still fire', () => {
+  // If any of these stops firing, the module has been negated into uselessness.
+  const real = [
+    'A second person reviews the fixture diff for sensitive data and records reviewer/date in the manifest.',
+    'This needs an owner decision before execution can start.',
+    'Blocked on an owner decision — no agent can rule this.',
+    'OQ-3 requires a human reviewer to confirm the corpus identity.',
+    'The release requires a manual sign-off from the owner.',
+    '**Open:** awaiting owner approval; nothing has been decided.',
+    'An attestation from the reviewer must be recorded.',
+  ];
+  for (const line of real) {
+    assert.equal(findHumanGates(line, 'x.md').length, 1, line.slice(0, 60));
+  }
+});
