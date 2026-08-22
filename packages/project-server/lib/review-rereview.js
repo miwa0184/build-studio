@@ -77,7 +77,16 @@ function roleHistory(wf, role, maxChars = 1200) {
  * introduced by a fix must still stop the run. What it forbids is treating the
  * document as unread.
  */
-function buildRereviewInstruction(role, skill, prdPath, round) {
+function buildRereviewInstruction(role, skill, prdPath, round, diffBase) {
+  // Telling a reviewer "do not re-read untouched sections" without showing it
+  // WHAT changed does not work — it opens the document to find out. Measured on
+  // a fazon review (2026-08-22): 5 of 6 round-2 reviewers read the full 394-line
+  // PRD, and round 2 cost 27% more cache reads and 20% more turns than round 1.
+  // By round 3 they had drifted to diff-first on their own and cost halved. This
+  // makes that the instruction rather than an accident.
+  const diffCmd = diffBase
+    ? `git diff ${diffBase} -- ${prdPath}`
+    : `git log --oneline -3 -- ${prdPath}   # then diff the previous commit against HEAD`;
   return `You are a ${role} reviewer doing a TARGETED RE-REVIEW. Use your /${skill} skill.
 
 PRD path: ${prdPath}
@@ -86,13 +95,25 @@ This is round ${round}. Round 1 swept the whole document; that has happened. You
 verify that the fixes claimed since your last review actually close the findings YOU raised —
 not to audit the document again from a new angle.
 
+## START HERE — THE DELTA, NOT THE DOCUMENT
+
+Run this first. It is the complete set of changes since your last review:
+
+    ${diffCmd}
+
+Work from that diff. Open the PRD only for a section the diff touches or one your own prior
+findings name, and read just that range (\`sed -n 'START,ENDp' ${prdPath}\`). Re-reading the whole
+document is exactly what this round exists to avoid: it costs a full review and produces findings
+about surfaces nobody changed.
+
 ## WHAT TO DO
 
-1. Read each of your prior findings below and locate the corresponding change in the PRD.
+1. Read the diff, then match each of your prior findings below to the change that claims to
+   close it.
 2. For each one, decide: **CLOSED** (the fix resolves it), **NOT CLOSED** (the fix misses or
    only partly addresses it — say precisely what remains), or **REGRESSED** (the fix broke
    something that previously read correctly).
-3. Read the sections the fixes touched. Do NOT re-read and re-assess sections that no fix
+3. Read only the sections the fixes touched. Do NOT re-read and re-assess sections that no fix
    touched and that you did not previously flag — those were reviewed in round 1 and are
    settled.
 

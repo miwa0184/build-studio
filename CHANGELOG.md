@@ -21,6 +21,47 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-22 — Re-reviews get the diff, and agent costs stop being 4x wrong
+
+### Fixed
+
+- **Per-agent token counts and costs were inflated several times over.** Usage
+  was attributed by *time window over every transcript in the project directory*
+  — but a review step runs six agents concurrently in the same directory, so
+  each was charged for all six, plus any other Claude session you had open in
+  that project. Measured on one review round: a reviewer reported 1,711,835
+  cache-read tokens against a real 421,411, and the round totalled **4.3x** its
+  true usage. Usage is now read from the agent's own session transcript.
+
+  An agent with no recorded session id now reports no usage rather than a guess.
+  A confidently wrong number is worse than a blank.
+
+### Changed
+
+- **A re-reviewing agent is now handed the exact diff to verify.** The
+  instruction already said not to re-read sections no fix touched, but gave no
+  way to see which those were — so reviewers opened the whole document anyway.
+  On a measured run, 5 of 6 round-2 reviewers read the full 394-line PRD and
+  **round 2 cost 27% more in cache reads and 20% more turns than round 1**. Each
+  review round now records the PRD's commit sha, and the next round's prompt
+  carries `git diff <sha> -- <prd>` as its first step, with instructions to open
+  the document only for ranges the diff or their own prior findings name.
+
+  By round 3 of that run the agents had drifted to diff-first behaviour on their
+  own and cost roughly halved — this makes that the instruction rather than an
+  accident. Runs that started before the sha was recorded fall back to a
+  `git log`-based recipe, so nothing loses the guidance mid-run.
+
+### Notes for forks
+
+- `computeTokenUsage(startedAt, completedAt, cwd, model, sessionId)` takes a
+  fifth argument and returns `null` without it.
+- `buildRereviewInstruction(role, skill, prdPath, round, diffBase)` takes a
+  fifth argument; omitting it yields the fallback recipe rather than throwing.
+- Review workflows now carry `wf.reviewBaseSha`.
+
+---
+
 ## 2026-08-22 — The spec human-gate scan is removed
 
 ### Removed

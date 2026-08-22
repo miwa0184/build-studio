@@ -1279,13 +1279,34 @@ function createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast) {
     sonnet: { input: 3,  output: 15, cacheCreate: 3.75,  cacheRead: 0.3 },
   };
 
-  function computeTokenUsage(startedAt, completedAt, agentCwd, modelShortName) {
+  /**
+   * Token usage for ONE agent.
+   *
+   * `sessionId` is what makes the answer an agent's own. Without it this fell
+   * back to "every transcript in the project touched during the agent's time
+   * window", and a review step runs six agents concurrently in the same cwd —
+   * so each was charged for all six, plus any other Claude session open in that
+   * project. Measured on a fazon review round (2026-08-22): one reviewer was
+   * reported at 1,711,835 cache-read tokens against a real 421,411, and the
+   * round totalled $41.67 against ~4x fewer tokens than that implies. The
+   * owner's own terminal session in the same project — 873M cache-read tokens
+   * on the day — was being swept in too.
+   *
+   * The window still applies as a second filter: a resumed session's transcript
+   * carries turns from before this agent started.
+   *
+   * @param {string|null} sessionId  the agent's cliSessionId; without it the
+   *   result is null rather than a guess, because a wrong number that looks
+   *   precise is worse than no number.
+   */
+  function computeTokenUsage(startedAt, completedAt, agentCwd, modelShortName, sessionId) {
     try {
       const os = require('os');
       // Derive Claude project slug from cwd: replace leading '/' with '-', rest '/' → '-'
       const slug = agentCwd.replace(/\//g, '-');
       const claudeDir = path.join(os.homedir(), '.claude', 'projects', slug);
       if (!fs.existsSync(claudeDir)) return null;
+      if (!sessionId) return null;
 
       const start = new Date(startedAt).getTime();
       const end = new Date(completedAt).getTime();
@@ -1295,6 +1316,8 @@ function createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast) {
 
       for (const file of fs.readdirSync(claudeDir)) {
         if (!file.endsWith('.jsonl')) continue;
+        // This agent's transcript only. The file is named for the session id.
+        if (file !== `${sessionId}.jsonl`) continue;
         const filePath = path.join(claudeDir, file);
         const stat = fs.statSync(filePath);
         // Skip files not touched during the agent's run window
@@ -3655,7 +3678,7 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     // the agent was still finishing) — delivered feedback proves the agent lived.
     agent.error = undefined;
     if (agent.startedAt && agent.agentCwd) {
-      agent.tokenUsage = computeTokenUsage(agent.startedAt, agent.completedAt, agent.agentCwd, agent.model);
+      agent.tokenUsage = computeTokenUsage(agent.startedAt, agent.completedAt, agent.agentCwd, agent.model, agent.cliSessionId);
     }
     // FU-1: harvest the opencode events stream into tokenUsage + kick actual-model resolution.
     captureOpencodeTelemetry(wf, agent, (f) => (f.steps?.[wf.currentStep]?.agents || []).find(a => normalizeRole(a.role) === normalizeRole(role)));
@@ -4910,7 +4933,7 @@ Fix only the issues raised. Commit your changes.`,
       // Clear any stale watchdog error — delivered feedback proves the agent lived.
       agent.error = undefined;
       if (agent.startedAt && agent.agentCwd) {
-        agent.tokenUsage = computeTokenUsage(agent.startedAt, agent.completedAt, agent.agentCwd, agent.model);
+        agent.tokenUsage = computeTokenUsage(agent.startedAt, agent.completedAt, agent.agentCwd, agent.model, agent.cliSessionId);
       }
       // FU-1: harvest the opencode events stream into tokenUsage + kick actual-model resolution.
       captureOpencodeTelemetry(wf, agent, (f) => (f.taskExecution?.taskStates?.[String(taskIdx)]?.agents || []).find(a => normalizeRole(a.role) === normalizeRole(role)));
@@ -4984,7 +5007,7 @@ Fix only the issues raised. Commit your changes.`,
         if (agent?.startedAt && agent?.agentCwd) {
           // claude: parse session jsonl; opencode: captureOpencodeTelemetry already
           // filled agent.tokenUsage from the events stream — reuse it for the task badge.
-          ts2.tokenUsage = computeTokenUsage(agent.startedAt, agent.completedAt, agent.agentCwd, agent.model) || agent.tokenUsage || null;
+          ts2.tokenUsage = computeTokenUsage(agent.startedAt, agent.completedAt, agent.agentCwd, agent.model, agent.cliSessionId) || agent.tokenUsage || null;
         }
         // Agent summary: first non-empty line of feedback
         const rawFeedback = (ts2.agents || []).find(a => a.feedback)?.feedback || '';
@@ -5783,6 +5806,19 @@ Fix only the issues raised. Commit your changes.`,
       // document under an instruction to produce only NEW material — which is a
       // finding generator, and the reason a review could never converge.
       const rvRereview = (wf.round || 1) > 1;
+      // The exact delta this round has to verify. Re-reviewers were told not to
+      // re-read untouched sections but given no way to see what changed, so they
+      // opened the whole PRD anyway: measured on a fazon run, 5 of 6 round-2
+      // reviewers read the full 394-line document, and round 2 cost 27% MORE in
+      // cache reads and 20% more turns than round 1 (2026-08-22). Recording the
+      // sha each round turns "don't re-read everything" into a command they can
+      // actually run.
+      const rvDiffBase = wf.reviewBaseSha || null;
+      try {
+        const sha = execFileSync('git', ['log', '-n', '1', '--format=%H', '--', wf.prdPath],
+          { cwd: projectRoot, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+        if (sha) wf.reviewBaseSha = sha;   // the base the NEXT round diffs against
+      } catch (_) { /* no git, or the PRD is uncommitted — fall back to no diff */ }
       const rvThreshold = freshLensRounds(config, MAX_REVIEW_ROUNDS, 'reviewing');
       const rvClosure = wrapupActive(wf.round || 1, rvThreshold, config, 'reviewing')
         ? buildWrapupBlock(wf.round || 1, rvThreshold, 'reviewing')
@@ -5795,7 +5831,7 @@ Fix only the issues raised. Commit your changes.`,
             feedback: null, reportFeedback: true,
             ...(rvRereview ? { historyOverride: roleHistory(wf, r.role) } : {}),
             instruction: rvRereview
-              ? buildRereviewInstruction(r.role, r.skill, wf.prdPath, wf.round) + rvClosure
+              ? buildRereviewInstruction(r.role, r.skill, wf.prdPath, wf.round, rvDiffBase) + rvClosure
               : `You are a ${r.role} reviewer. Review this PRD and provide structured feedback from a ${r.role} perspective. Use your /${r.skill} skill.\n\nPRD path: ${wf.prdPath}\n\nRead the PRD file, then analyze it.\n\n## REVIEW FORMAT — MANDATORY\n\nUse this exact format (it is machine-parsed by the dashboard):\n\n## Review: ${r.role}\n\n**Approved:** yes | no\n**Blocking:** N  |  **Medium:** N  |  **Low:** N\n\n### Summary\n[1-3 sentences — overall assessment]\n\n### Findings\n[Details grouped by topic. Mark each: BLOCKING, MEDIUM, or LOW.]\n\n### Action Items\n- [ ] [assignee_role] — description\n\n## REVIEW SCOPE RULES\n\n1. **Only review what the PRD covers.** If the PRD is about landing page polish, do not raise issues about backend storage architecture, payment flows, or other systems outside scope.\n2. **Check the "Out of scope" section** — anything listed there is explicitly excluded. Do not raise issues about excluded items.\n3. **Companion specs are OUT OF SCOPE for this review.** Companion-spec files (UX-XXX, ADRs, copy specs, and anything in docs/ux/, docs/brand/, docs/adrs/, etc.) are written and refined in the dedicated \`companion_specs\` step that runs AFTER this PRD review approves. Do NOT raise BLOCKING findings about missing or incomplete content inside companion-spec files — those gaps will be closed by the spec owner in the next step. If the PRD itself fails to anchor a decision that the companion spec needs, raise it as a NON-BLOCKING action item for the \`companion_specs\` step instead of blocking PRD approval.\n4. **Do not introduce new features.** Your job is to verify the proposed scope is correct and complete, not to expand it.\n5. **After round 2, only raise genuinely new issues.** If your concern was addressed in a previous round, confirm it is resolved — do not re-raise it or raise tangential follow-ups.\n6. **Classify each finding** as BLOCKING (must fix before implementation) or NON-BLOCKING (observation, can fix later). Be conservative with BLOCKING — most issues are non-blocking.\n7. **If you have no issues, set Approved: yes and all counts to 0.** Do not invent concerns to justify your review.\n\nThis is round ${wf.round}.${rvClosure}`,
           }));
           launchedAgents = launchWorkflowAgents(wf, agents, { useWorktrees: false });

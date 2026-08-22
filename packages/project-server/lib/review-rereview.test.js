@@ -74,3 +74,36 @@ test('an all-closed round is stated as the expected good outcome', () => {
   assert.match(i, /If every finding of yours is CLOSED/);
   assert.match(i, /not a rubber stamp/);
 });
+
+// ─── The delta has to be handed over, not just implied (fazon, 2026-08-22) ───
+//
+// The instruction already said "do not re-read untouched sections". Measured on
+// a real review, 5 of 6 round-2 reviewers read the full 394-line PRD anyway and
+// round 2 cost MORE than round 1 (+27% cache reads, +20% turns) — because
+// nothing told them HOW to see what changed.
+
+test('a known base sha becomes a runnable diff command', () => {
+  const t = buildRereviewInstruction('Brand', 'brand', 'docs/prds/PRD-125.md', 2, 'abc1234');
+  assert.match(t, /git diff abc1234 -- docs\/prds\/PRD-125\.md/);
+  assert.match(t, /START HERE — THE DELTA, NOT THE DOCUMENT/);
+});
+
+test('without a base sha it still says how to find the delta', () => {
+  // Runs launched before the sha was recorded must not lose the guidance.
+  const t = buildRereviewInstruction('QA', 'qa_review', 'docs/prds/PRD-9.md', 3, null);
+  assert.match(t, /START HERE — THE DELTA/);
+  assert.match(t, /git log --oneline -3 -- docs\/prds\/PRD-9\.md/);
+});
+
+test('the rest of the contract survives the new section', () => {
+  // The diff block is inserted mid-template; a broken literal would truncate it.
+  const t = buildRereviewInstruction('UX', 'ux', 'docs/prds/PRD-1.md', 2, 'deadbee');
+  for (const marker of ['## WHAT BLOCKS', '## WHAT DOES NOT BLOCK', '### Verification of prior findings', '### Action Items', 'REGRESSED']) {
+    assert.ok(t.includes(marker), `missing: ${marker}`);
+  }
+});
+
+test('reading the whole document is named as the thing to avoid', () => {
+  const t = buildRereviewInstruction('Architect', 'architect', 'p.md', 2, 'sha');
+  assert.match(t, /Re-reading the whole\s+document is exactly what this round exists to avoid/);
+});
