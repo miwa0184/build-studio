@@ -90,10 +90,10 @@ resolved state does.
 Why it pays twice: agents stop re-reading dead text every round (the measured
 ~25% of the largest document), and attention stops being diluted by it —
 long-context degradation from irrelevant material is a real, measured effect.
-A third, incidental benefit: tombstones written in gate vocabulary
-("attestation", "sign-off") stop tripping the pre-start human-gate scan
-(`lib/spec-human-gates.js`), which currently needs negation patterns to
-suppress exactly these.
+
+(An earlier draft claimed a third benefit — that archiving tombstones would
+stop them tripping a pre-start scan for human-only requirements. That scan has
+since been removed as unsalvageably noisy, so the benefit no longer exists.)
 
 Mechanics:
 

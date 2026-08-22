@@ -21,50 +21,57 @@ that move underneath you without your having edited anything.
 
 ---
 
-## 2026-08-20 — The human-gate scan stops reporting decisions you already made
+## 2026-08-22 — The spec human-gate scan is removed
 
-### Fixed
+### Removed
 
-- **The "needs a person" list was mostly citations of settled decisions.** One
-  item opened with *"31 things in this item's specs need a person"*; **18 of the
-  31 were references to four owner decisions already made and recorded.** Specs
-  cite decisions by number — "owner decision 2, as clarified", "Owner decision 4
-  resolves it", "(PRD-124 §2.5, owner decision 3)" — because numbering them is
-  how they get recorded, and the scan read every citation as a fresh gate. A
-  numbered decision is now treated as a citation.
+- **The pre-start scan for human-only requirements in specs is gone.** It
+  listed things it believed no agent could discharge — a second person, a manual
+  review, a sign-off, an owner decision — on the Backlog tab before a run and in
+  the `POST /workflow/start` response. In practice it could not tell a *pending*
+  obligation from prose that merely mentions one, and the noise crowded out the
+  occasional real finding.
 
-  Two narrower classes were also removed: an invitation to *propose* something
-  for approval ("`/brand` may propose the SV wording for owner approval") is
-  ordinary authoring work rather than a gate; and a pending approval that names
-  its fallback ("Awaiting owner approval. Until it is given, `/ios_dev` ships
-  the fallback pair") cannot block a run, which is the only thing this scan
-  exists to prevent.
+  Two examples from the runs that ended it. One item reported **31 gates, 18 of
+  them citations of four decisions the owner had already made** — specs cite
+  decisions by number ("owner decision 3", "Owner decision 4 resolves it")
+  because numbering is how a decision gets recorded. The next item reported
+  nine, six of which were `/security` sign-offs — and `/security` is a
+  configured agent role that runs during review, so those were not human gates
+  at all.
 
-  On the item that prompted this, the list drops from **31 to 8**, and what
-  remains is genuinely owed: an SV label pair awaiting approval, a manual QA
-  reading-order sign-off, and a brand sign-off required to remove a pattern.
+  Two rounds of tightening each cut the count without fixing the class: telling
+  "this needs a decision" from "this cites a decision" is a distinction of tense
+  and attribution that pattern matching over prose does not reliably make.
 
-  The scan stays advisory — it reports, it has never blocked a run.
+  Removed rather than disabled: `lib/spec-human-gates.js`, the
+  `humanGates` field on `POST /workflow/start` and
+  `GET /workflow/start-readiness`, and both UI panels.
+
+  **Unaffected:** the workflow steps that genuinely wait for you —
+  `demo_review`, `device_testing`, `owner_consultations` — are a different
+  mechanism (`needs-attention.js`, `HUMAN_GATES`). They are engine-defined,
+  unambiguous, and unchanged.
 
 ### Upgrade steps
 
-**In Build Studio** — project-server change:
+**In Build Studio** — project-server and hub both changed, so this needs the
+Next build and a full inject:
 
 ```bash
-cd packages/desktop && node inject-resources.js --sync-only
+cd packages/hub && npx next build
+cd packages/desktop && node inject-resources.js
 ```
 
-Then restart the app and any running project-servers.
+**In each managed project** — nothing to do. Nothing was ever written into your
+specs; the scan only read them.
 
-**In each managed project** — nothing to do. The change is in the scanner, not
-in your specs, and it re-runs from scratch on every workflow start.
+### Notes for forks
 
-### Known issues
-
-- The remaining findings still count *mentions*, not distinct gates: one pending
-  approval quoted in four files reports four times. Worth collapsing, but the
-  file and line of each mention are what make a finding actionable, so it needs
-  a design rather than a filter.
+- `GET /workflow/start-readiness` still exists and still reports branch,
+  default-branch, dirty and `needsAttention` — only `humanGates` is gone from
+  its response, and from the start response. A fork reading that field should
+  drop it; nothing else about either payload changed.
 
 ---
 

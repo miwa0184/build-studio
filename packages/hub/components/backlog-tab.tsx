@@ -138,23 +138,8 @@ export function BacklogTab({
   // both the rows and the readiness need re-reading.
   const [starting, setStarting] = useState<string | null>(null)
   const [startError, setStartError] = useState<{ id: string; message: string } | null>(null)
-  // Human gates found in this item's spec set, surfaced on the FIRST Start
-  // click. Confirming starts the run; the panel exists so a requirement only a
-  // person can discharge is seen before the run, not discovered by an agent
-  // that can only refuse it eight rounds later.
-  const [pendingGates, setPendingGates] = useState<{ id: string; run: RunType; gates: HumanGate[]; total: number; truncated: boolean } | null>(null)
 
-  const startRun = useCallback(async (id: string, run: RunType, opts: { skipGateCheck?: boolean } = {}) => {
-    if (!opts.skipGateCheck) {
-      try {
-        const r: Readiness = await api.get(`/workflow/start-readiness?item=${encodeURIComponent(id)}`)
-        if (r?.humanGates?.total) {
-          setPendingGates({ id, run, gates: r.humanGates.gates, total: r.humanGates.total, truncated: r.humanGates.truncated })
-          return
-        }
-      } catch { /* the scan is advisory — never let it stop a start */ }
-    }
-    setPendingGates(null)
+  const startRun = useCallback(async (id: string, run: RunType) => {
     setStarting(id)
     setStartError(null)
     try {
@@ -633,51 +618,6 @@ export function BacklogTab({
           }}>{startError.message}</div>
         )}
 
-        {pendingGates && pendingGates.id === id && (
-          <div style={{
-            margin: '0 12px 10px 64px', padding: '10px 12px',
-            background: 'rgba(245,158,11,0.08)', border: '1px solid var(--orange)',
-            borderRadius: 4, fontFamily: 'var(--mono)', fontSize: 11, lineHeight: 1.55,
-          }}>
-            <div style={{ color: 'var(--orange)', fontWeight: 700, marginBottom: 6 }}>
-              ⏸ {pendingGates.total} thing{pendingGates.total === 1 ? '' : 's'} in this item&rsquo;s specs need{pendingGates.total === 1 ? 's' : ''} a person
-            </div>
-            <div style={{ color: 'var(--text-dim)', marginBottom: 8 }}>
-              No agent can discharge these. Left in place they are reported as blocking findings
-              round after round, and the run cannot close. Resolve them first, or start knowing the
-              run will stop on them.
-            </div>
-            {pendingGates.gates.map((g, i) => (
-              <div key={i} style={{ marginBottom: 6 }}>
-                <div style={{ color: 'var(--text)' }}>&ldquo;{g.quote}&rdquo;</div>
-                <div style={{ color: 'var(--muted)', fontSize: 10 }}>{g.path}:{g.line} — {g.why}</div>
-              </div>
-            ))}
-            {pendingGates.truncated && (
-              <div style={{ color: 'var(--muted)', fontSize: 10, marginBottom: 6 }}>
-                Showing {pendingGates.gates.length} of {pendingGates.total}.
-              </div>
-            )}
-            <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-              <button
-                onClick={(e) => { e.stopPropagation(); startRun(pendingGates.id, pendingGates.run, { skipGateCheck: true }) }}
-                style={{
-                  padding: '4px 10px', borderRadius: 'var(--radius)', border: '1px solid var(--orange)',
-                  background: 'transparent', color: 'var(--orange)', fontFamily: 'var(--mono)',
-                  fontSize: 10, fontWeight: 700, cursor: 'pointer',
-                }}
-              >Start anyway</button>
-              <button
-                onClick={(e) => { e.stopPropagation(); setPendingGates(null) }}
-                style={{
-                  padding: '4px 10px', borderRadius: 'var(--radius)', border: '1px solid var(--border)',
-                  background: 'var(--surface2)', color: 'var(--text)', fontFamily: 'var(--mono)',
-                  fontSize: 10, fontWeight: 700, cursor: 'pointer',
-                }}
-              >Cancel</button>
-            </div>
-          </div>
-        )}
 
         {isExpanded && item && (
                       <div style={{
@@ -887,10 +827,8 @@ interface Readiness {
   dirty: boolean
   /** Requirements found in the item's spec set that only a person can
    *  discharge. Advisory: present or not, the run can still be started. */
-  humanGates?: { gates: HumanGate[]; total: number; truncated: boolean } | null
 }
 
-interface HumanGate { path: string; line: number; quote: string; why: string }
 
 /** The run this item's (type, status) makes it eligible for, or null. */
 function plannedRunFor(item?: Item): RunType | null {

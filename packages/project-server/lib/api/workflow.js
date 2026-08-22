@@ -15,7 +15,6 @@ const memoryGuard = require('../memory-guard');
 const transcriptRecovery = require('../transcript-recovery');
 const exitRecovery = require('../exit-recovery');
 const agentSkills = require('../agent-skills');
-const specHumanGates = require('../spec-human-gates');
 const gateBlocked = require('../gate-blocked');
 const { extractFixPlan, checkFeedbackContract, rejectionOutcome, MAX_REJECTIONS } = require('../plan-contract');
 const { assertInside } = require('../path-guard');
@@ -2983,55 +2982,6 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     return null;
   }
 
-  /**
-   * Human gates in a backlog item's spec set — the item file, the PRD it names,
-   * and every `docs/**.md` that PRD links.
-   *
-   * Advisory everywhere it is used: a requirement only a person can discharge is
-   * legitimate, and the owner decides. What it must not do is stay invisible,
-   * because an agent handed one can only refuse it and the refusal reads
-   * downstream as an ordinary blocking finding — eight fix rounds against "a
-   * second person reviews the fixture diff", zero product defects found (fazon
-   * PRD-105, 2026-08-09).
-   *
-   * Shared by start-readiness (pre-click) and the start response (every caller,
-   * including unattended ones), so all three entry points report the same thing.
-   *
-   * @returns {{gates:object[], total:number, truncated:boolean}|null}
-   */
-  function scanItemHumanGates(item) {
-    const id = String(item || '').trim();
-    // A backlog id is an id, not a path. This value arrives from a request
-    // query parameter and from `wf.input`, and is interpolated into a filename,
-    // so anything with a separator or a `..` segment is rejected outright
-    // rather than normalised — `FAZ-243` and `../../../../etc/hosts` must not
-    // both be accepted. `spec-human-gates` enforces containment again on every
-    // path it reads; this is the cheaper, earlier half of the same guard.
-    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id) || id.includes('..')) return null;
-    try {
-      const itemFile = assertInside(path.join('backlog', `${id}.md`), docsPath);
-      const paths = [path.relative(projectRoot, itemFile)];
-      try {
-        const raw = fs.readFileSync(itemFile, 'utf8');
-        const prdMatch = raw.match(/^prd:\s*(.+)$/m);
-        const prd = prdMatch && prdMatch[1].trim().replace(/^['"]|['"]$/g, '');
-        if (prd && prd !== 'null') {
-          paths.push(prd);
-          // The `prd:` value is repo content an agent wrote — untrusted for the
-          // same reason the id is. assertInside throws on anything escaping the
-          // project, and the catch below leaves `paths` with what was already
-          // collected rather than failing the whole scan.
-          const prdAbs = assertInside(prd, projectRoot);
-          const prdText = fs.existsSync(prdAbs) ? fs.readFileSync(prdAbs, 'utf8') : '';
-          for (const m of prdText.matchAll(/\b(docs\/[\w./-]+\.md)\b/g)) paths.push(m[1]);
-        }
-      } catch (_) { /* item unreadable, or a path escaping the project — scan what we have */ }
-      const scan = specHumanGates.scanSpecsForHumanGates([...new Set(paths)], fs, projectRoot);
-      return scan.total > 0 ? scan : null;
-    } catch (_) {
-      return null;
-    }
-  }
 
   // --- Routes ---
   router.get('/workflow', (req, res) => {
@@ -3613,22 +3563,7 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     // its specs carry — including AC-5's owner decision, which the run then
     // headed straight for (2026-08-09).
     //
-    // Advisory, exactly like the pre-click scan: the run has already started by
-    // the time this is attached, and nothing here can stop it. It exists so the
-    // information reaches every caller, including the ones with no screen — the
-    // log line below is what an unattended job leaves behind for later.
-    let humanGates = null;
-    try {
-      const scanned = scanItemHumanGates(wf.input);
-      if (scanned && scanned.total > 0) {
-        humanGates = scanned;
-        console.warn(`[workflow] ${wf.input}: ${scanned.total} human gate(s) in this item's specs — `
-          + `no agent can discharge these, and left in place they surface as blocking findings:`);
-        for (const g of scanned.gates) console.warn(`[workflow]   ${g.path}:${g.line} — ${g.why}`);
-      }
-    } catch (_) { /* advisory — never let the scan affect a start */ }
-
-    res.json({ workflow: wf, ...(humanGates ? { humanGates } : {}) });
+    res.json({ workflow: wf });
   });
 
   router.post('/workflow/feedback', (req, res) => {
@@ -3851,7 +3786,6 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     try { dirty = g(['status', '--porcelain']).length > 0; } catch (_) {}
     const active = state.loadWorkflow();
 
-    const humanGates = scanItemHumanGates(String(req.query.item || '').trim());
 
     // needsAttention distinguishes "a run is working" from "a run is finished
     // but still holding the slot" — both block a start, but only the second one
@@ -3863,7 +3797,6 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
       defaultBranch,
       onDefaultBranch: !!branch && branch === defaultBranch,
       dirty,
-      humanGates,
     });
   });
 

@@ -538,9 +538,6 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
 
   const [startError, setStartError] = useState<string | null>(null)
   const [startCanOverride, setStartCanOverride] = useState(false)
-  const [humanGates, setHumanGates] = useState<
-    { gates: { path: string; line: number; quote: string; why: string }[]; total: number; truncated: boolean } | null
-  >(null)
   async function startWorkflow(override?: boolean) {
     // Onboarding doesn't take a PRD input — the project itself is the input.
     if (wfType !== 'onboarding' && !input.trim()) return
@@ -554,13 +551,6 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
     // api.post returns the parsed body (incl. {error}) and does NOT throw on non-2xx,
     // so a guardrail 409 must be surfaced explicitly — otherwise Start looks like a no-op.
     const res = await api.post('/workflow/start', body)
-    // Human gates the item's specs carry. The Backlog tab catches these BEFORE
-    // starting; this path starts first, so they are shown as a persistent notice
-    // instead — the run is advisory-gated, not blocked. Without this, starting
-    // from here (or from an unattended caller) surfaced nothing at all: FAZ-243
-    // went in carrying six, including an owner decision the run then walked
-    // straight into (2026-08-09).
-    setHumanGates(res?.humanGates ?? null)
     if (res && res.error) {
       setStartError(res.error)
       // canOverride-gated errors (e.g. an execution start with a Required
@@ -1211,44 +1201,6 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
           </div>
         )}
 
-        {/* Human gates the started item's specs carry. The Backlog tab catches
-            these before starting; this path (and any unattended caller) starts
-            first, so they are reported here instead. Advisory — the run is not
-            blocked — but it must not be silent, which is exactly what FAZ-243
-            was when it went in carrying six. */}
-        {humanGates && (
-          <div style={{
-            marginBottom: 12, padding: '10px 14px', borderRadius: 4,
-            background: 'color-mix(in srgb, var(--orange) 13%, transparent)',
-            border: '1px solid var(--orange)', fontFamily: 'var(--mono)', fontSize: 11, lineHeight: 1.55,
-          }}>
-            <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 6 }}>
-              <span>⏸</span>
-              <span style={{ color: 'var(--orange)', fontWeight: 700 }}>
-                {humanGates.total} thing{humanGates.total === 1 ? '' : 's'} in this item&rsquo;s specs need{humanGates.total === 1 ? 's' : ''} a person
-              </span>
-              <button
-                onClick={() => setHumanGates(null)}
-                style={{ marginLeft: 'auto', background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer', fontFamily: 'var(--mono)', fontSize: 11 }}
-              >dismiss</button>
-            </div>
-            <div style={{ color: 'var(--text-dim)', marginBottom: 8 }}>
-              No agent can discharge these. Left unresolved they come back as blocking findings round
-              after round, and the run cannot close.
-            </div>
-            {humanGates.gates.map((g, i) => (
-              <div key={i} style={{ marginBottom: 5 }}>
-                <div style={{ color: 'var(--text)' }}>&ldquo;{g.quote}&rdquo;</div>
-                <div style={{ color: 'var(--muted)', fontSize: 10 }}>{g.path}:{g.line} — {g.why}</div>
-              </div>
-            ))}
-            {humanGates.truncated && (
-              <div style={{ color: 'var(--muted)', fontSize: 10 }}>
-                Showing {humanGates.gates.length} of {humanGates.total}.
-              </div>
-            )}
-          </div>
-        )}
 
         {/* The run is stopped and will stay stopped until someone acts. Covers every
             halt the engine can reach — a dead step, a blocked guardrail, a human
