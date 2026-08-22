@@ -52,12 +52,27 @@ that move underneath you without your having edited anything.
   accident. Runs that started before the sha was recorded fall back to a
   `git log`-based recipe, so nothing loses the guidance mid-run.
 
+- **A re-reviewer now receives its prior findings in full.** A flat 1,200-character
+  cap applied to every history entry, which delivered each reviewer **11–18% of
+  its own previous review**: the cut landed on the first finding's *title*, so
+  every finding body was missing, along with 80% of the PM fix report claiming
+  to close them. One reviewer responded by running `sed` over its own transcript
+  file to recover what had been cut.
+
+  The most recent round — the reviewer's own findings and the PM fix report
+  answering them — is now delivered whole. Earlier rounds stay capped, since
+  their findings were already adjudicated in the round that followed, so the
+  block stays bounded as rounds accumulate rather than growing with each one.
+  Truncation now states how much was removed instead of trailing off.
+
 ### Notes for forks
 
 - `computeTokenUsage(startedAt, completedAt, cwd, model, sessionId)` takes a
   fifth argument and returns `null` without it.
 - `buildRereviewInstruction(role, skill, prdPath, round, diffBase)` takes a
   fifth argument; omitting it yields the fallback recipe rather than throwing.
+- `roleHistory`'s third argument is now `olderMaxChars` — it caps rounds before
+  the latest only, and no longer bounds the whole block.
 - Review workflows now carry `wf.reviewBaseSha`.
 
 ---

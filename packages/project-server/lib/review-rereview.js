@@ -39,12 +39,25 @@
  * PM fix reports are always included regardless of role, because they are the
  * claim being verified.
  *
+ * **The most recent round is delivered in full.** A flat 1200-char cap used to
+ * apply to every entry, which on a measured run gave each reviewer 11-18% of its
+ * own prior review: the cut landed on the first finding's TITLE, so the bodies —
+ * the things being verified — were gone, along with 80% of the PM fix report
+ * claiming to close them. One reviewer responded by running `sed` over its own
+ * transcript .jsonl to recover what had been cut (fazon, 2026-08-22).
+ *
+ * Delivering the latest round whole is also the cheap option, which is what
+ * settles it: the biggest observed review plus fix report is ~17k chars against
+ * the 30.7k-char PRD a truncated reviewer re-reads instead. Older rounds stay
+ * capped — their findings were already adjudicated in the round that followed —
+ * so the block does not grow without bound as rounds accumulate.
+ *
  * @param {object} wf
  * @param {string} role
- * @param {number} [maxChars] per-entry truncation
+ * @param {number} [olderMaxChars] truncation for rounds before the latest
  * @returns {string} markdown block, or '' when there is nothing to show
  */
-function roleHistory(wf, role, maxChars = 1200) {
+function roleHistory(wf, role, olderMaxChars = 1200) {
   const all = (wf && wf.feedback) || [];
   const norm = (s) => String(s || '').toLowerCase().replace(/[\s_-]+/g, '');
   const wanted = norm(role);
@@ -52,9 +65,22 @@ function roleHistory(wf, role, maxChars = 1200) {
   const fixes = all.filter((f) => f.step === 'pm_fix');
   if (mine.length === 0 && fixes.length === 0) return '';
 
-  const clip = (t) => {
+  // A hard ceiling for the full-text entries too, so one pathological review
+  // cannot dominate the prompt. Far above anything observed (~11k).
+  const FULL_MAX = 24000;
+  const latestRound = Math.max(
+    0,
+    ...mine.map((f) => Number(f.round) || 0),
+    ...fixes.map((f) => Number(f.round) || 0),
+  );
+  // Say what was cut and why. A silent truncation reads as 'this is all of it',
+  // which is how a reviewer ends up verifying a finding it cannot see.
+  const clip = (t, full) => {
     const s = String(t || '');
-    return s.length > maxChars ? `${s.slice(0, maxChars)}… (truncated)` : s;
+    const limit = full ? FULL_MAX : olderMaxChars;
+    if (s.length <= limit) return s;
+    return `${s.slice(0, limit)}\n\n… (truncated — ${s.length - limit} more characters from an`
+      + ` earlier round; the latest round is shown in full)`;
   };
 
   let out = `\n\n## YOUR PRIOR FINDINGS AND THE FIXES CLAIMED FOR THEM\n\n`
@@ -62,10 +88,12 @@ function roleHistory(wf, role, maxChars = 1200) {
     + `re-litigating them is how a re-review turns back into a fresh sweep.\n`;
 
   for (const f of mine) {
-    out += `\n### Round ${f.round} — your review\n${clip(f.feedback)}\n`;
+    const full = (Number(f.round) || 0) === latestRound;
+    out += `\n### Round ${f.round} — your review${full ? ' (full text)' : ''}\n${clip(f.feedback, full)}\n`;
   }
   for (const f of fixes) {
-    out += `\n### Round ${f.round} — PM fix report (the claim you are verifying)\n${clip(f.feedback)}\n`;
+    const full = (Number(f.round) || 0) === latestRound;
+    out += `\n### Round ${f.round} — PM fix report (the claim you are verifying)${full ? ' (full text)' : ''}\n${clip(f.feedback, full)}\n`;
   }
   return out;
 }

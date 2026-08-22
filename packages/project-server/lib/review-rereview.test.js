@@ -44,11 +44,17 @@ test('a role with no prior findings and no fixes gets nothing rather than an emp
   assert.equal(roleHistory({ round: 2, feedback: [] }, 'Brand'), '');
 });
 
-test('long feedback is truncated, and says so', () => {
-  const wf = { round: 2, feedback: [{ round: 1, step: 'reviewing', role: 'Brand', feedback: 'x'.repeat(5000) }] };
+test('an OLDER round is truncated, and says so', () => {
+  // Was "long feedback is truncated": the cap now applies only to rounds before
+  // the latest, because a truncated latest round is the thing being verified.
+  const wf = { round: 3, feedback: [
+    { round: 1, step: 'reviewing', role: 'Brand', feedback: 'x'.repeat(5000) },
+    { round: 2, step: 'reviewing', role: 'Brand', feedback: 'latest' },
+  ] };
   const h = roleHistory(wf, 'Brand', 100);
-  assert.match(h, /… \(truncated\)/);
-  assert.ok(h.length < 1000);
+  assert.match(h, /truncated/);
+  assert.ok(h.includes('latest'), 'the latest round must survive whole');
+  assert.ok(h.length < 1500);
 });
 
 test('the re-review instruction narrows scope without forbidding blocking', () => {
@@ -106,4 +112,63 @@ test('the rest of the contract survives the new section', () => {
 test('reading the whole document is named as the thing to avoid', () => {
   const t = buildRereviewInstruction('Architect', 'architect', 'p.md', 2, 'sha');
   assert.match(t, /Re-reading the whole\s+document is exactly what this round exists to avoid/);
+});
+
+// ─── The latest round must arrive whole (fazon, 2026-08-22) ─────────────────
+//
+// A flat 1200-char cap gave each reviewer 11-18% of its own prior review. The
+// cut landed on the first finding's TITLE, so every finding body — the thing
+// being verified — was gone, as was 80% of the PM fix report claiming to close
+// them. A reviewer ran `sed` over its own transcript to recover the rest.
+
+function wfWith(entries) { return { feedback: entries }; }
+const long = (n, tag) => `${tag} `.repeat(Math.ceil(n / (tag.length + 1))).slice(0, n);
+
+test('the latest round of own findings is delivered in full', () => {
+  const body = long(9000, 'FINDING');
+  const h = roleHistory(wfWith([{ role: 'QA', round: 2, step: 'reviewing', feedback: body }]), 'QA');
+  assert.ok(h.includes(body), 'the whole review must be present');
+  assert.doesNotMatch(h, /truncated/);
+});
+
+test('the latest PM fix report is delivered in full — it is the claim', () => {
+  const fix = long(6000, 'FIXED');
+  const h = roleHistory(wfWith([{ role: 'PM', round: 2, step: 'pm_fix', feedback: fix }]), 'QA');
+  assert.ok(h.includes(fix));
+  assert.doesNotMatch(h, /truncated/);
+});
+
+test('older rounds stay capped, so the block does not grow without bound', () => {
+  const h = roleHistory(wfWith([
+    { role: 'QA', round: 1, step: 'reviewing', feedback: long(9000, 'OLD') },
+    { role: 'QA', round: 4, step: 'reviewing', feedback: long(9000, 'NEW') },
+  ]), 'QA');
+  assert.match(h, /truncated/, 'round 1 should be cut');
+  assert.ok(h.includes(long(9000, 'NEW')), 'round 4 should be whole');
+  assert.ok(h.length < 9000 + 1200 + 3000, `block should stay bounded, got ${h.length}`);
+});
+
+test('a truncation says what was removed rather than trailing off', () => {
+  // Silent truncation reads as "this is all of it", which is how a reviewer
+  // ends up verifying a finding it cannot see.
+  const h = roleHistory(wfWith([
+    { role: 'QA', round: 1, step: 'reviewing', feedback: long(5000, 'OLD') },
+    { role: 'QA', round: 2, step: 'reviewing', feedback: 'short' },
+  ]), 'QA');
+  assert.match(h, /more characters from an earlier round; the latest round is shown in full/);
+});
+
+test('only this role\'s findings are included', () => {
+  const h = roleHistory(wfWith([
+    { role: 'QA', round: 1, step: 'reviewing', feedback: 'QA-FINDING' },
+    { role: 'Brand', round: 1, step: 'reviewing', feedback: 'BRAND-FINDING' },
+  ]), 'QA');
+  assert.ok(h.includes('QA-FINDING'));
+  assert.ok(!h.includes('BRAND-FINDING'), 'other roles must not leak in');
+});
+
+test('even a full-text entry has a ceiling', () => {
+  const h = roleHistory(wfWith([{ role: 'QA', round: 1, step: 'reviewing', feedback: long(40000, 'X') }]), 'QA');
+  assert.match(h, /truncated/);
+  assert.ok(h.length < 30000, `pathological entry must not dominate, got ${h.length}`);
 });
