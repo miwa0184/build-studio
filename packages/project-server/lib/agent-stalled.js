@@ -128,7 +128,31 @@ function classifyStalledAgent({
   if (!isAwaitingInput(text)) return null;
   if (!Number.isFinite(idleMs) || idleMs < waitConfirmMs) return null;
 
-  // 2. Finished but never reported. The strong clause is the recoverable
+  // 2. At a DIALOG, asking a question. This is positive evidence — the CLI's
+  //    own navigation footer — and it outranks the recoverable-report heuristic
+  //    below, which is only an inference.
+  //
+  //    Order matters here, and getting it wrong is expensive. An agent drawing
+  //    a numbered menu has NOT finished: it is holding its context open waiting
+  //    for a person, usually with uncommitted work in its worktree. But a long
+  //    run has almost always left something report-shaped in its transcript by
+  //    then, so `hasRecoverableReport` is true and the next branch claimed the
+  //    agent had "finished but never reported" — offering two actions that both
+  //    destroy what it is waiting to be told. Recover posts a partial answer as
+  //    the step's result; relaunch throws away the context and the uncommitted
+  //    work. The actual fix is one keystroke in the pane (2026-08-23: a QA agent
+  //    blocked on a pre-commit hook question, reported as finished, ~50 minutes
+  //    of work one Recover click away from being silently discarded).
+  if (WAITING_MARKERS.some((re) => re.test(text))) {
+    return {
+      reason: 'awaiting_decision',
+      title: 'An agent is waiting for your decision',
+      detail: 'The agent asked a question and is holding at its own prompt. It has not finished — its context and any uncommitted work are intact, and it will wait indefinitely.',
+      action: 'Open that agent\'s terminal and answer it. Do NOT recover or relaunch — recovering posts a partial report as the step result, and relaunching discards its context and any uncommitted work.',
+    };
+  }
+
+  // 3. Finished but never reported. The strong clause is the recoverable
   //    report: the agent's own words already exist, it simply never sent them.
   if (hasRecoverableReport) {
     return {
@@ -139,8 +163,8 @@ function classifyStalledAgent({
     };
   }
 
-  // 3. Waiting, with nothing behind it. Weakest signal — say so rather than
-  //    implying a diagnosis, and offer no automatic action.
+  // 4. Waiting, with nothing behind it and no dialog on screen. Weakest signal —
+  //    say so rather than implying a diagnosis, and offer no automatic action.
   return {
     reason: 'agent_waiting',
     title: 'An agent is waiting and will not proceed',

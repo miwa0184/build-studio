@@ -222,6 +222,53 @@ test('a stalled marker on an agent that is no longer running is ignored', () => 
   assert.equal(deriveNeedsAttention(wfWithStalled('agent_waiting', 'done')), null);
 });
 
+// The 15-minute idle timeout stamps status='error' on any agent whose log has
+// gone quiet — and an agent that stalls by WAITING produces no log output, so
+// it always gets stamped. Requiring status==='running' therefore excluded the
+// exact case this rule exists for: the diagnosis was computed, stored, and
+// never shown, while the dead-step rule reported "all agents errored with no
+// output — relaunch" about a live agent holding uncommitted work.
+test('an agent stamped error by the idle timeout still surfaces its diagnosis', () => {
+  const n = deriveNeedsAttention(wfWithStalled('awaiting_decision', 'error'));
+  assert.equal(n.reason, 'awaiting_decision');
+  assert.equal(n.step, 'reviewing');
+});
+
+test('the alive-but-stuck diagnosis outranks the dead-step rules', () => {
+  // Both describe the same step. dead_step's action is "relaunch", which is the
+  // one thing that must not happen to an agent waiting at a dialog.
+  const wf = {
+    currentStep: 'qa_tests',
+    steps: {
+      qa_tests: {
+        status: 'running',
+        autoAdvanceError: 'all 1 agent(s) errored with no output — halted instead of advancing past a dead step',
+        agents: [{
+          role: 'QA', status: 'error', feedback: null,
+          stalled: {
+            reason: 'awaiting_decision',
+            title: 'An agent is waiting for your decision',
+            detail: 'It asked a question and is holding at its own prompt.',
+            action: 'Open that agent\'s terminal and answer it.',
+          },
+        }],
+      },
+    },
+  };
+  const n = deriveNeedsAttention(wf);
+  assert.equal(n.reason, 'awaiting_decision');
+  assert.doesNotMatch(n.action, /relaunch/i);
+});
+
+test('a genuinely dead step is still reported as dead', () => {
+  // The reordering must not shadow the rule it now sits in front of.
+  const wf = {
+    currentStep: 'qa_tests',
+    steps: { qa_tests: { status: 'running', agents: [{ role: 'QA', status: 'error', feedback: null, error: 'boom' }] } },
+  };
+  assert.equal(deriveNeedsAttention(wf).reason, 'dead_step');
+});
+
 test('a gate that could not run reaches the owner, not the fix loop', () => {
   const wf = { currentStep: 'qa_validation', steps: { qa_validation: { status: 'running', agents: [
     { role: 'QA', status: 'done', feedback: '**Tests passed:** 7/7\n**Gate could not run:** ERR_CONNECTION_REFUSED' },

@@ -25,6 +25,29 @@ that move underneath you without your having edited anything.
 
 ### Fixed
 
+- **An agent waiting at a question was reported as a dead step, and the fix
+  offered was the one that destroys its work.** When an agent asks a question it
+  draws a menu and waits — producing no log output, which trips the 15-minute
+  idle timeout, which stamps the agent `error`. Two things then went wrong at
+  once. The stall classifier saw a recoverable report in the transcript (a long
+  run has almost always left something report-shaped by then) and called it
+  *"An agent finished but never reported — use Recover, or relaunch the step."*
+  And the dashboard banner skipped that diagnosis entirely, because it only
+  surfaced stalls on agents still marked `running`, so what you actually saw was
+  *"all agent(s) errored with no output — fix the cause and relaunch."*
+
+  Every action on offer was destructive: Recover posts a partial report as the
+  step's result, and relaunch discards the agent's context and any uncommitted
+  work in its worktree. The agent was alive, intact, and one keystroke from
+  continuing.
+
+  A pane showing a dialog is now reported as **"An agent is waiting for your
+  decision"**, with the action to open its terminal and answer — and it outranks
+  both the recoverable-report guess and the dead-step rule. An agent stamped
+  `error` by the idle timeout still surfaces its own diagnosis instead of a
+  generic one. A genuinely dead step is still reported as dead, and a bare
+  prompt with a report behind it is still `finished_not_reported`.
+
 - **QA delivered its companion spec and the dashboard showed "Changes
   requested".** The `companion_specs` step writes specs; it is not a review
   round, and it has no verdict to give. But it resolved each §10 owner without
@@ -64,13 +87,18 @@ that move underneath you without your having edited anything.
 
 ### Upgrade steps
 
-**In Build Studio** — project-server change only:
+**In Build Studio** — hub and project-server both changed, so a full rebuild:
 
 ```bash
-cd packages/desktop && node inject-resources.js --sync-only
+cd packages/hub && npx next build
+cd packages/desktop && node inject-resources.js
 ```
 
 Then restart the Electron app and any running project-servers.
+
+Time the restart: relaunching stops the project-servers, and an agent parked at
+a question is exactly the thing this release makes visible. Answer any waiting
+agent first — its context does not survive a relaunched step.
 
 **In each managed project** — nothing to do. The role rosters ship with the
 presets and are unchanged. One caveat: a project that overrides `roles` and

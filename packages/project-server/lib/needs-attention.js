@@ -96,6 +96,39 @@ function deriveNeedsAttention(wf) {
     };
   }
 
+  // 2b. An agent that is ALIVE but will never progress on its own — waiting at
+  //     a dialog, blocked on an expired login, or finished without posting its
+  //     report. The watchdog derives this second axis onto the agent
+  //     (agent-stalled.js) and deletes it the moment the agent recovers, so the
+  //     presence of `a.stalled` is itself the signal.
+  //
+  //     This runs BEFORE the dead-step rules below, and deliberately does not
+  //     require `status === 'running'`. Both of those were wrong for the case
+  //     this rule exists to catch. An agent that stalls by WAITING produces no
+  //     log output, so it always trips the 15-minute idle timeout, which stamps
+  //     `status = 'error'` — the rule then skipped it, and the dead-step rule
+  //     underneath reported "all agents errored with no output, relaunch the
+  //     step" about a live agent holding uncommitted work. The diagnosis was
+  //     computed correctly, stored on the agent, and never shown to anyone
+  //     (2026-08-23). `a.stalled` only exists because the process check said the
+  //     agent was alive, so it is the more specific answer wherever both apply.
+  for (const [key, st] of Object.entries(wf.steps || {})) {
+    for (const a of st.agents || []) {
+      // 'done' still disqualifies — a flag must not outlive its condition. But
+      // 'error' does not: that is the idle timeout's stamp, not a verdict about
+      // the process, and it is the state a waiting agent always ends up in.
+      if (a && a.stalled && !a.feedback && a.status !== 'done') {
+        return {
+          reason: a.stalled.reason,
+          step: key,
+          title: a.stalled.title,
+          detail: `${a.role}: ${a.stalled.detail}`,
+          action: a.stalled.action,
+        };
+      }
+    }
+  }
+
   if (step) {
     // 3. Every agent died with no output, or a gate rejected the step past the
     //    retry ceiling. Both stash the explanation in the same place.
@@ -163,24 +196,8 @@ function deriveNeedsAttention(wf) {
     }
   }
 
-  // 4b. An agent that is ALIVE but will never progress — an expired login, or
-  //     one that finished and never posted its report. The process checks above
-  //     say "healthy", because it is; the watchdog derives this second axis onto
-  //     the agent (agent-stalled.js) and it is surfaced here so every consumer
-  //     sees one answer. Advisory: nothing halts, the owner decides.
-  for (const [key, st] of Object.entries(wf.steps || {})) {
-    for (const a of st.agents || []) {
-      if (a && a.stalled && a.status === 'running') {
-        return {
-          reason: a.stalled.reason,
-          step: key,
-          title: a.stalled.title,
-          detail: `${a.role}: ${a.stalled.detail}`,
-          action: a.stalled.action,
-        };
-      }
-    }
-  }
+  // (The alive-but-stuck scan that used to sit here is now rule 2b, above the
+  //  dead-step rules it was losing to.)
 
   // 5. A gate that exists to wait for a person. Not a failure — but the run is
   //    stopped and will stay stopped, which is what a caller needs to know.

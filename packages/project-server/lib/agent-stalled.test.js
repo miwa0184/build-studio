@@ -90,7 +90,43 @@ const DIALOG_WORKING_PANE = [
 test('a question dialog is recognised as waiting despite its "Esc to cancel"', () => {
   assert.equal(isAwaitingInput(QUESTION_MENU), true);
   const v = classifyStalledAgent({ paneText: QUESTION_MENU, idleMs: 20 * 60 * 1000, hasFeedback: false });
-  assert.equal(v && v.reason, 'agent_waiting');
+  assert.equal(v && v.reason, 'awaiting_decision');
+});
+
+// A long-running agent has almost always left something report-shaped in its
+// transcript by the time it asks a question, so these two signals arrive
+// TOGETHER — and the dialog is the true one. Reporting "finished but never
+// reported" here offered Recover (posts a partial report as the step result)
+// and relaunch (discards the context and any uncommitted work) for an agent
+// that was neither finished nor safe to restart.
+test('a dialog outranks a recoverable report — both signals fire at once', () => {
+  const v = classifyStalledAgent({
+    paneText: QUESTION_MENU, idleMs: 20 * 60 * 1000, hasFeedback: false, hasRecoverableReport: true,
+  });
+  assert.equal(v.reason, 'awaiting_decision');
+  assert.doesNotMatch(v.action, /^Use Recover/);
+  assert.match(v.action, /answer it/i);
+});
+
+test('the awaiting-decision action warns off both destructive moves', () => {
+  const v = classifyStalledAgent({
+    paneText: QUESTION_MENU, idleMs: 20 * 60 * 1000, hasFeedback: false, hasRecoverableReport: true,
+  });
+  // Named explicitly: the dashboard offers both buttons right next to this text.
+  assert.match(v.action, /relaunch/i);
+  assert.match(v.action, /uncommitted work/i);
+  // And must not repeat the claim that misled: it did NOT produce a report.
+  assert.doesNotMatch(v.detail, /produced a complete report/i);
+  assert.match(v.detail, /intact/i);
+});
+
+test('a bare prompt with a recoverable report is still finished_not_reported', () => {
+  // The fix must not swallow the case it sits in front of: no dialog markers,
+  // report in hand — that really is an agent that forgot to POST.
+  const v = classifyStalledAgent({
+    paneText: WAITING, idleMs: LONG, hasFeedback: false, hasRecoverableReport: true,
+  });
+  assert.equal(v.reason, 'finished_not_reported');
 });
 
 test('a genuinely working agent is still not flagged', () => {
