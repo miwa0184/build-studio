@@ -6183,7 +6183,20 @@ Fix only the issues raised. Commit your changes.`,
       const specAgents = Object.entries(roleMap)
         .filter(([roleName]) => !isPMRole(roleName))
         .map(([roleName, specs]) => {
-        const role = require('../config').findRole(config, roleName) || require('../config').findRole(config, roleName.replace(/_/g, ' '));
+        // Prefer the standalone variant when a role name exists in more than one
+        // category. This step AUTHORS specs, but findRole's default order is
+        // review→execution→standalone, so a project shipping both review:QA
+        // (skill qa_review) and standalone:QA (skill qa) handed the spec author
+        // the REVIEWER skill — whose mandated output is a PRD-review verdict
+        // (`**Approved:** yes | no`). A fully delivered spec then rendered as
+        // "Changes requested" in the dashboard (2026-08-23). qa_validation
+        // already passes 'standalone' for the same reason.
+        //
+        // Roles with no standalone entry (UX, Brand, Architect, Marketing,
+        // Security) fall through to the previous resolution order unchanged —
+        // findRole treats preferredCategory as a preference, not a filter.
+        const resolveSpecRole = (name) => require('../config').findRole(config, name, 'standalone');
+        const role = resolveSpecRole(roleName) || resolveSpecRole(roleName.replace(/_/g, ' '));
         const displayName = role ? role.role : roleName;
         const skill = role ? role.skill : roleName;
 
@@ -6200,7 +6213,10 @@ Fix only the issues raised. Commit your changes.`,
           instruction += `**Review and update these existing specs** for alignment with the revised PRD:\n${toReview.map((s, i) => `${i + 1}. ${s.desc}${s.fileCell ? ` → file: ${s.fileCell}` : ''}`).join('\n')}\n\nFor each: read the current spec file and the revised PRD. Identify any gaps or misalignments caused by scope changes. Update the spec file to match the current PRD. If no changes are needed, confirm alignment in your feedback. Either way, if your spec's row in the PRD's Companion Specs table still says "Pending"/"Required", flip it to "Done" in the same commit as your spec changes (or in its own commit if the spec needed none) — amendment rows point at files that existed before you started, so the file's existence proves nothing; the flipped row is the delivery evidence.\n\n`;
         }
 
-        instruction += `Use the /${skill} skill. Commit any changes you make. ${COMMIT_ON_CURRENT_BRANCH}`;
+        // The reporting block is not decoration: a spec author whose role doubles
+        // as a PRD reviewer will otherwise fall back to its skill's mandated
+        // review format, and the dashboard's verdict parser reads that literally.
+        instruction += `Use the /${skill} skill. Commit any changes you make. ${COMMIT_ON_CURRENT_BRANCH}\n\n## REPORTING — THIS IS A DELIVERY, NOT A REVIEW VERDICT\n\nThis step delivers companion specs. It is not a PRD review round. Do NOT report in the PRD-review format (\`**Approved:** yes | no\`) even if your role's skill prescribes that format — the dashboard parses it as a review verdict and shows a fully delivered spec as "Changes requested".\n\nStart your feedback with this line:\n\n**All issues addressed:** yes | no\n\n\`yes\` means every spec assigned to you above is written or updated and its §10 row says Done. Answer for YOUR OWN deliverable only — not for the state of the PRD.\n\nIf you found a problem in the PRD that you cannot fix yourself, still deliver your spec, then (a) say so in the first line of \`### Summary\`, and (b) list it under \`### Action Items\` addressed to the role that owns it.`;
 
         return {
           role: displayName,

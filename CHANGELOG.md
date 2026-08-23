@@ -21,6 +21,65 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-23 — A delivered companion spec no longer reports itself rejected
+
+### Fixed
+
+- **QA delivered its companion spec and the dashboard showed "Changes
+  requested".** The `companion_specs` step writes specs; it is not a review
+  round, and it has no verdict to give. But it resolved each §10 owner without
+  saying which variant it wanted, and every preset defines *two* roles named QA
+  — `review: QA` (skill `qa_review`, the PRD-review skill) and
+  `standalone: QA` (skill `qa`, the test-authoring one). Role lookup searches
+  review first, so the spec **author** was handed the **reviewer** skill, whose
+  mandated output format is `**Approved:** yes | no`. The agent filled it in
+  honestly, the dashboard parsed it as a review verdict, and a spec that had
+  been written, committed, and marked Done in the PRD table rendered as
+  rejected.
+
+  Only QA was affected — UX, Brand, Architect, Marketing and Security exist
+  under one category each and resolved correctly the whole time.
+
+### Changed
+
+- **Companion-spec authors are now told how to report.** The step's instruction
+  previously ended without naming an output format, so each agent fell back to
+  whatever its role's skill prescribed. It now states that the step is a
+  delivery rather than a review, asks for `**All issues addressed:** yes | no`
+  about the agent's own deliverable, and explicitly rules out the PRD-review
+  format. A problem the author found in the PRD but cannot fix itself goes in
+  the summary's first line and under `### Action Items`, addressed to the role
+  that owns it — so it stays visible without being reported as a verdict on the
+  spec that was delivered.
+
+### Known issues
+
+- `companion_specs` is the last step of the review flow and offers only
+  *approve* and *skip*. A genuine PRD defect surfaced there — the case above was
+  one, a pinned fixture whose numbers did not reproduce — has no route back to
+  the PM, and the run completes with it open. The step's own "no §10 table"
+  error text still advises `send_back`, an action that does not exist here.
+  Unresolved: whether the step should gain a send-back or whether such findings
+  belong in the backlog instead.
+
+### Upgrade steps
+
+**In Build Studio** — project-server change only:
+
+```bash
+cd packages/desktop && node inject-resources.js --sync-only
+```
+
+Then restart the Electron app and any running project-servers.
+
+**In each managed project** — nothing to do. The role rosters ship with the
+presets and are unchanged. One caveat: a project that overrides `roles` and
+drops the `standalone: QA` entry will still resolve QA to the reviewer variant;
+the new instruction block keeps the report readable, but adding a
+`standalone: QA` role restores the intended skill.
+
+---
+
 ## 2026-08-22 — Re-reviews get the diff, and agent costs stop being 4x wrong
 
 ### Fixed
