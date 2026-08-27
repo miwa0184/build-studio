@@ -421,6 +421,7 @@ function startServer(projectRoot, opts = {}) {
   const AGENT_MAX_AUTO_RESUMES = 2;             // then fall through to the loud halt
   const agentRecovery = require('./agent-recovery');
   const agentStalled = require('./agent-stalled');
+  const qaSuiteRun = require('./qa-suite-run');
   const transcriptRecovery = require('./transcript-recovery');
   // Provider usage limits (see lib/limit-block.js). Capped so a limit that keeps
   // re-blocking surfaces instead of being hammered the instant each reset lands.
@@ -440,6 +441,37 @@ function startServer(projectRoot, opts = {}) {
     const activeWf = state.loadWorkflow();
     if (activeWf && activeWf.currentStep !== 'completed' && activeWf.sessionName) {
       let changed = false;
+
+      // A server-run test suite that outlived its server.
+      //
+      // qa_validation can run xcodebuild itself and launch its agent only when
+      // the run finishes (see lib/qa-suite-run.js). That child is OUR child, so
+      // a project-server restart kills it — and nothing else would ever notice:
+      // the step sits 'running' with an empty agent list, which is not a dead
+      // step and not a stalled agent, so no other rule here or in
+      // needs-attention applies. Mark it blocked so the owner is told to
+      // relaunch, rather than leaving the run inert forever.
+      for (const [stepKey, step] of Object.entries(activeWf.steps || {})) {
+        const sr = step && step.suiteRun;
+        if (!sr || sr.status !== 'running') continue;
+        // A run started by THIS process is being awaited; leave it alone.
+        if (sr.serverPid === process.pid) continue;
+        // Anything else belongs to a server that is gone. Two shapes, and the
+        // live one is the dangerous one: because the suite runs in its own
+        // process group it can outlive its server, and an orphan xcodebuild
+        // holds the simulator against every other project while nothing is
+        // left that can wait for it or read its result.
+        const stillRunning = qaSuiteRun.isPidAlive(sr.pid);
+        if (stillRunning) qaSuiteRun.killGroup(sr.pid, 'SIGTERM');
+        sr.status = 'interrupted';
+        sr.finishedAt = new Date().toISOString();
+        step.status = 'blocked';
+        step.error = `The test suite this step was running (pid ${sr.pid}) was started by a project-server that is no longer running`
+          + `${stillRunning ? ', and was still going — it has been stopped so it does not hold the simulator' : ''}. `
+          + `Partial output is at ${sr.logPath}. Relaunch ${stepKey} to run it again.`;
+        changed = true;
+        console.warn(`[qa-suite] ${stepKey}: orphaned suite pid ${sr.pid}${stillRunning ? ' (killed)' : ' (already gone)'} — step blocked for relaunch`);
+      }
 
       // Check for dead tmux session.
       //
@@ -771,6 +803,16 @@ function startServer(projectRoot, opts = {}) {
   // The only client is the Electron app on the same machine, over localhost.
   // Set BUILD_STUDIO_LISTEN_HOST=0.0.0.0 to opt back in deliberately.
   const listenHost = process.env.BUILD_STUDIO_LISTEN_HOST || '127.0.0.1';
+
+  // A server-run test suite lives in its own process group so a timeout can
+  // kill the whole xcodebuild tree — which also means it does NOT die with us.
+  // Take ours down on the way out, or quitting the app leaves an xcodebuild
+  // holding the simulator with nothing left that knows how to wait for it.
+  const stopSuiteRuns = () => { try { require('./qa-suite-run').killAllActive(); } catch (_) {} };
+  process.on('exit', stopSuiteRuns);
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(sig, () => { stopSuiteRuns(); process.exit(0); });
+  }
 
   const tryListen = () => {
     server.listen(currentPort, listenHost, () => {

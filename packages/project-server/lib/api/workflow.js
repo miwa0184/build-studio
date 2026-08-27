@@ -16,6 +16,7 @@ const transcriptRecovery = require('../transcript-recovery');
 const exitRecovery = require('../exit-recovery');
 const agentSkills = require('../agent-skills');
 const gateBlocked = require('../gate-blocked');
+const qaSuite = require('../qa-suite-run');
 const { extractFixPlan, checkFeedbackContract, rejectionOutcome, MAX_REJECTIONS } = require('../plan-contract');
 const { assertInside } = require('../path-guard');
 
@@ -7657,9 +7658,13 @@ Report honestly. Note: this step does NOT block — even Approved: no advances t
       // dial it down: config.simulator.parallel_testing = false → serial (no clones,
       // no cascade); a number → capped worker count; unset/true → full parallel.
       const _pt = config.simulator && config.simulator.parallel_testing;
-      const parallelFlag = _pt === false
-        ? '-parallel-testing-enabled NO'
-        : (typeof _pt === 'number' ? `-parallel-testing-enabled YES -parallel-testing-worker-count ${_pt}` : '-parallel-testing-enabled YES');
+      // One source of truth for the flags: qa-suite-run builds the argv the
+      // server actually spawns, and the prompt's display string is derived from
+      // it rather than hand-written a second time.
+      const parallelFlag = qaSuite.parallelArgs(_pt).join(' ');
+      // Collected while composing the scope section so the server can run the
+      // same scoped invocation the prompt used to describe.
+      let qaScopeTargets = null;
       let qaScopeSection = '';
       if (qaScope === 'new-uitests' && config.simulator && config.simulator.destination) {
         try {
@@ -7683,6 +7688,7 @@ Report honestly. Note: this step does NOT block — even Approved: no advances t
             .concat(testClasses.map(c => `-only-testing:${c}`))
             .map(s => `  ${s}`)
             .join(' \\\n');
+          qaScopeTargets = [unitTarget, ...testClasses];
           qaScopeSection = `\n\n## QA SCOPE — NEW UITests ONLY (qa_validation.scope=new-uitests)
 
 Regression XCUITests take 20-40 min and aren't validating *this PRD's* surface — they're re-running unrelated tests that haven't changed. Skip them this round; the operator runs full regression manually via the **Operations → UITests** tab before pushing to remote.
@@ -7708,7 +7714,43 @@ The first \`-only-testing:${unitTarget}\` flag scopes to all unit tests in the u
         }
       }
 
-      const iosTestingSection = (config.simulator && config.simulator.destination)
+      // Can the SERVER run the suite instead of the agent? When it can, every
+      // instruction below about launching, tailing and polling xcodebuild is
+      // not just unnecessary, it is the thing that cost 10.8M cache-read tokens
+      // on one FAZ-286 run (see qa-suite-run.js). Those points stay in the
+      // prompt only for the fallback path, where the agent really does run it.
+      // Opt out per project with qa_validation.server_runs_suite: false.
+      //
+      // Resolving the target here rather than at spawn time is deliberate: the
+      // prompt has to commit to one story or the other, and a project whose
+      // scheme cannot be determined must get the full agent-run instructions,
+      // not a promise that a run happened.
+      let suiteTarget = null;
+      if (config.simulator && config.simulator.destination
+          && (config.qa_validation && config.qa_validation.server_runs_suite) !== false) {
+        suiteTarget = qaSuite.discoverProjectAndScheme({ projectRoot, simulator: config.simulator });
+        if (suiteTarget.error) {
+          console.warn(`[qa-suite] not running the suite server-side: ${suiteTarget.error}`);
+          suiteTarget = null;
+        }
+      }
+      const hoistSuite = !!suiteTarget;
+
+      const iosTestingSection = hoistSuite
+        ? `\n\n## iOS TESTING — THE WORKFLOW RUNS THE SUITE, NOT YOU
+
+This is an iOS project, and the workflow runs \`xcodebuild test\` itself before starting you. Its
+result is in the section below.
+
+1. **Do NOT launch xcodebuild.** The simulator handles one test session at a time; a second run
+   queues behind the first, doubles wallclock and orphans simulator clones.
+2. **Do NOT poll, tail or watch anything.** There is nothing in flight to watch. The run is over by
+   the time you read this.
+3. **Read the counts from the section below** and put them in your report. Open the log file only
+   for a specific failure you need detail on.
+4. If the suite genuinely needs re-running (you believe the result is stale or wrong), say so in
+   your feedback and stop — do not re-run it yourself.`
+        : (config.simulator && config.simulator.destination)
         ? `\n\n## iOS-SPECIFIC PROTECTIONS — READ THIS BEFORE RUNNING xcodebuild
 
 This is an iOS project. xcodebuild has gotchas that have stalled QA on this project before. Follow these:
@@ -7731,7 +7773,7 @@ xcodebuild test \\\\
   2>&1 | tee /tmp/qa-test-output.log
 \`\`\`
 
-6. **While xcodebuild runs, tail the log to confirm progress** — DO NOT spawn a Bash Monitor that waits silently. Periodic foreground tail: \`tail -5 /tmp/qa-test-output.log\` (run this every few minutes via the Bash tool). If you see Test Suite / Test Case / Executed lines being added, the run is progressing. If 10+ minutes pass with NO new log lines, the run is genuinely stuck — kill the PID (\`kill -9 <pid>\`) and report environment failure rather than spawning a duplicate. After any \`kill -9\`, run \`node "$XCTEST_CLEAN" --quiet\` to reap the orphaned clones.
+6. **While xcodebuild runs, tail the log to confirm progress — but poll SLOWLY.** DO NOT spawn a Bash Monitor that waits silently. Periodic foreground tail: \`tail -5 /tmp/qa-test-output.log\`. **Wait at least 2 minutes between checks, and put the wait INSIDE the same Bash call** (e.g. \`sleep 120; tail -5 /tmp/qa-test-output.log\`) so one check costs one turn. Every poll re-reads your entire context: on a measured run, 13-second polling burned 10.8M cache-read tokens — 61% of the whole QA step — to watch a counter that changed nothing about what you do next. A 9-minute suite needs about four checks, not a hundred. If you see Test Suite / Test Case / Executed lines being added, the run is progressing. If 10+ minutes pass with NO new log lines, the run is genuinely stuck — kill the PID (\`kill -9 <pid>\`) and report environment failure rather than spawning a duplicate. After any \`kill -9\`, run \`node "$XCTEST_CLEAN" --quiet\` to reap the orphaned clones.
 
 7. **Clean up leaked simulator clones — pre AND post (and after any kill).** \`-parallel-testing-enabled YES\` clones the sim into a GLOBAL device set (\`~/Library/Developer/XCTestDevices\`) shared with every other project on this machine. Cancelled or force-killed runs orphan their clones, which accumulate and fill the boot drive (this folder hit 66 GB before the reaper existed). Run \`node "$XCTEST_CLEAN" --quiet\` BEFORE starting and AFTER finishing (success, failure, or kill). It deletes ONLY Shutdown + idle clones, so it is safe to run even while a DIFFERENT project is mid-test — a booted or freshly-created clone is never touched. **Do NOT** use \`xcrun simctl shutdown all\` or \`rm -rf ~/Library/Developer/XCTestDevices/*\` — those would destroy another project's in-flight test run.`
         : '';
@@ -7765,8 +7807,118 @@ xcodebuild test \\\\
 
 You are QA. **Your job is to RUN the test suite and report test outcomes — nothing else.**\n\nPRD path: ${wf.prdPath}\nUse the /${skill} skill.${browserSkillRef2}${testFileList2}${e2eAlreadyRan ? e2eInstruction : ''}${qaRoundContext2}\n\n## DO NOT DO THESE THINGS\n\n- **Do NOT review companion-spec methodology or quality.** That is a team_review concern. Your feedback must contain test results (e.g. \`N passed\`, \`M failed\`), not spec critique. The approval gate REJECTS feedback that lacks recognizable test output.\n- **Do NOT skip running tests in favor of static review.** If you cannot run the test command (missing toolchain, broken environment), report the exact failure verbatim and stop — do not substitute a spec review for missing test output.\n- **Do NOT pass \`-resultBundlePath\` to xcodebuild.** It routes output to the .xcresult bundle instead of stdout, making the test counts invisible to you and to the approval gate. Default stdout reporting is what the gate parses.${gateBlocked.GATE_BLOCKED_INSTRUCTIONS}${devServerSection}${preTestSection}${iosTestingSection}${qaScopeSection}\n\n## VALIDATION STEPS — RUN IN ORDER\n\n**Do NOT read companion-spec files (docs/qa/*.md, docs/adrs/*.md, docs/ux/*.md, etc.) at all in this step.** They were already validated in the companion_specs step before execution started. Reading them is what causes you to drift into methodology review instead of running tests. If you find yourself opening a spec file, STOP and run tests instead.\n\n1. **Run the test suite FIRST.** Use the project's native test command:\n   - JS/TS projects: \`npx vitest run\` or \`npm test\`, plus Playwright (\`npx playwright test\`) for E2E\n   - iOS/Swift projects: \`xcodebuild test -scheme <SchemeName> -destination 'platform=iOS Simulator,name=iPhone 15'\` (or the equivalent for the project's scheme)\n   - Android/Kotlin projects: \`./gradlew test\` (unit) and \`./gradlew connectedAndroidTest\` (instrumented)\n2. **Report ALL test counts** in the format the approval gate expects: include at least one of \`**Tests passed:** N/M\`, \`N passed\`, \`N failed\`, or the native runner's "Executed N tests, with M failures" line. Without this, the gate will reject your feedback.\n3. ${e2eAlreadyRan ? 'E2E tests were already run during task execution (see results above) — skip unless re-run is needed' : 'Run any E2E/Playwright .spec.* files written for this PRD'}\n${visualSmokeSection2}\n\n## TEST DATA CLEANUP — MANDATORY\nAfter ALL tests finish (pass or fail), delete every test record created during this run.\n- Test users (emails matching \`test-*@example.com\` or \`preflight@example.com\`)\n- Test events, sessions, and any other DB rows created by tests\n- Use the project's delete endpoints or direct DB queries\n- Verify cleanup: query the DB and confirm test records are gone\n- Report cleanup status in your feedback (e.g., "Cleaned up 12 test users, 3 test events")\nDo NOT leave test data behind — it accumulates across runs and pollutes the database.\n\n## IMPORTANT\n- If tests fail, report the EXACT failure output — do not summarize\n- Distinguish between PRD test failures (blocking) and pre-existing failures (non-blocking)\n- Do NOT fix code — only report what fails${qaVisualSection2}`,
       }];
-      wf.steps.qa_validation = { status: 'running', agents: launchWorkflowAgents(wf, qaAgent, { useWorktrees: false, cwd: projectRoot }) };
+
+      // Launch the agent with the suite result appended. Shared by the direct
+      // path and the hoisted one so there is exactly one place that starts it.
+      const launchQaAgent = (suiteSection) => {
+        const agents = [{ ...qaAgent[0], instruction: qaAgent[0].instruction + (suiteSection || '') }];
+        wf.steps.qa_validation.status = 'running';
+        wf.steps.qa_validation.agents = launchWorkflowAgents(wf, agents, { useWorktrees: false, cwd: projectRoot });
+        state.saveWorkflow(wf);
+      };
+
+      if (!hoistSuite) {
+        wf.steps.qa_validation = { status: 'running', agents: [] };
+        launchQaAgent('');
+        return res.json({ workflow: wf });
+      }
+
+      // ── Server-run suite (option A) ──────────────────────────────────────
+      // The step goes 'running' with NO agent while xcodebuild runs, then the
+      // agent starts with the counts already in its prompt. An empty agent list
+      // cannot auto-advance: the auto-advance gate also requires feedback, and
+      // an agentless step has none.
+      const suiteLogPath = path.join(logsPath, `qa-suite-${wf.id}-r${wf.round || 1}.log`);
+      let suiteArgs;
+      try {
+        suiteArgs = qaSuite.buildXcodebuildArgs({
+          project: suiteTarget.project,
+          scheme: suiteTarget.scheme,
+          destination: config.simulator.destination,
+          parallelTesting: _pt,
+          onlyTesting: qaScopeTargets || [],
+        });
+      } catch (e) {
+        console.warn('[qa-suite] cannot build command, falling back to agent-run:', e.message);
+        wf.steps.qa_validation = { status: 'running', agents: [] };
+        launchQaAgent(qaSuite.formatSuiteSection({ status: 'unavailable', error: e.message }));
+        return res.json({ workflow: wf });
+      }
+      const suiteCommand = qaSuite.displayCommand(suiteArgs);
+
+      // Decline rather than queue: the simulator runs one test session at a
+      // time, and a second xcodebuild doubles wallclock and orphans clones.
+      if (qaSuite.xcodebuildInFlight()) {
+        const why = 'another xcodebuild test is already running on this machine';
+        console.warn(`[qa-suite] ${why} — leaving the run to the agent`);
+        wf.steps.qa_validation = { status: 'running', agents: [] };
+        launchQaAgent(qaSuite.formatSuiteSection({ status: 'unavailable', error: why }));
+        return res.json({ workflow: wf });
+      }
+
+      const timeoutMs = qaSuite.resolveTimeoutMs(config.qa_validation);
+      let handle;
+      try {
+        handle = qaSuite.startSuiteRun({
+          cwd: projectRoot,
+          args: suiteArgs,
+          logPath: suiteLogPath,
+          timeoutMs,
+          env: { ...process.env, BUILD_STUDIO_SIMULATOR_DESTINATION: config.simulator.destination },
+          onProgress: (p) => {
+            const step = wf.steps.qa_validation;
+            if (!step || !step.suiteRun) return;
+            step.suiteRun.progress = p;
+            state.saveWorkflow(wf);
+          },
+        });
+      } catch (e) {
+        console.warn('[qa-suite] spawn failed, falling back to agent-run:', e.message);
+        wf.steps.qa_validation = { status: 'running', agents: [] };
+        launchQaAgent(qaSuite.formatSuiteSection({ status: 'unavailable', error: `xcodebuild could not be started (${e.message})` }));
+        return res.json({ workflow: wf });
+      }
+
+      wf.steps.qa_validation = {
+        status: 'running',
+        agents: [],
+        suiteRun: {
+          status: 'running',
+          command: suiteCommand,
+          logPath: suiteLogPath,
+          pid: handle.pid,
+          // Whose child is this? The watchdog uses it to tell "running, and I
+          // am awaiting it" from "running, but the server that started it is
+          // gone" — the second needs killing, not waiting.
+          serverPid: process.pid,
+          startedAt: new Date().toISOString(),
+          timeoutMs,
+          progress: { casesPassed: 0, casesFailed: 0, elapsedMs: 0 },
+        },
+      };
       state.saveWorkflow(wf);
+      console.log(`[qa-suite] running ${suiteCommand} (pid ${handle.pid}, timeout ${Math.round(timeoutMs / 60000)}m)`);
+
+      handle.promise.then((result) => {
+        const step = wf.steps.qa_validation;
+        if (!step) return;
+        step.suiteRun = { ...step.suiteRun, ...result, status: result.status, finishedAt: new Date().toISOString() };
+        console.log(`[qa-suite] ${result.status} in ${Math.round(result.durationMs / 1000)}s — `
+          + `${result.counts.casesPassed} passed, ${result.counts.casesFailed} failed`);
+        launchQaAgent(qaSuite.formatSuiteSection({ ...step.suiteRun, timeoutMs }));
+        // Reap simulator clones the run leaked. Only Shutdown+idle clones are
+        // removed, so this is safe even while another project is mid-test.
+        try {
+          require('child_process').spawn(process.execPath, [path.join(__dirname, '..', 'xctest-clean.js'), '--quiet'], { detached: true, stdio: 'ignore' }).unref();
+        } catch (_) { /* hygiene only */ }
+      }).catch((e) => {
+        const step = wf.steps.qa_validation;
+        if (!step) return;
+        console.warn('[qa-suite] run failed, falling back to agent-run:', e.message);
+        step.suiteRun = { ...step.suiteRun, status: 'error', error: e.message, finishedAt: new Date().toISOString() };
+        launchQaAgent(qaSuite.formatSuiteSection({ status: 'unavailable', error: `the run failed to start (${e.message})` }));
+      });
+
       return res.json({ workflow: wf });
     }
 

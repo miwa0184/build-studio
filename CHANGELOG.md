@@ -21,6 +21,79 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-27 — The workflow runs the iOS test suite, so QA stops paying to watch it
+
+### Changed
+
+- **On iOS projects, `qa_validation` now runs `xcodebuild test` itself** and
+  starts the QA agent with the results already in its prompt. The agent used to
+  run the suite, and because a foreground run blocks and a silent one trips the
+  15-minute stall watchdog, it was told to background the run and tail the log
+  "every few minutes". In practice that meant every ~13 seconds, and every poll
+  is an API request that re-reads the agent's whole context.
+
+  Measured across every QA run still on disk:
+
+  | run | requests | polling | share of the step's cache reads |
+  |---|---|---|---|
+  | fazon FAZ-286 | 148 | 90 | 61% |
+  | deskrhythm #1 | 39 | 17 | 47% |
+  | deskrhythm #2 | 47 | 16 | 37% |
+
+  On FAZ-286 that was 10.8M cache-read tokens spent watching a counter, in a
+  step that was itself 60% of the whole execution run. The cost was turn
+  *count*, not context size — context sat flat near 90K while 148 requests each
+  paid to re-read it.
+
+  The agent keeps everything else: visual smoke, test-data cleanup, failure
+  triage and the report. Only the blocking wait moved.
+
+- **The fallback path polls slowly.** When the server can't run the suite, the
+  agent still does — but the instruction now names an explicit interval (2
+  minutes minimum, with the wait *inside* one Bash call) and says what polling
+  costs, instead of "every few minutes".
+
+### Added
+
+- `simulator.scheme` and `simulator.project` are discovered when unset, via
+  `xcodebuild -list`. The scheme named after the project wins; a lone scheme
+  wins; anything else is treated as ambiguous and hands the run back to the
+  agent rather than guessing. (fazon's project carries both `Fazon` and
+  `Copy of Fazon`, and they sort with the copy first.)
+- `qa_validation.suite_timeout_minutes` (default 45). A suite past its limit is
+  killed and reported to the agent as a gate that could not run — never as a
+  result, since a killed run has counts but no verdict.
+- `qa_validation.server_runs_suite: false` opts a project out entirely.
+
+### Known issues
+
+- **Non-iOS QA runs are unaffected, and one of them is expensive for a different
+  reason.** The polling instructions were gated on a configured simulator, so
+  web projects never had the problem — they run `npx vitest run` once and stop.
+  But one measured web run still spent 5.9M cache reads across 61 requests,
+  dominated by browser automation for the visual smoke (screenshots are image
+  tokens, and they inflate every later turn). That needs its own fix.
+- **Codex-run QA agents record no token usage at all**, so this measurement
+  covers only the Claude-run ones. Seven agents across nine projects is the
+  whole visible sample.
+
+### Upgrade steps
+
+**In Build Studio** — project-server change only:
+
+```bash
+cd packages/desktop && node inject-resources.js --sync-only
+```
+
+Then restart the Electron app and any running project-servers.
+
+**In each managed project** — nothing to do. Scheme and project are discovered
+when unset. Two optional knobs if you want them: set `simulator.scheme` to skip
+discovery (worth doing if your project has multiple schemes), and
+`qa_validation.suite_timeout_minutes` if 45 is wrong for your suite.
+
+---
+
 ## 2026-08-23 — A delivered companion spec no longer reports itself rejected
 
 ### Fixed
