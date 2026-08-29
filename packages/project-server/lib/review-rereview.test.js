@@ -172,3 +172,54 @@ test('even a full-text entry has a ceiling', () => {
   assert.match(h, /truncated/);
   assert.ok(h.length < 30000, `pathological entry must not dominate, got ${h.length}`);
 });
+
+// ── prdHeadSha ───────────────────────────────────────────────────────────────
+//
+// This helper exists because the inline version of it was dead code for a week.
+// It called execFileSync in a scope that never imported it, threw ReferenceError
+// on every round in every project, and the caller's `catch (_) {}` ate it. The
+// prompt shipped in its no-diff form and nothing looked wrong — the re-review
+// block was present, just never carrying a diff. These tests are the thing that
+// was missing: something that actually calls it.
+
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+const { prdHeadSha } = require('./review-rereview');
+
+const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
+
+test('a committed file resolves to a sha', () => {
+  const sha = prdHeadSha(REPO_ROOT, 'CHANGELOG.md');
+  assert.match(sha || '', /^[0-9a-f]{40}$/, 'expected a full commit sha');
+});
+
+test('a path with no commits is null, not a throw and not a stale sha', () => {
+  // `git log -- <unknown>` exits 0 with empty output, so this is the branch that
+  // must not return '' and must not fall through to some other file's sha.
+  assert.equal(prdHeadSha(REPO_ROOT, 'docs/prds/PRD-does-not-exist.md'), null);
+});
+
+test('missing arguments are null rather than a lookup of the whole repo', () => {
+  assert.equal(prdHeadSha(REPO_ROOT, null), null);
+  assert.equal(prdHeadSha(null, 'CHANGELOG.md'), null);
+});
+
+test('outside a git repo it is null, not an exception', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'no-git-'));
+  assert.equal(prdHeadSha(dir, 'anything.md'), null);
+});
+
+test('the sha it returns actually produces a diff line in the prompt', () => {
+  // The regression guard. Both halves worked in isolation the whole time; what
+  // was broken was that the sha never reached buildRereviewInstruction.
+  const sha = prdHeadSha(REPO_ROOT, 'CHANGELOG.md');
+  const ins = buildRereviewInstruction('Architect', 'architect', 'CHANGELOG.md', 2, sha);
+  assert.match(ins, new RegExp(`git diff ${sha} -- CHANGELOG\\.md`));
+});
+
+test('and without a sha the prompt degrades instead of emitting a broken command', () => {
+  const ins = buildRereviewInstruction('Architect', 'architect', 'CHANGELOG.md', 2, null);
+  assert.doesNotMatch(ins, /git diff/, 'a null base must not render `git diff null --`');
+  assert.match(ins, /START HERE/, 'the re-review framing still ships');
+});

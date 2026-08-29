@@ -21,6 +21,56 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-29 — Re-reviewers actually get the diff this time
+
+### Fixed
+
+- **The targeted re-review shipped on 2026-08-22 has never worked.** That entry
+  said each review round records the PRD's commit sha so the next round's prompt
+  carries `git diff <sha> -- <prd>` as its first step. The recording step called
+  `execFileSync` in a function that never imported it — every other use in that
+  file does its own local `require('child_process')` first — so it threw
+  `ReferenceError` on the first round of every review, in every project, and the
+  caller's `catch (_) {}` swallowed it.
+
+  Nothing looked broken, which is why it lasted a week. The re-review block was
+  present and correct in every round-2 prompt; it just always rendered in its
+  no-diff form, because a missing base is a legitimate state (an uncommitted
+  PRD) that the prompt is built to degrade into. Round 2 kept re-reading whole
+  documents, and the 27%-more-cache-reads measurement that motivated the change
+  was never actually addressed.
+
+  The lookup now lives in `review-rereview.js`, which does its own require and
+  is covered by tests that call it. A genuinely absent base still degrades the
+  same way, but it now logs why instead of being indistinguishable from a
+  programming error.
+
+### Upgrade steps
+
+**In Build Studio** — project-server change only:
+
+```bash
+cd packages/desktop && node inject-resources.js --sync-only
+```
+
+Then restart the Electron app and any running project-servers.
+
+**In each managed project** — nothing to do. The base sha is recorded on the
+next review round you start; an in-flight review picks it up from its next
+round onward.
+
+### Notes for forks
+
+- `packages/project-server/lib/api/workflow.js` has no module-level
+  `child_process` import: all 52 call sites rely on a local
+  `require('child_process')` in the same function. That is one edit away from
+  the bug above at any time, and the failure is silent wherever the call sits
+  inside a `catch`. A sweep of every other file in the repo found none with the
+  same exposure — they all import at module level. If you add an `execFileSync`
+  call to `workflow.js`, add the require next to it.
+
+---
+
 ## 2026-08-27 — The workflow runs the iOS test suite, so QA stops paying to watch it
 
 ### Changed

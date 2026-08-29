@@ -178,4 +178,32 @@ That is the expected outcome of a working fix round, not a rubber stamp.
 - [ ] [assignee_role] — description`;
 }
 
-module.exports = { roleHistory, buildRereviewInstruction };
+/**
+ * The PRD's current commit sha — the base the NEXT review round diffs against.
+ *
+ * This lives here, rather than inline at the call site, because the inline
+ * version silently did nothing for a week. It called `execFileSync` in a scope
+ * that never imported it (every other use in workflow.js does its own local
+ * `require('child_process')` first), so it threw `ReferenceError` on every
+ * round, in every project — and the caller's `catch (_) {}` swallowed it. The
+ * re-review prompt shipped, correctly, in its no-diff form, so nothing looked
+ * broken: the block was present, just never carrying a `git diff` line.
+ *
+ * A module that does its own require cannot fail that way, and can be tested.
+ *
+ * @returns {string|null} the sha, or null when there is genuinely no base
+ *   (no git, PRD never committed, path unknown) — which the prompt handles.
+ */
+function prdHeadSha(projectRoot, prdPath) {
+  if (!projectRoot || !prdPath) return null;
+  const { execFileSync } = require('child_process');
+  try {
+    const sha = execFileSync('git', ['log', '-n', '1', '--format=%H', '--', prdPath],
+      { cwd: projectRoot, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    return sha || null;
+  } catch (_) {
+    return null; // uncommitted PRD or no git — a real, expected absence
+  }
+}
+
+module.exports = { roleHistory, buildRereviewInstruction, prdHeadSha };

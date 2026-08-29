@@ -5801,7 +5801,7 @@ Fix only the issues raised. Commit your changes.`,
       // review-wrapup.js was written for, which until now only reached
       // final_review and only past the cap (unreachable in practice).
       const { wrapupActive, buildWrapupBlock, freshLensRounds } = require('../review-wrapup');
-      const { roleHistory, buildRereviewInstruction } = require('../review-rereview');
+      const { roleHistory, buildRereviewInstruction, prdHeadSha } = require('../review-rereview');
       // Round 1 sweeps the whole PRD; rounds 2+ verify that the fixes closed
       // THIS role's findings. Without the split, every round re-read the entire
       // document under an instruction to produce only NEW material — which is a
@@ -5815,11 +5815,15 @@ Fix only the issues raised. Commit your changes.`,
       // sha each round turns "don't re-read everything" into a command they can
       // actually run.
       const rvDiffBase = wf.reviewBaseSha || null;
-      try {
-        const sha = execFileSync('git', ['log', '-n', '1', '--format=%H', '--', wf.prdPath],
-          { cwd: projectRoot, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-        if (sha) wf.reviewBaseSha = sha;   // the base the NEXT round diffs against
-      } catch (_) { /* no git, or the PRD is uncommitted — fall back to no diff */ }
+      const rvHeadSha = prdHeadSha(projectRoot, wf.prdPath);
+      if (rvHeadSha) {
+        wf.reviewBaseSha = rvHeadSha;      // the base the NEXT round diffs against
+      } else if (wf.prdPath) {
+        // Say so. The previous version swallowed every failure here, including
+        // the ReferenceError that made this dead code for a week — a silent
+        // catch around a lookup nobody checks is how that survives.
+        console.warn(`[review] no commit found for ${wf.prdPath} — round ${(wf.round || 1) + 1} will re-review without a diff`);
+      }
       const rvThreshold = freshLensRounds(config, MAX_REVIEW_ROUNDS, 'reviewing');
       const rvClosure = wrapupActive(wf.round || 1, rvThreshold, config, 'reviewing')
         ? buildWrapupBlock(wf.round || 1, rvThreshold, 'reviewing')
