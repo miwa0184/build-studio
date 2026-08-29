@@ -67,17 +67,26 @@ that move underneath you without your having edited anything.
 
 ### Upgrade steps
 
-**In Build Studio** — project-server change only:
+**In Build Studio** — this entry alone is a project-server change:
 
 ```bash
 cd packages/desktop && node inject-resources.js --sync-only
 ```
 
-Then restart the Electron app and any running project-servers.
+**If you are pulling from 2026-08-15 or earlier, do the full rebuild instead** —
+the entries below this one include hub changes (the Capture Learnings panel, the
+execution timeline), and `--sync-only` does not update the Next.js build:
 
-**In each managed project** — nothing to do. The base sha is recorded on the
-next review round you start; an in-flight review picks it up from its next
-round onward.
+```bash
+cd packages/hub && npx next build
+cd packages/desktop && node inject-resources.js
+```
+
+Either way, restart the Electron app and any running project-servers afterwards.
+
+**In each managed project** — nothing to do for this entry. Read the
+per-entry sections below; the 2026-08-23 one has the only caveat worth acting
+on (a project that overrides `roles` and drops `standalone: QA`).
 
 ### Notes for forks
 
@@ -252,6 +261,11 @@ the new instruction block keeps the report readable, but adding a
 ---
 
 ## 2026-08-22 — Re-reviews get the diff, and agent costs stop being 4x wrong
+
+> **The diff half of this entry did not actually work until 2026-08-29.** The
+> sha recording threw on every round and the error was swallowed, so the
+> re-review prompt always rendered without a diff. See the 2026-08-29 entry.
+> The token-attribution fix below was unaffected and has worked since it landed.
 
 ### Fixed
 
