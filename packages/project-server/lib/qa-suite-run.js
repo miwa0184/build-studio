@@ -72,10 +72,30 @@ function buildXcodebuildArgs({ project, scheme, destination, parallelTesting, on
   if (!project) throw new Error('buildXcodebuildArgs: project is required');
   if (!scheme) throw new Error('buildXcodebuildArgs: scheme is required');
   if (!destination) throw new Error('buildXcodebuildArgs: destination is required');
+  // Reject prompt placeholders before they reach xcodebuild.
+  //
+  // The prompt text this replaced carries `<Scheme>` deliberately — it means
+  // "substitute your project's scheme", and an agent reading it does. The
+  // server does not, and an unsubstituted one produced
+  // `-only-testing:<Scheme>Tests`: xcodebuild aborted during target resolution
+  // in 683ms having run nothing, and the failure surfaced a whole step later as
+  // a gate that could not run. Fail here instead, where the caller falls back
+  // to the agent-run path (2026-08-29).
+  for (const [name, value] of [['project', project], ['scheme', scheme], ['destination', destination]]) {
+    if (/<[^>]+>/.test(String(value))) {
+      throw new Error(`buildXcodebuildArgs: ${name} still contains a placeholder (${value})`);
+    }
+  }
   const args = ['test', '-project', project, '-scheme', scheme, '-destination', destination];
   args.push(...parallelArgs(parallelTesting));
   for (const t of onlyTesting) {
-    if (t) args.push(`-only-testing:${t}`);
+    if (!t) continue;
+    // A scope target is built from the scheme too (`<Scheme>Tests`), so it
+    // carries the same placeholder risk and the same silent failure.
+    if (/<[^>]+>/.test(String(t))) {
+      throw new Error(`buildXcodebuildArgs: only-testing target still contains a placeholder (${t})`);
+    }
+    args.push(`-only-testing:${t}`);
   }
   return args;
 }

@@ -25,6 +25,26 @@ that move underneath you without your having edited anything.
 
 ### Fixed
 
+- **The server-run iOS suite could spawn `-only-testing:<Scheme>Tests` and run
+  nothing.** On a project that sets no `simulator.scheme`, the scope section
+  built its own scheme with a `'<Scheme>'` fallback — a placeholder meaning
+  "substitute your project's scheme", which is right in prompt text an agent
+  reads and fatal in an argv. The project and scheme were discovered correctly;
+  only the derived unit-test target still carried the placeholder. xcodebuild
+  aborted during target resolution in 683ms with exit 70, zero tests ran, and it
+  surfaced a step later as *"qa_validation could not run a check"*.
+
+  The .xcodeproj and scheme are now resolved once, before anything derives a
+  target name from them, and the argv builder refuses any argument still
+  containing a `<…>` placeholder rather than spawning a doomed command. The
+  caller treats that refusal like any other decline and hands the run back to
+  the agent.
+
+  Only projects with `simulator.destination` set and `simulator.scheme` unset
+  were affected — and only since 2026-08-27, when the server started running the
+  suite. The failure was loud and non-destructive (a gate that could not run,
+  which is exactly what it was), so nothing was mis-reported as passing.
+
 - **The targeted re-review shipped on 2026-08-22 has never worked.** That entry
   said each review round records the PRD's commit sha so the next round's prompt
   carries `git diff <sha> -- <prd>` as its first step. The recording step called

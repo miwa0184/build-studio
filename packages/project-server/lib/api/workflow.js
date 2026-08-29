@@ -7656,6 +7656,26 @@ Report honestly. Note: this step does NOT block — even Approved: no advances t
       // runs). Regression XCUITests are run manually via Operations → UITests
       // tab before merge. Saves 20-40 min per QA round on iOS-sized projects.
       const qaScope = (config.qa_validation && config.qa_validation.scope) || 'full';
+      // Resolve the .xcodeproj and scheme ONCE, here, before anything derives a
+      // target name from them.
+      //
+      // This used to happen further down, after the scope section had already
+      // built its own scheme with `|| '<Scheme>'` — a placeholder that reads
+      // fine in a prompt ("substitute your project's scheme") and is fatal in an
+      // argv. fazon sets no `simulator.scheme`, so the server spawned
+      // `-only-testing:<Scheme>Tests`, xcodebuild aborted during target
+      // resolution in 683ms, and zero tests ran (2026-08-29). Two resolutions of
+      // one fact is the bug; there is now one.
+      let suiteTarget = null;
+      if (config.simulator && config.simulator.destination
+          && (config.qa_validation && config.qa_validation.server_runs_suite) !== false) {
+        suiteTarget = qaSuite.discoverProjectAndScheme({ projectRoot, simulator: config.simulator });
+        if (suiteTarget.error) {
+          console.warn(`[qa-suite] not running the suite server-side: ${suiteTarget.error}`);
+          suiteTarget = null;
+        }
+      }
+      const hoistSuite = !!suiteTarget;
       // Parallel XCUITest cloning halves wallclock but, on some iOS-26 simulator
       // cohorts, the clones crash on boot (FBSOpenApplicationServiceError cascade),
       // making tests flaky and tripping the QA gate run after run. Let a project
@@ -7685,8 +7705,13 @@ Report honestly. Note: this step does NOT block — even Approved: no advances t
           });
           // Identify the unit-test target from project config; fall back to the
           // <Scheme>Tests convention derived from config.simulator.scheme.
-          const iosScheme = (config.simulator && config.simulator.scheme) || '<Scheme>';
-          const iosProject = (config.simulator && config.simulator.project) || `ios/${iosScheme}.xcodeproj`;
+          // Prefer the resolved target. `<Scheme>` survives only as prompt text
+          // for the agent-run path, where a human-readable "substitute this"
+          // placeholder is the point — it must never reach an argv.
+          const iosScheme = (suiteTarget && suiteTarget.scheme)
+            || (config.simulator && config.simulator.scheme) || '<Scheme>';
+          const iosProject = (suiteTarget && suiteTarget.project)
+            || (config.simulator && config.simulator.project) || `ios/${iosScheme}.xcodeproj`;
           const unitTarget = (config.qa_validation && config.qa_validation.unit_test_target) || `${iosScheme}Tests`;
           const onlyTestingFlags = [`-only-testing:${unitTarget}`]
             .concat(testClasses.map(c => `-only-testing:${c}`))
@@ -7724,22 +7749,8 @@ The first \`-only-testing:${unitTarget}\` flag scopes to all unit tests in the u
       // on one FAZ-286 run (see qa-suite-run.js). Those points stay in the
       // prompt only for the fallback path, where the agent really does run it.
       // Opt out per project with qa_validation.server_runs_suite: false.
-      //
-      // Resolving the target here rather than at spawn time is deliberate: the
-      // prompt has to commit to one story or the other, and a project whose
-      // scheme cannot be determined must get the full agent-run instructions,
-      // not a promise that a run happened.
-      let suiteTarget = null;
-      if (config.simulator && config.simulator.destination
-          && (config.qa_validation && config.qa_validation.server_runs_suite) !== false) {
-        suiteTarget = qaSuite.discoverProjectAndScheme({ projectRoot, simulator: config.simulator });
-        if (suiteTarget.error) {
-          console.warn(`[qa-suite] not running the suite server-side: ${suiteTarget.error}`);
-          suiteTarget = null;
-        }
-      }
-      const hoistSuite = !!suiteTarget;
-
+      // (suiteTarget / hoistSuite are resolved above, before the scope section
+      //  derives any target name from the scheme.)
       const iosTestingSection = hoistSuite
         ? `\n\n## iOS TESTING — THE WORKFLOW RUNS THE SUITE, NOT YOU
 

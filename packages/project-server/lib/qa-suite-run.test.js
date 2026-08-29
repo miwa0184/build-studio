@@ -279,3 +279,48 @@ test('a lone .xcodeproj is found under ios/', () => {
   const r = discoverProjectAndScheme({ projectRoot: root, simulator: { scheme: 'Only' } });
   assert.equal(r.project, 'ios/Only.xcodeproj');
 });
+
+// ── placeholder rejection ────────────────────────────────────────────────────
+//
+// The prompt text carries `<Scheme>` on purpose — it means "substitute your
+// project's scheme", and an agent reading it does. The server does not. fazon
+// sets no simulator.scheme, so a second, legacy resolution produced
+// `-only-testing:<Scheme>Tests`; xcodebuild aborted during target resolution in
+// 683ms with exit 70, ran nothing, and it surfaced a step later as a gate that
+// could not run. These assert the argv builder refuses rather than spawns.
+
+test('a placeholder scheme is refused, not spawned', () => {
+  assert.throws(
+    () => buildXcodebuildArgs({ project: 'ios/P.xcodeproj', scheme: '<Scheme>', destination: 'd' }),
+    /scheme still contains a placeholder/,
+  );
+});
+
+test('a placeholder in the derived only-testing target is refused too', () => {
+  // The exact shape that shipped: project and scheme resolved correctly, and
+  // only the scope target — derived from a DIFFERENT resolution of the scheme —
+  // still carried the placeholder.
+  assert.throws(
+    () => buildXcodebuildArgs({
+      project: 'ios/Fazon.xcodeproj', scheme: 'Fazon', destination: 'd',
+      onlyTesting: ['<Scheme>Tests', 'FazonUITests/DebugLogRingCrossLaunchTests'],
+    }),
+    /only-testing target still contains a placeholder/,
+  );
+});
+
+test('a placeholder project or destination is refused', () => {
+  assert.throws(() => buildXcodebuildArgs({ project: 'ios/<Scheme>.xcodeproj', scheme: 'S', destination: 'd' }), /project still contains/);
+  assert.throws(() => buildXcodebuildArgs({ project: 'p', scheme: 'S', destination: '<destination>' }), /destination still contains/);
+});
+
+test('real values that merely contain angle-free punctuation still build', () => {
+  // Guard the guard: the check must not reject legitimate destinations.
+  const args = buildXcodebuildArgs({
+    project: 'ios/Fazon.xcodeproj', scheme: 'Fazon',
+    destination: 'platform=iOS Simulator,id=4D61978E-9034-408E-8EC3-0E865D0BD2DD',
+    onlyTesting: ['FazonTests', 'FazonUITests/DebugLogRingCrossLaunchTests'],
+  });
+  assert.ok(args.includes('-only-testing:FazonTests'));
+  assert.ok(args.includes('-only-testing:FazonUITests/DebugLogRingCrossLaunchTests'));
+});
