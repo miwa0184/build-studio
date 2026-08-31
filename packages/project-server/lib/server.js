@@ -27,6 +27,9 @@ const { createSupportRouter } = require('./api/support');
 const { createCliConfigRouter } = require('./api/cli-config');
 const { createOverseer } = require('./overseer');
 const { parseAllowedOrigins, isAllowedOrigin } = require('./allowed-origins');
+const { createAdmission } = require('./admission');
+const { createAdmissionSeam } = require('./admission-seam');
+const { createAdmissionErrorHandler } = require('./admission-error');
 
 function startServer(projectRoot, opts = {}) {
   const config = loadConfig(projectRoot);
@@ -128,6 +131,15 @@ function startServer(projectRoot, opts = {}) {
   const gitOps = createGitOps(config);
   const tmuxOps = createTmuxOps(config);
   const overseer = createOverseer(config, state, broadcast);
+  const admission = createAdmission(config);
+
+  // The central admission seam — mounted BEFORE every mutating route below
+  // and every API router, so a UI click and a direct API call meet exactly
+  // the same server verdict. Start ingress requires a verified RunRequest and
+  // registers the run before any handler side effect; mutations of the active
+  // run verify the STORED admission context; reads pass so a refused or
+  // stopped run stays explainable. See lib/admission-seam.js.
+  app.use(createAdmissionSeam({ state, admission }));
 
   // Start overseer when a workflow is live on server startup
   const existingWf = state.loadWorkflow();
@@ -188,7 +200,7 @@ function startServer(projectRoot, opts = {}) {
   const { router: queueRouter, parseExecutionPlan } = createQueueRouter(config, broadcast);
   const statusRouter = createStatusRouter(config, gitOps, state);
   const terminalRouter = createTerminalRouter(config, state, tmuxOps);
-  const workflowRouter = createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast);
+  const workflowRouter = createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast, { admission });
   const runRouter = createRunRouter(config, state, gitOps, tmuxOps, broadcast, parseExecutionPlan);
   // One monitor per project-server, shared by the CI/CD tab and the Monitor
   // tab so a single cached `gh run list` answers both.
@@ -231,6 +243,11 @@ function startServer(projectRoot, opts = {}) {
 
   // Presets endpoint — lists available workflow presets
   app.get('/api/presets', (req, res) => res.json({ presets: listPresets() }));
+
+  // Common typed boundary for admission failures escaping any workflow, run,
+  // or server route. Non-admission errors pass through unchanged to Express's
+  // ordinary 500 handling.
+  app.use(createAdmissionErrorHandler());
 
   // WebSocket / persistent pty terminal
   const server = http.createServer(app);

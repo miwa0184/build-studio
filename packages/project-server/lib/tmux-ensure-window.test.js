@@ -16,7 +16,26 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { execFileSync } = require('child_process');
+
+// ensureWindow is an admission BACKSTOP (A1b.1): it refuses to create the
+// window an agent would be spawned into unless handed the verified context the
+// admission service issued for the run. These tests mint a real context the
+// same way the server does — registry entry + guard file + contextFor — on a
+// throwaway state dir.
+function admittedContext(t) {
+  const statePath = fs.mkdtempSync(path.join(os.tmpdir(), 'bs-adm-ctx-'));
+  t.after(() => { try { fs.rmSync(statePath, { recursive: true, force: true }); } catch (_) {} });
+  const { createAdmission } = require('./admission');
+  const admission = createAdmission({ projectRoot: statePath, statePath });
+  const runId = `test-run-${Date.now().toString(36)}`;
+  admission.registry.admit({ nonce: `n-${runId}-0123456789abcdef`, runId, verdict: { kind: 'GateVerdict', runId }, lineage: { runId } });
+  admission.runGuard.register(runId, { identity: { runId } });
+  return admission.contextFor(runId);
+}
 
 const SOCKET = 'bs-ensure-window-test';
 const tmux = (...args) => execFileSync('tmux', ['-L', SOCKET, ...args], { stdio: ['pipe', 'pipe', 'pipe'] }).toString();
@@ -41,7 +60,7 @@ test('ensureWindow creates the session when there is none', (t) => {
   t.after(() => { quiet('kill-server'); restore(); });
   quiet('kill-server');
 
-  const target = ops.ensureWindow('s1', 'first', process.cwd());
+  const target = ops.ensureWindow('s1', 'first', process.cwd(), admittedContext(t));
   assert.equal(target, 's1:first');
   assert.equal(ops.hasSession('s1'), true);
 });
@@ -51,8 +70,9 @@ test('ensureWindow adds a window to a live session', (t) => {
   t.after(() => { quiet('kill-server'); restore(); });
   quiet('kill-server');
 
-  ops.ensureWindow('s1', 'first', process.cwd());
-  const target = ops.ensureWindow('s1', 'second', process.cwd());
+  const ctx = admittedContext(t);
+  ops.ensureWindow('s1', 'first', process.cwd(), ctx);
+  const target = ops.ensureWindow('s1', 'second', process.cwd(), ctx);
   assert.match(target, /^s1:\d+$/); // indexed, not named
   const windows = tmux('list-windows', '-t', 's1', '-F', '#{window_name}').trim().split('\n');
   assert.deepEqual(windows.sort(), ['first', 'second']);
@@ -65,7 +85,8 @@ test('ensureWindow survives the session dying between the check and the call', (
   t.after(() => { quiet('kill-server'); restore(); });
   quiet('kill-server');
 
-  ops.ensureWindow('s1', 'only-window', process.cwd());
+  const ctx = admittedContext(t);
+  ops.ensureWindow('s1', 'only-window', process.cwd(), ctx);
   assert.equal(ops.hasSession('s1'), true);
 
   // Reap the last window — exactly what the feedback handler now does. tmux
@@ -73,7 +94,7 @@ test('ensureWindow survives the session dying between the check and the call', (
   ops.killWindowAndChildren('s1:only-window');
 
   // The launch proceeds believing the session is alive. It must not throw.
-  const target = ops.ensureWindow('s1', 'next-step', process.cwd());
+  const target = ops.ensureWindow('s1', 'next-step', process.cwd(), ctx);
   assert.equal(target, 's1:next-step');
   assert.equal(ops.hasSession('s1'), true);
   assert.equal(tmux('list-windows', '-t', 's1', '-F', '#{window_name}').trim(), 'next-step');
@@ -86,11 +107,29 @@ test('a genuine window failure still surfaces', (t) => {
   t.after(() => { quiet('kill-server'); restore(); });
   quiet('kill-server');
 
-  ops.ensureWindow('s1', 'live', process.cwd());
+  const ctx = admittedContext(t);
+  ops.ensureWindow('s1', 'live', process.cwd(), ctx);
   assert.throws(
-    () => ops.ensureWindow('s1', 'bad', '/definitely/not/a/directory/here'),
+    () => ops.ensureWindow('s1', 'bad', '/definitely/not/a/directory/here', ctx),
     /.+/,
     'a bad cwd on a live session should throw',
   );
   assert.equal(ops.hasSession('s1'), true);
+});
+
+test('ensureWindow refuses without a verified admission context (backstop)', (t) => {
+  const { ops, restore } = opsOnTestSocket();
+  t.after(() => { quiet('kill-server'); restore(); });
+  quiet('kill-server');
+
+  // No context, a forged plain object, and a stale-looking copy all refuse —
+  // only a context the admission service actually issued passes.
+  for (const bad of [undefined, null, {}, { runId: 'x', verdict: {} }]) {
+    assert.throws(
+      () => ops.ensureWindow('s1', 'w', process.cwd(), bad),
+      (e) => e.code === 'ADMISSION_BACKSTOP',
+      'a missing or forged admission context must refuse the spawn window',
+    );
+  }
+  assert.equal(ops.hasSession('s1'), false, 'a refused launch must not have created the session');
 });

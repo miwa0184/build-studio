@@ -89,7 +89,21 @@ function createGitOps(config) {
   }
 
   return {
-    createWorktree(branch) {
+    /**
+     * Create a worktree for an ADMITTED run. `admissionCtx` is the context the
+     * admission service issued for the run this worktree serves — a backstop,
+     * not the primary gate: the Express seam admits the run long before this
+     * runs, and a request that only THIS check stops is a primary-gate defect.
+     * It exists so a future code path that forgets admission cannot silently
+     * create working directories.
+     */
+    createWorktree(branch, admissionCtx) {
+      const { isAdmissionContext } = require('./admission');
+      if (!isAdmissionContext(admissionCtx)) {
+        const err = new Error(`createWorktree(${branch}): refused — no verified admission context for this run (backstop; the primary admission seam should have refused earlier)`);
+        err.code = 'ADMISSION_BACKSTOP';
+        throw err;
+      }
       const wtPath = path.join(worktreesPath, branch);
       if (fs.existsSync(wtPath)) return wtPath;
       fs.mkdirSync(worktreesPath, { recursive: true });

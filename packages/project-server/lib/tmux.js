@@ -34,9 +34,23 @@ function createTmuxOps(config) {
    * planner reported, its window was reaped, and the fix_execution launch that
    * followed died on `no server running`, leaving the step half-started.
    *
+   * Backstop (A1b.1): every agent process this system starts is launched by a
+   * `send-keys` into a window this function created, so this is the last
+   * chance to catch a launch path that skipped admission. `admissionCtx` must
+   * be the context the admission service issued for the run being served —
+   * a request that only THIS check stops is a primary-gate defect (the
+   * Express seam should have refused it long before), but a forgotten wiring
+   * must fail closed here rather than spawn.
+   *
    * @returns {string} the tmux target for the new window
    */
-  function ensureWindow(sessionName, windowName, cwd) {
+  function ensureWindow(sessionName, windowName, cwd, admissionCtx) {
+    const { isAdmissionContext } = require('./admission');
+    if (!isAdmissionContext(admissionCtx)) {
+      const err = new Error(`ensureWindow(${sessionName}:${windowName}): refused — no verified admission context for this run (backstop; the primary admission seam should have refused earlier)`);
+      err.code = 'ADMISSION_BACKSTOP';
+      throw err;
+    }
     if (!hasSession(sessionName)) {
       createSession(sessionName, windowName, cwd);
       return `${sessionName}:${windowName}`;

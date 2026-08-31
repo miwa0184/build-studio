@@ -4,6 +4,7 @@ import { useEffect, useState, useCallback, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useProjectApi } from '@/lib/use-project-api'
+import { buildRunRequest } from '@/lib/run-request'
 import { useProject } from '@/lib/project-context'
 import { roleConfig, avatarSrc } from '@/lib/roles'
 import { CommitRibbon } from './commit-ribbon'
@@ -429,9 +430,18 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
     if (wfType !== 'onboarding' && !input.trim()) return
     setStartError(null)
     setStartCanOverride(false)
-    const body: Record<string, string | boolean> = { type: wfType }
+    const body: Record<string, unknown> = { type: wfType }
     if (wfType !== 'onboarding') body.input = input.trim()
     if (override) body.override = true
+    // A1b.1: a start is admitted server-side against a RunRequest. The hub
+    // only assembles the envelope; the server re-verifies every field, so this
+    // click and a direct API call meet exactly the same verdict.
+    const { runRequest, error: rrError } = await buildRunRequest(api.get, {
+      type: wfType,
+      input: wfType !== 'onboarding' ? input.trim() : undefined,
+    })
+    if (!runRequest) { setStartError(rrError || 'Could not build the run request'); return }
+    body.runRequest = runRequest
     // Per-run CLI pickers were removed (2026-07-21): agent CLI/model/effort is
     // set per role on the project's Agents tab (or the global Model tab).
     // api.post returns the parsed body (incl. {error}) and does NOT throw on non-2xx,
