@@ -514,10 +514,12 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
     load()
   }
 
-  async function markAgentDone(role: string) {
-    await api.post('/workflow/feedback', { role, feedback: 'Manually marked as done.' })
-    load()
-  }
+  // There is deliberately no "mark agent as done" here. The old Cancel button
+  // posted a completion line as ordinary agent feedback — it never terminated
+  // the process, and it manufactured an agent report out of an operator click
+  // with no provenance. Ending a stuck agent is the overseer's job
+  // (force-complete / kill-and-skip), which terminates the process, labels the
+  // output as operator-generated, and parks the run.
 
   // Build the timeline from the project's resolved preset order. WF_STEPS is
   // used ONLY as a display-name dictionary; the canonical ORDER comes from
@@ -1210,7 +1212,6 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
             onAdvance={advanceWorkflow}
             onFinish={finishWorkflow}
             onViewLog={(w) => setViewingLog(w)}
-            onMarkDone={markAgentDone}
           />
         )}
       </div>
@@ -1272,7 +1273,7 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
 }
 
 function StepDetail({
-  wf, pathologySignals, findings, onFindingToggle, activeKey, notes, setNotes, advancing, onAdvance, onFinish, onViewLog, onMarkDone,
+  wf, pathologySignals, findings, onFindingToggle, activeKey, notes, setNotes, advancing, onAdvance, onFinish, onViewLog,
 }: {
   wf: Workflow | null
   pathologySignals: PathologySignals | null
@@ -1285,7 +1286,6 @@ function StepDetail({
   onAdvance: (action?: string, extra?: Record<string, unknown>) => void
   onFinish: () => void
   onViewLog: (window: string) => void
-  onMarkDone: (role: string) => void
 }) {
   if (!wf) {
     return <Empty icon="⚙" text="Select a workflow type and PRD to begin" />
@@ -1497,7 +1497,7 @@ function StepDetail({
             const taskLabel = activeKey === 'task_execution' && a.taskIndex !== undefined
               ? `Task ${a.taskIndex + 1}`
               : undefined
-            return <AgentFeedbackCard key={i} agent={a} taskLabel={taskLabel} onViewLog={onViewLog} onMarkDone={onMarkDone} onRelaunchTask={wf.technicalStop ? undefined : (idx) => onAdvance('relaunch_task', { taskIndex: idx })} />
+            return <AgentFeedbackCard key={i} agent={a} taskLabel={taskLabel} onViewLog={onViewLog} onRelaunchTask={wf.technicalStop ? undefined : (idx) => onAdvance('relaunch_task', { taskIndex: idx })} />
           })}
         </div>
       )}
@@ -3042,7 +3042,7 @@ function OverseerCard({ overseer, onDismiss, onNudgeAgent }: { overseer: Oversee
   )
 }
 
-function AgentFeedbackCard({ agent, taskLabel, onViewLog, onMarkDone, onRelaunchTask }: { agent: WorkflowAgent; taskLabel?: string; onViewLog: (w: string) => void; onMarkDone: (role: string) => void; onRelaunchTask?: (taskIndex: number) => void }) {
+function AgentFeedbackCard({ agent, taskLabel, onViewLog, onRelaunchTask }: { agent: WorkflowAgent; taskLabel?: string; onViewLog: (w: string) => void; onRelaunchTask?: (taskIndex: number) => void }) {
   const [expanded, setExpanded] = useState(false)
   const verdict = detectVerdict(agent)
   const vc = VERDICT_CONFIG[verdict]
@@ -3203,18 +3203,6 @@ function AgentFeedbackCard({ agent, taskLabel, onViewLog, onMarkDone, onRelaunch
               }}
             >
               ↺ Relaunch
-            </button>
-          )}
-          {agent.status === 'running' && (
-            <button
-              onClick={(e) => { e.stopPropagation(); onMarkDone(agent.role) }}
-              style={{
-                padding: '2px 8px', borderRadius: 4,
-                border: '1px solid rgba(239,68,68,0.25)', background: 'rgba(239,68,68,0.08)',
-                color: 'var(--red)', fontFamily: 'var(--mono)', fontSize: 10, fontWeight: 600, cursor: 'pointer',
-              }}
-            >
-              ✗ Cancel
             </button>
           )}
           {agent.window && (

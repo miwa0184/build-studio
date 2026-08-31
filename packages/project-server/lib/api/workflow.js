@@ -18,11 +18,12 @@ const agentSkills = require('../agent-skills');
 const gateBlocked = require('../gate-blocked');
 const qaSuite = require('../qa-suite-run');
 const { extractFixPlan, checkFeedbackContract, rejectionOutcome, MAX_REJECTIONS } = require('../plan-contract');
-const { createRunGuard } = require('../run-guard');
+const { RunGuardCorruptError } = require('../run-guard');
+const { attachStateAuthority } = require('../state');
 const runBudgets = require('../run-budgets');
 const blockedTasks = require('../blocked-tasks');
 const { isAgentVerdict } = require('../feedback-provenance');
-const { isTechnicalStop, applyToWorkflow, refusalPayload } = require('../technical-stop');
+const { isTechnicalStop, refusalPayload, TerminalRunError, TechnicalStopPersistError } = require('../technical-stop');
 const { assertInside } = require('../path-guard');
 
 // Common instruction fragments injected into all agent prompts.
@@ -472,45 +473,42 @@ function createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast) {
   const { docsPath, projectRoot, worktreesPath, logsPath } = config;
 
   /**
-   * The run guard — every budget that must not be renewable.
+   * The state authority seam — the run guard enforced at the storage boundary.
    *
-   * Separate file, separate lifetime, per run. It is NOT part of the workflow
-   * object on purpose: saveWorkflow writes that object whole with no revision
-   * check, so anything holding an older snapshot rolls its contents back. See
-   * run-guard.js for the measurement.
+   * The guard (run-guard.js) holds every budget that must not be renewable and
+   * the run's terminal outcome, in its own file with a revision check. What
+   * used to be missing is enforcement: this router consulted the guard where
+   * individual handlers remembered to, while loadWorkflow/saveWorkflow moved
+   * workflow-state.json whole. attachStateAuthority (state.js) closes that —
+   * every load projects the guard's stop, every save re-applies it, and a
+   * guard that cannot be read fails closed. The real state manager arrives
+   * with the seam already attached; attaching here covers a caller that hands
+   * in a bare persistence stub, so there is one behaviour either way.
    *
-   * statePath is a frozen config key, so binding it once here is safe. The
-   * budget NUMBERS are read per call, because config hot-reloads.
+   * statePath is a frozen config key. The budget NUMBERS are read per call,
+   * because config hot-reloads.
    */
-  // config.js derives statePath as `<projectRoot>/.build-studio`; the same
-  // derivation is the fallback for a caller that built its config by hand.
-  const runGuard = createRunGuard({
-    statePath: config.statePath || path.join(config.projectRoot || process.cwd(), '.build-studio'),
-  });
+  attachStateAuthority(state, config);
+  const runGuard = state.runGuard;
   const budgets = () => runBudgets.resolveBudgets(config);
 
   /**
    * Put the run into its typed terminal outcome.
    *
-   * Recorded in three places, each with a different reader: on the workflow
-   * (the hub and deriveNeedsAttention), on the step (consumers that only look
-   * at steps), and in the run guard (so a restart cannot lose it). The step is
-   * `blocked`, which the auto-advance tick already refuses to act on.
+   * One write path, at the state boundary: the guard first (so a restart, a
+   * stale save or a restore cannot lose it), then the workflow projection
+   * (for the hub, deriveNeedsAttention, and consumers that only read steps).
+   * The step is `blocked`, which the auto-advance tick already refuses to act
+   * on.
+   *
+   * Throws TechnicalStopPersistError when the guard cannot take the stop —
+   * the run is still left non-transitionable, but the failure surfaces as a
+   * machine-readable error (see the router's error handler) instead of a
+   * response claiming the run was successfully parked.
    */
   function applyTechnicalStop(wf, stop) {
-    applyToWorkflow(wf, stop);
-    try {
-      runGuard.mutate(wf.id, (doc) => {
-        doc.technicalStop = stop;
-        if (stop.tasks && stop.tasks.length) doc.blockingTasks = stop.tasks;
-      });
-    } catch (e) {
-      console.error(`[workflow] could not persist technical stop to the run guard: ${e.message}`);
-    }
     console.warn(`[workflow] TECHNICAL_STOP ${stop.reasonCode} on ${stop.step} (run ${stop.runId})`);
-    state.saveWorkflow(wf);
-    broadcast('workflow-updated', {});
-    return stop;
+    return state.recordTechnicalStop(wf, stop);
   }
 
   /**
@@ -523,7 +521,12 @@ function createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast) {
     wf.acceptanceGaps = gaps;
     try {
       runGuard.mutate(wf.id, (doc) => { doc.acceptanceGaps = gaps; });
-    } catch (_) {}
+    } catch (e) {
+      // Not silently: an unwritable guard is the same fault recordTechnicalStop
+      // fails closed on. The gap still rides the workflow object; transitions
+      // that depend on the guard will fail closed on their own.
+      console.error(`[workflow] could not mirror acceptance gaps into the run guard: ${e.message}`);
+    }
   }
 
   /**
@@ -3935,12 +3938,17 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
       }
     }
 
-    // Scan all snapshots — deduplicate by prdId (only count each workflow run once
-    // by using the latest snapshot per workflow id)
+    // Scan all snapshots — deduplicate by prdId (only count each workflow run
+    // once by using the latest snapshot per workflow id). Through the PURE
+    // read: this is a GET, and it used to go through restoreSnapshot — a write
+    // path that replaces workflow-state.json, moves the step tracker, rewrites
+    // agent-status.json and broadcasts. (It also read a `name` field that
+    // listSnapshots does not produce, so it summed nothing at all — the two
+    // bugs hid each other.)
     const seenWfIds = new Set();
     for (const snap of state.listSnapshots()) {
       try {
-        const wf = state.restoreSnapshot(snap.name);
+        const wf = state.readSnapshot(snap.file);
         if (!wf || seenWfIds.has(wf.id)) continue;
         seenWfIds.add(wf.id);
         sumWorkflow(wf);
@@ -3968,6 +3976,15 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
       const wf = state.restoreSnapshot(snapshotFile);
       res.json({ workflow: wf, restored: snapshotFile });
     } catch (e) {
+      // A terminal active run refuses ANY restore — same-run pre-stop snapshots
+      // and other runs' snapshots alike. Restoring is how a stop, and the
+      // acceptance gap behind it, used to be walked back out of existence.
+      if (e instanceof TerminalRunError) {
+        return res.status(409).json({ ...refusalPayload(e.technicalStop), restoreRefused: true });
+      }
+      if (e instanceof RunGuardCorruptError) {
+        return res.status(503).json({ code: e.code, error: e.message, runId: e.runId || null });
+      }
       res.status(400).json({ error: e.message });
     }
   });
@@ -4208,7 +4225,11 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
         return;
       }
       state.saveWorkflow(w);
-    } catch (_) {}
+    } catch (e) {
+      // Fail closed, but never silently: a stop that could not be persisted is
+      // still enforced by the state boundary, and the fault must be visible.
+      console.error(`[auto-advance] could not persist the refusal outcome: ${e.message}`);
+    }
     console.warn(`[auto-advance] paused on step=${stepKey} after ${outcome.stepCount} refusals — the run's refusal budget is not renewed by restarting or re-enabling; advance the step explicitly once the cause is fixed`);
   }
 
@@ -4248,7 +4269,14 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     const step = wf.steps[wf.currentStep];
     if (!step) return;
 
-    // A run that already stopped does not get advanced by a timer.
+    // A guard that cannot be verified means the run's terminal truth is
+    // unknowable — the timer must not act until a human has repaired it. The
+    // timer keeps ticking so a repaired guard resumes without a restart.
+    if (wf.guardUnverifiable) return;
+
+    // A run that already stopped does not get advanced by a timer. The stop is
+    // projected from the run guard on every load, so a stale workflow file
+    // cannot hide it from this check.
     if (isTechnicalStop(wf.technicalStop) || wf.currentStep === 'technical_stop') {
       stopAutoAdvanceTimer();
       return;
@@ -4626,25 +4654,39 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     const wf = state.loadWorkflow();
     if (!wf) return res.status(404).json({ error: 'no active workflow' });
 
+    // --- An unverifiable guard has no transitions either ---
+    //
+    // The guard file exists but cannot be read, so whether this run is
+    // terminal is unknowable. Fail closed with the same machine-readable
+    // answer every save gives, before any handler can mutate anything.
+    if (wf.guardUnverifiable) {
+      return res.status(503).json({
+        code: 'RUN_GUARD_UNREADABLE',
+        error: `The run guard for ${wf.id} exists but cannot be verified — no transition can proceed until it is repaired. ${wf.guardUnverifiable.error}`,
+        workflow: wf,
+      });
+    }
+
     // --- A stopped run has no transitions, only recovery ---
     //
     // The terminality used to be incidental: nothing matched the step key
     // 'technical_stop', so handlers fell through to "no valid transition". That
     // is not a guarantee — it holds only until someone adds a handler, or a
     // restored snapshot puts the run on a step that does have one. Refuse here,
-    // before any handler can mutate anything.
+    // before any handler can mutate anything. loadWorkflow projects the stop
+    // from the run guard, so a stale workflow file cannot slip past this; a
+    // stop the workflow carries but the guard does not know yet (a run that was
+    // in flight when it landed) is made durable through the one write path.
     if (isTechnicalStop(wf.technicalStop)) {
-      // Mirror into the guard if it is not there yet. A stop normally arrives
-      // via applyTechnicalStop, which mirrors it — but a restored snapshot or a
-      // run that was in flight when this landed carries the stop on the
-      // workflow object alone, and that object is the one a stale whole-object
-      // save can roll back. Writing it here means a restart sees the halt
-      // whichever way the run acquired it.
       try {
-        if (!runGuard.load(wf.id).technicalStop) {
-          runGuard.mutate(wf.id, (doc) => { doc.technicalStop = wf.technicalStop; });
+        if (!state.authoritativeStop(wf.id)) {
+          state.recordTechnicalStop(wf, wf.technicalStop);
         }
-      } catch (_) {}
+      } catch (e) {
+        // The refusal below stands either way; the boundary keeps enforcing
+        // the stop in memory until the guard can hold it.
+        console.error(`[workflow] could not mirror the workflow-carried stop into the run guard: ${e.message}`);
+      }
       return res.status(409).json({ ...refusalPayload(wf.technicalStop), workflow: wf });
     }
 
@@ -9753,6 +9795,27 @@ ${FIX_EXECUTION_EFFICIENCY_INSTRUCTIONS}${STRUCTURED_FEEDBACK_INSTRUCTIONS}`,
 
     return res.status(400).json({ error: `no valid transition for step=${wf.currentStep} action=${action}` });
   }
+
+  // Typed authority failures thrown anywhere in this router — a guard that
+  // cannot be read, a stop that could not be made durable, a terminal run
+  // something tried to replace — surface as machine-readable refusals rather
+  // than an HTML 500. Failing closed only counts if the caller can tell WHY.
+  router.use((err, req, res, next) => {
+    if (err instanceof TechnicalStopPersistError) {
+      return res.status(503).json({
+        code: err.code,
+        error: err.message,
+        technicalStop: err.technicalStop || null,
+      });
+    }
+    if (err instanceof RunGuardCorruptError) {
+      return res.status(503).json({ code: err.code, error: err.message, runId: err.runId || null });
+    }
+    if (err instanceof TerminalRunError) {
+      return res.status(409).json(refusalPayload(err.technicalStop));
+    }
+    next(err);
+  });
 
   return router;
 }

@@ -13,8 +13,8 @@ const fs = require('fs');
 const path = require('path');
 const incidentsLib = require('./incidents');
 const { PROVENANCE, syntheticFeedback } = require('./feedback-provenance');
-const { createTechnicalStop, REASON_CODES, applyToWorkflow } = require('./technical-stop');
-const { createRunGuard } = require('./run-guard');
+const { createTechnicalStop, REASON_CODES } = require('./technical-stop');
+const { attachStateAuthority } = require('./state');
 
 const CHECK_INTERVAL_MS = 15_000;
 const STALL_THRESHOLD_MS = 10 * 60 * 1000; // 10 min — agent stall warning
@@ -70,6 +70,11 @@ const TURN_COMPLETE_PATTERN = /✻\s+\S+\s+for\s+\d+[smh]\b/;
  * @param {function} broadcast — SSE broadcast function
  */
 function createOverseer(config, state, broadcast) {
+  // The real state manager arrives with the authority seam already attached;
+  // attaching here covers a bare persistence stub, so the overseer's writes go
+  // through the same run-guard enforcement either way. No-op when present.
+  attachStateAuthority(state, config);
+
   let intervalId = null;
   let running = false;
 
@@ -184,18 +189,12 @@ function createOverseer(config, state, broadcast) {
         'This run is parked because a task finished with no agent verdict. Acceptance coverage for it cannot '
         + 'be rebuilt inside this run — start a successor repair run.',
     });
-    applyToWorkflow(wf, stop);
-    try {
-      const statePath = config.statePath || path.join(config.projectRoot || process.cwd(), '.build-studio');
-      createRunGuard({ statePath }).mutate(wf.id, (doc) => {
-        doc.technicalStop = stop;
-        doc.blockingTasks = stop.tasks;
-      });
-    } catch (e) {
-      log(`could not persist the technical stop to the run guard: ${e.message}`);
-    }
     log(`TECHNICAL_STOP ${reasonCode} — run parked (${agentWindow})`);
-    return stop;
+    // One write path for terminal truth: the state boundary writes the guard
+    // and persists the parked workflow together, and THROWS when the guard
+    // cannot take the stop — the operator action then reports failure instead
+    // of claiming a park that would not survive a restart.
+    return state.recordTechnicalStop(wf, stop);
   }
 
   /** Any open incident other than this one — i.e. is something still wrong? */
@@ -1096,12 +1095,12 @@ function createOverseer(config, state, broadcast) {
         agentWindow: windowName,
         detail: 'force-completed by operator after a wallclock overrun — no agent verdict was produced',
       });
-      state.saveWorkflow(wf);
 
-      // No loopback to /workflow/advance here any more. Both actions used to
-      // fire one so the next task launched — which turned "this task cannot be
-      // completed" into "carry on as though it had been". The run is parked
-      // above; nothing follows it in this run.
+      // parkRun persisted the workflow through the state boundary. No loopback
+      // to /workflow/advance: both actions used to fire one so the next task
+      // launched — which turned "this task cannot be completed" into "carry on
+      // as though it had been". The run is parked; nothing follows it in this
+      // run.
       return { ok: true };
     } catch (e) {
       return { ok: false, error: e.message };
@@ -1116,9 +1115,9 @@ function createOverseer(config, state, broadcast) {
    * It used to mark the task `done` under a `**Approved:** yes` header, which
    * said the opposite of what happened: no work was attributed and no agent
    * reviewed anything. The task is now `skipped`, its acceptance coverage stays
-   * unmet until a real replacement run passes, and the feedback body carries no
-   * approval marker. The workflow still advances to the next task — that is the
-   * operator's call — but it advances honestly.
+   * unmet, and the feedback body carries no approval marker. The run is PARKED
+   * (TASK_SKIPPED_UNVERIFIED) — nothing follows the skipped task in this run;
+   * a real attempt at it belongs to a successor repair run.
    *
    * @returns {{ok: boolean, error?: string}}
    */
@@ -1187,12 +1186,12 @@ function createOverseer(config, state, broadcast) {
         agentWindow: windowName,
         detail: 'aborted by operator after a wallclock overrun — no work attributed',
       });
-      state.saveWorkflow(wf);
 
-      // No loopback to /workflow/advance here any more. Both actions used to
-      // fire one so the next task launched — which turned "this task cannot be
-      // completed" into "carry on as though it had been". The run is parked
-      // above; nothing follows it in this run.
+      // parkRun persisted the workflow through the state boundary. No loopback
+      // to /workflow/advance: both actions used to fire one so the next task
+      // launched — which turned "this task cannot be completed" into "carry on
+      // as though it had been". The run is parked; nothing follows it in this
+      // run.
       return { ok: true };
     } catch (e) {
       return { ok: false, error: e.message };

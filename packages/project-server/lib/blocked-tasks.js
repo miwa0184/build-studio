@@ -129,9 +129,9 @@ function taskExecutionOutcome(wf) {
         tasks: blocking.map(({ index, name, reason }) => ({ index, name, reason })),
         evidence: blocking.map((t) => `taskStates.${t.index}.status=${t.status}`),
         recoveryHint:
-          `Relaunch ${blocking.length === 1 ? 'the blocked task' : 'the blocked tasks'} `
-          + `(${blocking.map((t) => `#${t.index + 1} ${t.name}`).join(', ')}) after addressing the review findings, `
-          + 'or cancel the run. The workflow will not merge while a task is blocked.',
+          `${blocking.length === 1 ? 'A task' : `${blocking.length} tasks`} could not be completed `
+          + `(${blocking.map((t) => `#${t.index + 1} ${t.name}`).join(', ')}). This run stays parked and will not merge; `
+          + 'a further attempt at the blocked work is a successor repair run with its own run id and budget.',
       }),
     };
   }

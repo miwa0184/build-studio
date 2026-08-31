@@ -99,7 +99,10 @@ function createTechnicalStop({ reasonCode, runId, step, tasks, evidence, recover
     step: step || null,
     tasks: Array.isArray(tasks) ? tasks : [],
     evidence: Array.isArray(evidence) ? evidence : [],
-    recoveryHint: recoveryHint || 'Diagnose the cause, then relaunch the step or cancel the run.',
+    // The default hint must not advertise in-run recovery: a technical stop is
+    // terminal for the run it stops, and every route that could act on advice
+    // like "relaunch the step" answers 409.
+    recoveryHint: recoveryHint || 'Diagnose the cause. This run stays parked; a further attempt is a successor repair run with its own run id and budget.',
     // Stated as fields, not only as behaviour, so a reader that has only the
     // serialised object — a snapshot, an API response, another process — reaches
     // the same conclusion as a reader with these functions.
@@ -178,10 +181,47 @@ function refusalPayload(stop) {
   };
 }
 
+/**
+ * Thrown when an operation would replace or transition a run whose guard says
+ * it is terminal — e.g. restoring a snapshot over a technically stopped run.
+ * Carries the authoritative stop so the refusing surface can answer with
+ * `refusalPayload(err.technicalStop)`.
+ */
+class TerminalRunError extends Error {
+  constructor(stop) {
+    super(`run ${stop && stop.runId} is terminal: ${stop && stop.reasonCode} — no state may replace or resume it`);
+    this.name = 'TerminalRunError';
+    this.code = 'RUN_TERMINAL';
+    this.technicalStop = stop;
+  }
+}
+
+/**
+ * Thrown when a technical stop could not be made durable in the run guard.
+ *
+ * The one thing this error exists to prevent is a FALSE SUCCESS: a route that
+ * parks a run, fails to write the guard, logs a line and answers as though the
+ * park took. The stop is still applied to the in-memory workflow and held as a
+ * pending stop at the state boundary (see state.js), so the run is not
+ * transitionable — but the caller must report the failure, because until the
+ * guard holds the stop it is not durable across a restart.
+ */
+class TechnicalStopPersistError extends Error {
+  constructor(stop, cause) {
+    super(`technical stop ${stop && stop.reasonCode} for run ${stop && stop.runId} could not be persisted to the run guard: ${cause && cause.message}`);
+    this.name = 'TechnicalStopPersistError';
+    this.code = 'TECHNICAL_STOP_PERSIST_FAILED';
+    this.technicalStop = stop;
+    if (cause) this.cause = cause;
+  }
+}
+
 module.exports = {
   SCHEMA_VERSION,
   TECHNICAL_STOP,
   REASON_CODES,
+  TerminalRunError,
+  TechnicalStopPersistError,
   createTechnicalStop,
   isTechnicalStop,
   countsAsApproval,

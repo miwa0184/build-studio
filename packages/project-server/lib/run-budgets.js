@@ -144,7 +144,7 @@ function consumeTaskFixCycle(guard, runId, taskIndex, budgets) {
       step: 'task_execution',
       tasks: [{ index: taskIndex, name: `task ${taskIndex + 1}`, reason: `reached max fix cycles (${used - 1}/${budgets.maxTaskFixCycles})` }],
       evidence: [`task_fix_cycles:${taskIndex}=${used} exceeds ${budgets.maxTaskFixCycles}`],
-      recoveryHint: 'The reviewer refused this task on every allowed fix cycle. Address the findings directly, then relaunch the task.',
+      recoveryHint: 'The reviewer refused this task on every allowed fix cycle. The findings are the outcome — this run stays parked, and a further attempt at the task is a successor repair run with its own budget.',
     }));
 }
 
@@ -218,8 +218,8 @@ function noteAutoAdvanceRefusal(guard, runId, stepKey, budgets, errMsg) {
       `last refusal on ${stepKey}: ${errMsg || 'no message'}`,
     ],
     recoveryHint:
-      'A gate has refused to advance this run as many times as its budget allows. Fix the cause the gate is '
-      + 'reporting and advance the step explicitly — re-enabling auto-advance does not restore the budget.',
+      'A gate has refused to advance this run as many times as its budget allows. This run stays parked — '
+      + 'diagnose the cause the gate is reporting; a further attempt is a successor repair run, and no toggle restores a spent budget.',
   });
   return out;
 }

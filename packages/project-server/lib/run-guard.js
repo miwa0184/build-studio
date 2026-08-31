@@ -53,6 +53,31 @@ class RunGuardConflictError extends Error {
   }
 }
 
+/**
+ * A guard file that EXISTS but cannot be trusted: unparseable, unreadable,
+ * wrong schema, or claiming to belong to a different run.
+ *
+ * This is a different situation from a missing file, and the difference is the
+ * whole failure model. A missing file is a new run with no prior guard state —
+ * cheap and correct to start clean. An existing file that cannot be verified
+ * used to be silently replaced by an empty document, which handed corruption a
+ * power nothing else in the system has: it renewed every budget and dropped any
+ * recorded terminal stop. So it fails closed instead — the caller gets a typed
+ * error, the corrupt file stays on disk as evidence, and nothing that depends
+ * on the guard's authority (budgets, transitions, saves) proceeds until a human
+ * has looked at it.
+ */
+class RunGuardCorruptError extends Error {
+  constructor(message, { runId, file, cause } = {}) {
+    super(message);
+    this.name = 'RunGuardCorruptError';
+    this.code = 'RUN_GUARD_UNREADABLE';
+    this.runId = runId;
+    this.file = file;
+    if (cause) this.cause = cause;
+  }
+}
+
 /** Run ids come from workflow ids; keep them safe as filenames without collapsing distinct ids. */
 function safeRunId(runId) {
   const raw = String(runId || 'unknown-run');
@@ -91,16 +116,43 @@ function createRunGuard({ statePath }) {
 
   function readDoc(runId) {
     const file = fileFor(runId);
+    // Absence is a NEW run — no prior guard state, nothing to distrust.
     if (!fs.existsSync(file)) return emptyDoc(runId);
+    let doc;
     try {
-      const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
-      // A file that is unreadable or belongs to another run must not be trusted
-      // into this run's budgets — start clean rather than inherit.
-      if (!doc || typeof doc !== 'object' || String(doc.runId) !== String(runId)) return emptyDoc(runId);
-      return { ...emptyDoc(runId), ...doc, runId: String(runId) };
-    } catch (_) {
-      return emptyDoc(runId);
+      doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (e) {
+      // An existing file that cannot be read or parsed fails CLOSED. Returning
+      // emptyDoc here let corruption renew every budget and erase a recorded
+      // technical stop — the one thing this store exists to make impossible.
+      throw new RunGuardCorruptError(
+        `run guard for ${runId} exists but cannot be read: ${e.message}`,
+        { runId: String(runId), file, cause: e },
+      );
     }
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
+      throw new RunGuardCorruptError(
+        `run guard for ${runId} is not a guard document`,
+        { runId: String(runId), file },
+      );
+    }
+    // A file at this run's path claiming another run's id is either corruption
+    // or tampering; trusting it would cross two runs' budgets, and replacing it
+    // would erase whichever run it really belongs to.
+    if (String(doc.runId) !== String(runId)) {
+      throw new RunGuardCorruptError(
+        `run guard file for ${runId} claims to belong to run ${JSON.stringify(doc.runId)}`,
+        { runId: String(runId), file },
+      );
+    }
+    if (!Number.isInteger(doc.schemaVersion) || doc.schemaVersion < 1
+      || !Number.isInteger(doc.revision) || doc.revision < 0) {
+      throw new RunGuardCorruptError(
+        `run guard for ${runId} has an unrecognisable schema (schemaVersion=${JSON.stringify(doc.schemaVersion)}, revision=${JSON.stringify(doc.revision)})`,
+        { runId: String(runId), file },
+      );
+    }
+    return { ...emptyDoc(runId), ...doc, runId: String(runId) };
   }
 
   function prune() {
@@ -204,4 +256,4 @@ function createRunGuard({ statePath }) {
   };
 }
 
-module.exports = { createRunGuard, RunGuardConflictError, SCHEMA_VERSION, GUARD_DIR };
+module.exports = { createRunGuard, RunGuardConflictError, RunGuardCorruptError, SCHEMA_VERSION, GUARD_DIR };

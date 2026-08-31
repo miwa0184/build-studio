@@ -23,10 +23,14 @@ that move underneath you without your having edited anything.
 
 ## 2026-08-31 — The engine stops instead of walking past its own halts
 
-Ten fail-open paths in the workflow engine, closed together. Each was reproduced
-against the previous head before anything was changed. No product behaviour
-changes; what changes is what the engine does when something has already gone
-wrong. Design record: `docs/plans/a1a-state-correctness-and-transition-authority.md`.
+Fail-open paths in the workflow engine, closed together — first the ten in the
+engine's transition logic, then (same day, after an independent review of the
+result) the deeper set at the storage boundary itself: restore, stale saves,
+restarts, a statistics route that wrote, and a guard store that could be reset
+by corruption. Each was reproduced against the unmodified head before anything
+was changed. No product behaviour changes; what changes is what the engine does
+when something has already gone wrong. Design record:
+`docs/plans/a1a-state-correctness-and-transition-authority.md`.
 
 ### Changed
 
@@ -97,6 +101,18 @@ wrong. Design record: `docs/plans/a1a-state-correctness-and-transition-authority
   still shows the most urgent one; dismissing it reveals the next rather than
   clearing everything.
 
+- **The "Cancel" button on a running agent card is gone.** It did not cancel
+  anything: it posted a synthetic completion line as ordinary agent feedback,
+  so the process kept running while the workflow recorded an agent report that
+  no agent wrote and that carried no provenance. Ending a stuck agent is the
+  overseer's force-complete / kill-and-skip, which terminate the process,
+  label the output as operator-generated, and park the run.
+
+- **Terminal stops no longer advertise in-run recovery in their hint text.**
+  Several recovery hints on TECHNICAL_STOP outcomes still said "relaunch the
+  task" or "advance the step explicitly" — advice every route answers 409 to.
+  A terminal hint now names the only real route, the successor repair run.
+
 ### Fixed
 
 - **A technically stopped run is parked, and stays parked.** A TECHNICAL_STOP is
@@ -138,6 +154,46 @@ wrong. Design record: `docs/plans/a1a-state-correctness-and-transition-authority
   granting rounds past the cap, but it was also ending the run — which deleted
   the other exit that step exists to offer ("move on", which stops the loop
   instead of extending it). The action is now declined with both options intact.
+
+- **A terminal stop can no longer be restored, saved or restarted away.** The
+  run guard recorded the stop, but nothing enforced it where state actually
+  moves: `POST /workflow/restore` could put back a pre-stop snapshot of the
+  same run — or a different run's snapshot — and the stop and the acceptance
+  gap behind it vanished together; a stale workflow copy that predated the
+  stop loaded as transitionable and saved straight over it; a restart trusted
+  whatever the file said. Terminal truth is now enforced at the storage
+  boundary itself (`attachStateAuthority` in `state.js`): every load projects
+  the guard's stop onto the workflow, every save re-applies it before writing,
+  and restoring anything over a terminal run is refused with the typed
+  refusal, leaving files byte-identical. This closes holes in the "parked, and
+  stays parked" claim earlier in this section — that was true of the routes
+  that checked; it is now true of the boundary every route, timer and overseer
+  write goes through.
+
+- **`GET /workflow/token-stats` no longer reads snapshots through a write
+  path.** It called `restoreSnapshot` per snapshot — a function that replaces
+  workflow-state.json, moves the step-transition tracker, rewrites
+  agent-status.json and broadcasts. (It also read a field `listSnapshots`
+  does not produce, so in practice it summed no snapshots at all; the two
+  bugs hid each other.) Snapshot reading is now a pure `readSnapshot`, and
+  the route both reports snapshot token usage for the first time and touches
+  nothing while doing it.
+
+- **A corrupt or mismatched run-guard file fails closed instead of resetting
+  the run.** An existing guard file that was unreadable, had an
+  unrecognisable schema, or claimed to belong to a different run was silently
+  replaced by an empty document — which renewed every budget and dropped any
+  recorded terminal stop. It now raises a machine-readable
+  `RUN_GUARD_UNREADABLE` error; no transition, save or restore proceeds until
+  the file is repaired, and the corrupt file is left in place as evidence. A
+  *missing* file still simply means a new run.
+
+- **A technical stop that cannot be written to the guard is reported as a
+  failure, never as a successfully parked run.** The park used to log the
+  guard error and answer as if it had taken. It now answers
+  `TECHNICAL_STOP_PERSIST_FAILED`, keeps the run non-transitionable in the
+  meantime (the stop is held at the state boundary and re-applied on every
+  load and save), and writes the guard as soon as it can.
 
 ### Added
 
@@ -196,6 +252,12 @@ is carrying a blocked task it will stop rather than merge, which is the point.
 - Budgets belong in the run guard, not on the workflow object.
   `saveWorkflow` writes that object whole with no revision check, so anything
   stored there can be rolled back by a stale writer.
+- Terminal truth is enforced by the state boundary, not by callers. Read and
+  write workflow state only through the state manager (`attachStateAuthority`
+  in `state.js`); record a stop only through `state.recordTechnicalStop`; do
+  not build a second run-guard path with different semantics — use
+  `state.runGuard`. Anything that only needs to LOOK at a snapshot must use
+  `readSnapshot`, never `restoreSnapshot`.
 - The hub must not decide transitions. It may render state, send an explicit
   user action, and toggle the server's auto-advance policy — nothing else.
   `packages/project-server/lib/hub-transition-authority.test.js` enforces this

@@ -7,6 +7,9 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const { createOverseer } = require('./overseer');
 
@@ -38,7 +41,12 @@ function harness() {
     loadWorkflow: () => JSON.parse(JSON.stringify(wf)),
     saveWorkflow: (next) => { Object.assign(wf, JSON.parse(JSON.stringify(next))); },
   };
-  const config = { projectRoot: '/nonexistent-project-root', port: 0 };
+  // A writable statePath: parking a run now writes the run guard through the
+  // state authority boundary, and an unwritable guard correctly FAILS the
+  // operator action instead of being swallowed. That failure mode has its own
+  // test (state-authority.test.js R20); this file tests provenance.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'overseer-feedback-'));
+  const config = { projectRoot: root, statePath: path.join(root, '.build-studio'), port: 0 };
   return { wf, overseer: createOverseer(config, state, () => {}) };
 }
 

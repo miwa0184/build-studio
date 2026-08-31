@@ -126,7 +126,10 @@ test('canary 5 — force-complete and kill-and-skip cannot become approval', () 
     loadWorkflow: () => JSON.parse(JSON.stringify(wf)),
     saveWorkflow: (next) => { Object.assign(wf, JSON.parse(JSON.stringify(next))); },
   };
-  const overseer = createOverseer({ projectRoot: '/nonexistent-project-root', port: 0 }, state, () => {});
+  // Writable statePath: parking a run writes the run guard through the state
+  // authority boundary, and an unwritable guard now correctly fails the action.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bs-canary5-'));
+  const overseer = createOverseer({ projectRoot: root, statePath: path.join(root, '.build-studio'), port: 0 }, state, () => {});
 
   assert.equal(overseer.forceCompleteTaskAgent('t2-ios').ok, true);
   const agent = wf.taskExecution.taskStates['1'].agents[0];

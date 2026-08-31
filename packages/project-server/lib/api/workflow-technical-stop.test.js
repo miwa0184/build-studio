@@ -177,8 +177,13 @@ test('relaunch cannot erase the stop record it is rendered next to', () => {
 
   return call(makeApp(wf), 'POST', '/workflow/advance', { action: 'relaunch' }).then(({ status }) => {
     assert.equal(status, 409);
-    assert.equal(wf.steps.technical_stop.error, 'BLOCKED_TASKS: relaunch it');
+    // The step record survives — and may be RE-PROJECTED from the
+    // authoritative stop (reason code and hint), since the refusal now also
+    // mirrors a workflow-carried stop into the run guard. What must never
+    // happen is the record being reset to a bare pending step.
+    assert.match(wf.steps.technical_stop.error, /^BLOCKED_TASKS/, 'the stop reason must survive a refused relaunch');
     assert.ok(wf.steps.technical_stop.stop, 'the stop record must survive a refused relaunch');
+    assert.equal(wf.steps.technical_stop.status, 'blocked');
     assert.equal(wf.currentStep, 'technical_stop');
   });
 });
