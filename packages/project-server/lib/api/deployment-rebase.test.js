@@ -55,23 +55,62 @@ beforeEach(async () => {
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });
 
+/**
+ * Wait for the BACKGROUND git fetch to finish before the tree is deleted.
+ *
+ * `GET /deployment` deliberately does not fetch inline — it answers from the
+ * refs it has and schedules `git fetch --quiet origin` behind the response, so
+ * the tab's 10-second poll is never blocked on the network (deployment.js,
+ * `remoteFetch`). That fetch is still writing into `local/.git` after the
+ * request returns and after the server is closed: it is a detached child
+ * process, not an HTTP connection.
+ *
+ * Deleting the repository underneath it is what produced, on CI,
+ * `ENOTEMPTY: directory not empty, rmdir '/tmp/bs-rebase-*\/local/.git'` from
+ * this hook — rimraf empties a directory, git recreates an object or lock file
+ * inside it, and the rmdir fails. The test that runs after this one already
+ * knows about the background fetch and sleeps 1500ms for it; this one ends on a
+ * `GET /deployment` and did not.
+ *
+ * Load-dependent, so it stayed invisible until a busy 2-core runner.
+ */
+function waitForGitQuiet(repo, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  const gitDir = path.join(repo, '.git');
+  while (Date.now() < deadline) {
+    let busy = false;
+    try {
+      // git holds a *.lock while it writes refs, the index, or the object store.
+      const stack = [gitDir];
+      while (stack.length && !busy) {
+        const dir = stack.pop();
+        for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+          if (e.isDirectory()) stack.push(path.join(dir, e.name));
+          else if (e.name.endsWith('.lock')) { busy = true; break; }
+        }
+      }
+    } catch (_) {
+      return; // the tree is already gone, or unreadable — nothing to wait for
+    }
+    if (!busy) return;
+    // Busy-wait briefly; this hook is synchronous by contract with node:test.
+    const until = Date.now() + 25;
+    while (Date.now() < until) { /* spin */ }
+  }
+}
+
 afterEach(async () => {
-  // Wait for the server to actually be down before deleting the tree it is
-  // serving. `server.close()` only stops NEW connections and returns
-  // immediately, and undici (what `fetch` uses) holds its sockets open with
-  // keep-alive — so a request handler could still be shelling out to git in
-  // `local/` while rmSync walked it. That surfaced on CI as
-  // `ENOTEMPTY: rmdir '/tmp/bs-rebase-*/local/.git'` from the teardown hook:
-  // rimraf empties a directory, git recreates a lock or index file inside it,
-  // and the rmdir fails. It is load-dependent, which is why it only appeared on
-  // a busy 2-core runner.
+  // Close the server first: `server.close()` alone only stops NEW connections
+  // and returns immediately, and undici (what `fetch` uses) holds its sockets
+  // open with keep-alive, so a handler could still be mid-request.
   if (server) {
     server.closeAllConnections?.();
     await new Promise((resolve) => server.close(resolve));
   }
-  // Belt and braces: retry rather than fail the whole file if the filesystem is
-  // still catching up. A teardown must not be able to fail a passing test.
-  fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  waitForGitQuiet(local);
+  // And retry rather than fail the file if the filesystem is still catching up.
+  // A teardown must not be able to fail a passing test.
+  fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 30, retryDelay: 100 });
 });
 
 const rebase = () => fetch(`${baseUrl}/api/deployment/rebase`, { method: 'POST' });
