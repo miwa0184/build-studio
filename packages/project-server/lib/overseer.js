@@ -150,6 +150,11 @@ function createOverseer(config, state, broadcast) {
     syncEscalationMirror(overseer);
   }
 
+  /** Any open incident other than this one — i.e. is something still wrong? */
+  function hasOpenIncidentsBesides(overseer, symptom) {
+    return incidentsLib.openIncidents(overseer.incidents).some((i) => i.symptom !== symptom);
+  }
+
   /** Resolve whichever open incident is about this agent window. */
   function resolveIncidentsForAgent(overseer, windowName) {
     if (!overseer) return;
@@ -1026,7 +1031,11 @@ function createOverseer(config, state, broadcast) {
           description: `Task force-completed by operator. Pane output is kept as untrusted diagnostic evidence — it is not an agent verdict and does not count as approval or acceptance evidence.`,
           allowedRecoveryAction: 'relaunch-task-for-real-verdict',
         });
-        if (incidentsLib.openIncidents(wf.overseer.incidents).length === 0 && wf.overseer.status === 'escalating') {
+        // Ignore the incident just raised: it records the override, it is not a
+        // problem waiting on anyone. Counting it meant the condition could never
+        // hold, so the overseer stayed 'escalating' with its activity frozen on
+        // the overrun text until somebody dismissed a banner by hand.
+        if (!hasOpenIncidentsBesides(wf.overseer, `force-completed-${windowName}`) && wf.overseer.status === 'escalating') {
           wf.overseer.status = 'watching';
           wf.overseer.activity = `Force-completed ${windowName} — advancing`;
         }
@@ -1126,7 +1135,7 @@ function createOverseer(config, state, broadcast) {
           description: 'Task aborted by operator with no work attributed. Its acceptance coverage stays unmet until a real replacement run passes.',
           allowedRecoveryAction: 'relaunch-task-for-real-verdict',
         });
-        if (incidentsLib.openIncidents(wf.overseer.incidents).length === 0 && wf.overseer.status === 'escalating') {
+        if (!hasOpenIncidentsBesides(wf.overseer, `skipped-${windowName}`) && wf.overseer.status === 'escalating') {
           wf.overseer.status = 'watching';
           wf.overseer.activity = `Skipped ${windowName} — advancing`;
         }

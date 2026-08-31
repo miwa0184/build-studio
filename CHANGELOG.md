@@ -79,8 +79,9 @@ wrong. Design record: `docs/plans/a1a-state-correctness-and-transition-authority
 - **Tasks nobody verified block the run from claiming their criteria are met.**
   A skipped or force-completed task no longer auto-advances `ac_verification`,
   `merge_for_review`, `merge_to_main`, `demo_review` or `device_testing`. You can
-  still advance those steps explicitly; only the automatic path is refused, and
-  the reason names the tasks. The task list shows them in orange with an
+  still advance those steps explicitly; only the automatic path is held, and the
+  reason names the tasks. It is a standing hold, not a refusal — it consumes no
+  budget and will wait indefinitely rather than ending the run. The task list shows them in orange with an
   "N unverified" count rather than counting them as complete.
 
 - **Fix plans have a task ceiling.** Implementation plans have had one for a long
@@ -100,9 +101,17 @@ wrong. Design record: `docs/plans/a1a-state-correctness-and-transition-authority
 
 - **A stopped run can be recovered instead of only cancelled.** A TECHNICAL_STOP
   stays terminal for anything automatic, but `Relaunch task` and `Skip task` now
-  work from it — the routes its own recovery hint points at. The stop is kept on
-  the run as evidence after it is cleared. `Relaunch step` is refused on a
+  work from it — the routes its own recovery hint points at, including on a task
+  in the `blocked` state those routes exist for. For halts that are not about a
+  task (a spent round budget, a fix plan over its ceiling), an explicit
+  `clear_technical_stop` acknowledges the halt and puts the run back on its step
+  so the normal actions apply; nothing reaches it without a person asking. Every
+  cleared stop is kept on the run as evidence. `Relaunch step` is refused on a
   stopped run rather than resetting the step and erasing the stop record.
+
+- **A blocked task also stops an explicit advance, not just the timer.** The
+  guard used to sit only in the auto-advance tick, so a restored snapshot — or a
+  run that was already in flight — could be advanced past a blocked task by hand.
 
 - **Three gate refusals no longer end a run.** The per-step and run-wide refusal
   ceilings shared one number, so the third refusal anywhere in a run was fatal —

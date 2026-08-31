@@ -165,6 +165,36 @@ handler the diff never touched.
 
 Each is now closed with a regression test that fails on the first cut.
 
+## The second review, and the same mistake twice
+
+A second independent review of the repaired head also returned REPAIR_REQUIRED,
+and the headline finding was that the *fix* for "acceptance gaps are recorded but
+never read" had reintroduced precisely the failure the round before it removed.
+
+The gate was written as a refusal: each tick called the refusal recorder, which
+spends run budget. But an acceptance gap is not an event — it is a standing
+condition that never clears on its own until a replacement run passes. So the
+run burned its whole run-wide refusal budget in about two minutes and stopped
+terminally, on nothing worse than an operator legitimately skipping a task. On
+`device_testing` that means a person standing at a device comes back to a dead
+run.
+
+The distinction that was missing, and is now explicit in the code: **a refusal is
+an event that spends budget; a hold is a condition that waits.** A gate that can
+never clear itself must be a hold.
+
+The same review found the recovery route added in round one reached only one of
+the six reason codes — `relaunch_task` and `skip_blocked` live under
+`task_execution`, and only `BLOCKED_TASKS` stops there. A run that hit a spent
+round budget stops on `reviewing`, where neither handler exists, so it had *no*
+action at all. `clear_technical_stop` is the general route: explicit, logged,
+and it decides nothing except that the halt has been read.
+
+Two rounds, and both regressions were the same shape — fail-closed applied to a
+case that needed to fail *open to a person*. Worth stating plainly, because the
+instinct that produced them is the right instinct for the ten original defects
+and the wrong one for the operator's escape hatch.
+
 ## Known limits
 
 - The per-step refusal count clears when that step genuinely advances; only the

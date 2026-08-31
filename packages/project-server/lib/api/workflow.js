@@ -549,7 +549,11 @@ function createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast) {
     console.log(`[workflow] TECHNICAL_STOP ${cleared.reasonCode} cleared by operator: ${reason}`);
   }
 
-  /** Record which tasks finished without a verdict, so acceptance cannot claim them. */
+  /**
+   * Record which tasks finished without a verdict, so acceptance cannot claim
+   * them. The caller is responsible for persisting `wf` — this only sets the
+   * field and mirrors it into the guard, which outlives the workflow object.
+   */
   function recordAcceptanceGaps(wf, gaps) {
     if (!gaps || gaps.length === 0) return;
     wf.acceptanceGaps = gaps;
@@ -4301,16 +4305,6 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     // reading it would have left the coverage claim exactly as false as before.
     // A person can still advance these steps explicitly; only the timer is
     // refused.
-    if (ACCEPTANCE_SENSITIVE_STEPS.has(wf.currentStep)) {
-      const gaps = blockedTasks.findAcceptanceGaps(wf);
-      if (gaps.length > 0) {
-        recordAcceptanceGaps(wf, gaps);
-        noteAdvanceRefusal(wf.currentStep, 'approve',
-          `${gaps.length} task(s) finished without an agent verdict (${gaps.map((g) => `#${g.index + 1} ${g.name}`).join(', ')}) — acceptance coverage is unmet, so this step will not auto-advance. Relaunch them for a real verdict, or advance explicitly to accept the gap.`);
-        return;
-      }
-    }
-
     // Don't keep hammering a step the gate has repeatedly rejected — it's surfaced via
     // step.autoAdvanceError and needs manual attention (fix the cause, then advance
     // explicitly; the refusal budget is spent for this run).
@@ -4337,6 +4331,35 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     const alwaysManual = ['device_testing', 'owner_consultations'];
     if (!wf.autoAdvanceSkipDemoReview) alwaysManual.push('demo_review');
     if (alwaysManual.includes(wf.currentStep)) return;
+
+    // A task nobody verified holds this step against the TIMER — and only the
+    // timer. An operator can still advance it explicitly to accept the gap.
+    //
+    // This is a standing condition, not a refusal, and the difference is the
+    // whole point: a refusal is an event that spends budget, and the first cut
+    // of this gate called noteAdvanceRefusal on every 8-second tick against a
+    // condition that never clears on its own. That burned the run-wide refusal
+    // budget in about two minutes and terminally stopped a run whose only sin
+    // was an operator legitimately skipping a task — reintroducing exactly the
+    // failure the budget separation had just removed. A hold spends nothing and
+    // waits.
+    if (ACCEPTANCE_SENSITIVE_STEPS.has(wf.currentStep)) {
+      const gaps = blockedTasks.findAcceptanceGaps(wf);
+      if (gaps.length > 0) {
+        const detail = `${gaps.length} task(s) finished without an agent verdict `
+          + `(${gaps.map((g) => `#${g.index + 1} ${g.name}`).join(', ')}) — acceptance coverage is unmet, so `
+          + `${wf.currentStep} will not auto-advance. Relaunch them for a real verdict, or advance this step `
+          + 'explicitly to accept the gap.';
+        if (step.acceptanceHold !== detail) {
+          step.acceptanceHold = detail;
+          recordAcceptanceGaps(wf, gaps);
+          state.saveWorkflow(wf);
+          console.warn(`[auto-advance] holding ${wf.currentStep}: ${detail}`);
+        }
+        return;
+      }
+      if (step.acceptanceHold) { delete step.acceptanceHold; state.saveWorkflow(wf); }
+    }
 
     // Review steps used below for verdict-based routing (send_to_devs on blocking).
     // coverage_matrix is intentionally NOT here — it is advisory (its findings are
@@ -4622,8 +4645,18 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
    * `relaunch` is deliberately NOT here: it resets `wf.steps[currentStep]` to a
    * bare pending object, which would erase the very record the stop wrote there
    * for consumers that only read steps.
+   *
+   * `relaunch_task` and `skip_blocked` only reach a handler when the run stopped
+   * on task_execution, which is true for BLOCKED_TASKS and nothing else. The
+   * other five reason codes stop on `reviewing`, `fix_plan`, `fix_execution` or
+   * whichever step a gate refused, where neither handler exists — so a run that
+   * hit a spent round budget had NO action available at all, and the only exit
+   * was discarding the work. `clear_technical_stop` is the general one: an
+   * explicit, logged operator acknowledgement that puts the run back on its step
+   * so the normal actions apply again. It is not an auto-advance — nothing
+   * reaches it without a person asking — which is the property that matters.
    */
-  const TECHNICAL_STOP_RECOVERY_ACTIONS = new Set(['relaunch_task', 'skip_blocked']);
+  const TECHNICAL_STOP_RECOVERY_ACTIONS = new Set(['relaunch_task', 'skip_blocked', 'clear_technical_stop']);
 
   router.post('/workflow/advance', (req, res) => {
     const { action, notes } = req.body;
@@ -4651,6 +4684,45 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     // handler once it has actually done something.
     if (isTechnicalStop(wf.technicalStop) && TECHNICAL_STOP_RECOVERY_ACTIONS.has(action)) {
       wf.currentStep = wf.technicalStop.step || 'task_execution';
+    }
+
+    // A blocked task with no stop recorded against it stops an explicit advance
+    // too. The tick asks blocksTransition; this route did not, so terminality
+    // held by convention — nothing matched the step key 'technical_stop' — and
+    // not by a guard. A restored snapshot, a run already in flight when this
+    // landed, or any future path that marks a task blocked without going through
+    // taskExecutionOutcome would have walked straight to merge.
+    if (!TECHNICAL_STOP_RECOVERY_ACTIONS.has(action) && !isTechnicalStop(wf.technicalStop)) {
+      const stop = blockedTasks.blocksTransition(wf);
+      if (stop) {
+        applyTechnicalStop(wf, stop);
+        return res.status(409).json({
+          error: `${stop.reasonCode}: ${stop.recoveryHint}`,
+          technicalStop: stop,
+          recoveryActions: [...TECHNICAL_STOP_RECOVERY_ACTIONS],
+          workflow: wf,
+        });
+      }
+    }
+
+    // --- Clear a technical stop: the general recovery route ---
+    //
+    // Deliberately does nothing except lift the halt and put the run back where
+    // it stopped. It does not decide what happens next; the operator does, with
+    // the step's normal actions. The stop is kept as evidence.
+    if (action === 'clear_technical_stop') {
+      if (!isTechnicalStop(wf.technicalStop) && !(wf.steps && wf.steps.technical_stop)) {
+        return res.status(400).json({ error: 'this run is not stopped' });
+      }
+      const stopped = wf.technicalStop;
+      clearTechnicalStopAfterRecovery(wf, notes || 'acknowledged by operator');
+      state.saveWorkflow(wf);
+      broadcast('workflow-updated', {});
+      return res.json({
+        workflow: wf,
+        clearedTechnicalStop: stopped ? stopped.reasonCode : null,
+        note: 'The halt is lifted and recorded. Nothing was advanced — use the step\'s own actions from here.',
+      });
     }
 
     // --- Relaunch: reset current step and re-enter it ---
@@ -7534,7 +7606,11 @@ ${EFFICIENCY_INSTRUCTIONS}`,
         const ts = tex?.taskStates[String(tIdx)];
         if (!ts) return res.status(400).json({ error: `Task ${tIdx} not found` });
         const phase = ts.status;
-        if (!['running', 'error', 'pending'].includes(phase)) {
+        // 'blocked' belongs here: it is the state the BLOCKED_TASKS stop tells
+        // the operator to relaunch out of, and the hub renders the Relaunch
+        // button on exactly those tasks. Rejecting it made the advertised
+        // recovery route — and the only button the UI offers — a 400.
+        if (!['running', 'error', 'pending', 'blocked'].includes(phase)) {
           return res.status(400).json({ error: `Task ${tIdx} is not in a relaunchable phase (${phase})` });
         }
 
@@ -7577,10 +7653,11 @@ ${EFFICIENCY_INSTRUCTIONS}`,
         if (!ts || !['blocked', 'error'].includes(ts.status)) {
           return res.status(400).json({ error: `Task ${tIdx} is not blocked or errored` });
         }
+        const priorStatus = ts.status;
         ts.status = 'skipped';
         ts.acceptanceCovered = false;
         ts.skipReason = ts.skipReason
-          || `skipped by operator from ${ts.status === 'error' ? 'an errored' : 'a blocked'} state — no work attributed`;
+          || `skipped by operator from ${priorStatus === 'error' ? 'an errored' : 'a blocked'} state — no work attributed`;
         ts.completedAt = ts.completedAt || new Date().toISOString();
         clearTechnicalStopAfterRecovery(wf, `task ${tIdx + 1} skipped by operator`);
         updateStepAgents(wf);

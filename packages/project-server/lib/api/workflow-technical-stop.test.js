@@ -213,3 +213,101 @@ test('skip_blocked marks the task skipped — never done', () => {
     assert.match(ts.skipReason, /no work attributed/);
   });
 });
+
+// ── Repair round 2 ────────────────────────────────────────────────────────────
+// A second independent review found that the first repair's acceptance gate
+// reintroduced the failure the repair existed to remove, and that the recovery
+// route reached only one of six reason codes. Each of these is one assertion the
+// previous round did not have.
+
+test('an unverified task holds a step against the timer WITHOUT spending budget', async () => {
+  // The first cut called noteAdvanceRefusal here — on every 8-second tick,
+  // against a condition that never clears on its own. That burned the run-wide
+  // refusal budget in about two minutes and terminally stopped a run whose only
+  // sin was an operator legitimately skipping a task.
+  const os2 = require('os');
+  const root = fs.mkdtempSync(path.join(os2.tmpdir(), 'wf-hold-test-'));
+  const statePath = path.join(root, '.build-studio');
+  fs.mkdirSync(statePath, { recursive: true });
+
+  const { createRunGuard } = require('../run-guard');
+  const { COUNTERS } = require('../run-budgets');
+  const guard = createRunGuard({ statePath });
+
+  const wf = wfWithBlockedTask('device_testing');
+  wf.taskExecution.taskStates['1'] = { status: 'skipped', acceptanceCovered: false, agents: [] };
+  wf.steps.device_testing = { status: 'pending', agents: [] };
+
+  // The hold is derived, so deriveNeedsAttention reports it without any tick.
+  const { deriveNeedsAttention } = require('../needs-attention');
+  assert.equal(deriveNeedsAttention(wf).reason, 'acceptance_gap');
+
+  // And no counter has been touched by merely being in that state.
+  assert.equal(guard.count(wf.id, COUNTERS.AUTO_ADVANCE_REFUSALS), 0);
+  assert.equal(guard.count(wf.id, `${COUNTERS.AUTO_ADVANCE_REFUSALS}:device_testing`), 0);
+});
+
+test('every reason code has a recovery route, not just BLOCKED_TASKS', async () => {
+  // relaunch_task and skip_blocked only reach a handler when the run stopped on
+  // task_execution. A run that hit a spent round budget stops on `reviewing`,
+  // where neither exists — so it had no action available at all, and the only
+  // exit was discarding the work.
+  for (const [reasonCode, step] of [
+    ['REVIEW_ROUND_BUDGET_EXHAUSTED', 'reviewing'],
+    ['STRICT_REVIEW_CAP_WITH_FINDINGS', 'reviewing'],
+    ['AUTO_ADVANCE_REFUSAL_BUDGET_EXHAUSTED', 'qa_validation'],
+    ['FIX_PLAN_TASK_CEILING', 'fix_plan'],
+  ]) {
+    const wf = wfWithBlockedTask('technical_stop');
+    wf.taskExecution.taskStates['1'] = { status: 'done', agents: [] };
+    wf.technicalStop = {
+      outcome: 'TECHNICAL_STOP', reasonCode, runId: wf.id, step,
+      tasks: [], evidence: [`${reasonCode} evidence`], recoveryHint: 'Look at the evidence.',
+    };
+    wf.steps.technical_stop = { status: 'blocked' };
+
+    const app = makeApp(wf);
+    const refused = await call(app, 'POST', '/workflow/advance', { action: 'approve' });
+    assert.equal(refused.status, 409, `${reasonCode}: autonomy must stay refused`);
+    assert.ok(refused.body.recoveryActions.includes('clear_technical_stop'));
+
+    const cleared = await call(app, 'POST', '/workflow/advance', { action: 'clear_technical_stop', notes: 'read it' });
+    assert.equal(cleared.status, 200, `${reasonCode}: the operator must have a route`);
+    assert.equal(wf.technicalStop, null);
+    assert.equal(wf.currentStep, step, 'the run goes back to where it stopped');
+    assert.equal(wf.clearedTechnicalStops[0].reasonCode, reasonCode);
+  }
+});
+
+test('relaunch_task accepts a blocked task — the state its own hint names', async () => {
+  // The hint says "relaunch the blocked task", and the hub renders the Relaunch
+  // button on exactly those tasks. The handler rejected `blocked` as an
+  // unrelaunchable phase, so the advertised route answered 400.
+  const wf = wfWithBlockedTask('technical_stop');
+  wf.sessionName = 'bs-test';
+  wf.technicalStop = {
+    outcome: 'TECHNICAL_STOP', reasonCode: 'BLOCKED_TASKS', runId: wf.id, step: 'task_execution',
+    tasks: [{ index: 1, name: 'Sync engine', reason: 'max fix cycles' }], evidence: [],
+    recoveryHint: 'Relaunch the blocked task.',
+  };
+  wf.steps.technical_stop = { status: 'blocked' };
+
+  const { status, body } = await call(makeApp(wf), 'POST', '/workflow/advance', { action: 'relaunch_task', taskIndex: 1 });
+  assert.notEqual(status, 400, `relaunch_task on a blocked task must not be refused: ${JSON.stringify(body).slice(0, 200)}`);
+  assert.doesNotMatch(JSON.stringify(body), /not in a relaunchable phase/);
+});
+
+test('an explicit advance is guarded too, not only the timer', async () => {
+  // Terminality used to hold because nothing matched the step key — a
+  // convention, not a guard. A restored snapshot or a run already in flight can
+  // sit on a later step with a blocked task and no stop recorded.
+  const wf = wfWithBlockedTask('merge_to_main');
+  wf.steps.merge_to_main = { status: 'pending', agents: [] };
+  assert.equal(wf.technicalStop, undefined, 'precondition: no stop recorded yet');
+
+  const { status, body } = await call(makeApp(wf), 'POST', '/workflow/advance', { action: 'approve' });
+  assert.equal(status, 409);
+  assert.equal(body.technicalStop.reasonCode, 'BLOCKED_TASKS');
+  assert.equal(wf.currentStep, 'technical_stop');
+  assert.notEqual(wf.currentStep, 'capture_learnings');
+});
