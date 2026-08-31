@@ -21,6 +21,109 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-09-01 — Runs are admitted at the door, and a run's history cannot be deleted into a fresh start
+
+Every run start is now admitted server-side against the project's actual git
+state before its first side effect, every run is registered with a durable
+identity, and the run-guard store no longer prunes old guard files or treats a
+missing file as a brand-new run. A UI click and a direct API call meet exactly
+the same server verdict; the hub carries no admission authority. Design record
+(with the full re-measured ingress inventory and the red-first evidence):
+`docs/plans/a1b1-admission-and-run-identity.md`.
+
+### Added
+
+- **A RunRequest/GateVerdict admission gate.** `POST /api/workflow/start` and
+  `POST /api/launch` now require a `runRequest` — versioned, naming the repo
+  (`owner/name`, verified against origin), the *current* head sha, a task
+  packet that must exist in the committed tree at that head, a bounded
+  validity window, and a single-use nonce. The server verifies everything,
+  registers the run, and returns a machine-readable `gateVerdict` it generated
+  itself; anything shaped like a client-supplied verdict, approval, or bypass
+  is refused. `GET /api/admission/context` (read-only) tells a client what a
+  valid request would contain right now.
+- **Claims classification on admission.** A request may carry classified
+  evidence: `MEASURED` (requires a structured receipt), `DERIVED` (accepted
+  only for server-recomputable methods; a wrong result refuses), and
+  `INFERENCE`/`HYPOTHESIS`/`UNKNOWN` (transported, never authority). No claim
+  can substitute for a failed repo/head/packet verification.
+- **Durable run identity and replay protection.** Admission writes one atomic
+  registry entry (`.build-studio/admission/registry.json`) that consumes the
+  nonce and registers the run — with lineage metadata from the root run on
+  (`lineageId`, `predecessorRunId`, `successorOrdinal`) — and survives server
+  restarts. A replayed nonce refuses, restart or not.
+- **Backstops at the consumption points.** `createWorktree`, the agent-launch
+  funnel, dev-server startup, the review worktree path and the tmux window
+  every agent is spawned into each refuse without a verified server-issued
+  admission context, so a future code path that forgets admission fails closed
+  instead of spawning.
+
+### Changed
+
+- **Starting a run without a valid RunRequest now refuses (HTTP 403), where it
+  used to just start.** This is the point of the slice, and it is a behaviour
+  change on an unmodified config: direct API callers and scripts that POST to
+  `/api/workflow/start` or `/api/launch` must now send a `runRequest` (the hub
+  does this automatically). A refusal leaves nothing behind — no workflow or
+  run record, no branch, no worktree, no process.
+- **The task packet must be committed.** A review of an uncommitted PRD draft,
+  a bugfix whose bug file is not at head, and a kickoff/onboarding in a repo
+  with no tracked anchor file (`.build-studio/config.yaml`, `README.md`, or
+  `docs/vision.md`) now refuse until the file is committed. The gate verifies
+  committed state; the working tree does not count.
+- **Work-advancing mutations of a run started before this update refuse.** A
+  pre-update run has no registration, so advance/feedback/auto-advance/
+  model-override/restore/recover on it answer 403 `RUN_NOT_ADMITTED`. Cancel,
+  finish and open remain available — the operator's escape hatch stays open on
+  exactly the runs everything else refuses.
+- **A registered run whose guard file is missing fails closed** (typed
+  `RUN_GUARD_MISSING`) instead of silently loading as a new run with fresh
+  budgets. It still renders in the hub; it can no longer transition, save, or
+  launch. Deleting a guard file used to renew the run it belonged to.
+- **Guard files are no longer pruned.** The store used to keep only the 40
+  most recent run files, deleting older runs' budgets and recorded stops on
+  every write. Nothing deletes guard or admission files any more; they are
+  small JSON and stay until a real archiving model (A1b.2) exists.
+
+### Upgrade steps
+
+**In Build Studio** — rebuild and reinstall the bundle (hub + project-server
+both changed): `cd packages/hub && npx next build`, then
+`cd packages/desktop && node inject-resources.js`, then restart the Electron
+app and any running project-servers.
+
+**In each managed project** — finish or cancel any run that is active when you
+update; a run started by the old server cannot be advanced by the new one
+(cancel still works). Nothing else: the new state lives under
+`.build-studio/admission/`, which the server creates on first admission. If a
+project's `.gitignore` covers `.build-studio/` state files, add
+`.build-studio/admission/` and `.build-studio/run-guard/` alongside them.
+
+### Known issues
+
+- Four GET routes have pre-existing mutating side effects (`/api/backlog`,
+  `/api/deployment`, the ops-uitests run listings, and the support triage
+  status poll) and four one-shot agent ingresses (CI investigate, support
+  triage, demo setup, ops-uitests) are not yet behind admission. Both are
+  recorded in the plan's inventory; neither can start or advance a run.
+- The pre-existing intermittent failure in `qa-suite-run.test.js` ("a full run
+  is streamed to the log and parsed") still reproduces occasionally under
+  full-suite parallelism (documented since A1a); it passes reliably in
+  isolation and is untouched by this work.
+
+### Notes for forks
+
+- The admission seam in `lib/admission-seam.js` is mounted in `server.js`
+  before every API router. A fork adding a route that starts or advances a
+  run must add it to the seam's route sets — and should treat "only the
+  backstop stopped my request" as a primary-gate defect, which is what the
+  acceptance tests treat it as.
+- Do not reintroduce guard pruning, guard deletion, or a missing-file-means-
+  new-run fallback for registered runs; `a1b1-identity.test.js` pins all
+  three, and `a1b1-acceptance.test.js` pins the HTTP contract (A1–A13).
+
+---
+
 ## 2026-08-31 — The engine stops instead of walking past its own halts
 
 Fail-open paths in the workflow engine, closed together — first the ten in the

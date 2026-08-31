@@ -40,8 +40,14 @@ const crypto = require('crypto');
 
 const SCHEMA_VERSION = 1;
 const GUARD_DIR = 'run-guard';
-/** Keep the most recent N run files; older runs are pruned on write. */
-const MAX_RUN_FILES = 40;
+
+// There is deliberately NO file cap and NO pruning in this store any more.
+// The old MAX_RUN_FILES=40 mtime prune meant the 41st run silently erased the
+// oldest run's budgets and recorded stop — which, combined with load()'s
+// missing-file-means-new-run behaviour, RENEWED that run: exactly the rewind
+// this store exists to make impossible, applied by the store to itself.
+// Guard files are small JSON; they stay until a real archiving and lineage
+// model (A1b.2) can retire them without forgetting what they proved.
 
 class RunGuardConflictError extends Error {
   constructor(message, { runId, expected, actual } = {}) {
@@ -78,6 +84,39 @@ class RunGuardCorruptError extends Error {
   }
 }
 
+/**
+ * A run the admission registry says EXISTS, whose guard file is gone.
+ *
+ * This is not a new run and must never be treated as one. The guard held the
+ * run's spent budgets and any recorded stop; its absence for a registered run
+ * means that history was deleted or lost, and synthesising an empty document
+ * would renew every budget and erase any stop — a rewind by file deletion.
+ * Fails closed: typed error, no fresh budget, no transition, no restore, no
+ * worktree, no agent start, until a human has looked at what happened.
+ */
+class RunGuardMissingError extends Error {
+  constructor(message, { runId, file } = {}) {
+    super(message);
+    this.name = 'RunGuardMissingError';
+    this.code = 'RUN_GUARD_MISSING';
+    this.runId = runId;
+    this.file = file;
+  }
+}
+
+/**
+ * An attempt to register a run id that already has a guard file.
+ */
+class RunGuardExistsError extends Error {
+  constructor(message, { runId, file } = {}) {
+    super(message);
+    this.name = 'RunGuardExistsError';
+    this.code = 'RUN_GUARD_EXISTS';
+    this.runId = runId;
+    this.file = file;
+  }
+}
+
 /** Run ids come from workflow ids; keep them safe as filenames without collapsing distinct ids. */
 function safeRunId(runId) {
   const raw = String(runId || 'unknown-run');
@@ -106,9 +145,14 @@ function emptyDoc(runId) {
   };
 }
 
-function createRunGuard({ statePath }) {
+function createRunGuard({ statePath, isRegistered } = {}) {
   if (!statePath) throw new Error('createRunGuard: statePath is required');
   const dir = path.join(statePath, GUARD_DIR);
+  // `isRegistered(runId)` asks the admission registry whether this run id was
+  // explicitly registered. Without it (older callers, unit tests of the store
+  // itself) a missing file keeps the pre-registration meaning: an in-memory
+  // empty document for a run nothing has ever recorded against.
+  const registeredCheck = typeof isRegistered === 'function' ? isRegistered : null;
 
   function fileFor(runId) {
     return path.join(dir, `${safeRunId(runId)}.json`);
@@ -116,8 +160,19 @@ function createRunGuard({ statePath }) {
 
   function readDoc(runId) {
     const file = fileFor(runId);
-    // Absence is a NEW run — no prior guard state, nothing to distrust.
-    if (!fs.existsSync(file)) return emptyDoc(runId);
+    if (!fs.existsSync(file)) {
+      // The distinction the whole lifecycle turns on: a run the registry KNOWS
+      // with no guard file is deleted history, not a new run. Fail closed.
+      if (registeredCheck && registeredCheck(runId)) {
+        throw new RunGuardMissingError(
+          `run ${runId} is registered but its guard file is missing — its budgets and any recorded stop are unaccounted for`,
+          { runId: String(runId), file },
+        );
+      }
+      // An UNREGISTERED id with no file: nothing was ever recorded. The empty
+      // document is in-memory only; nothing is written here.
+      return emptyDoc(runId);
+    }
     let doc;
     try {
       doc = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -155,16 +210,40 @@ function createRunGuard({ statePath }) {
     return { ...emptyDoc(runId), ...doc, runId: String(runId) };
   }
 
-  function prune() {
-    try {
-      const files = fs.readdirSync(dir)
-        .filter((f) => f.endsWith('.json'))
-        .map((f) => ({ name: f, mtime: fs.statSync(path.join(dir, f)).mtimeMs }))
-        .sort((a, b) => a.mtime - b.mtime);
-      for (const old of files.slice(0, Math.max(0, files.length - MAX_RUN_FILES))) {
-        try { fs.unlinkSync(path.join(dir, old.name)); } catch (_) {}
-      }
-    } catch (_) {}
+  /**
+   * Explicitly create the guard for a NEW run, with its identity.
+   *
+   * This is the only way a guard file comes into existence for a run being
+   * registered — plain load() never creates one, and save() below still
+   * refuses to move a revision it did not read. `identity` carries the
+   * lineage metadata a root run starts with (lineageId = its own id,
+   * predecessorRunId = null, successorOrdinal = 0) plus what admission
+   * verified: the request digest, the admitted head, the admitted repo.
+   *
+   * Refuses (RunGuardExistsError) when a file is already there: a register
+   * that overwrote an existing guard would be the budget rewind again, with
+   * a nicer name.
+   */
+  function register(runId, { identity } = {}) {
+    if (!runId) throw new Error('runGuard.register: runId is required');
+    const file = fileFor(runId);
+    if (fs.existsSync(file)) {
+      throw new RunGuardExistsError(
+        `run ${runId} already has a guard file — a run is registered once`,
+        { runId: String(runId), file },
+      );
+    }
+    fs.mkdirSync(dir, { recursive: true });
+    const doc = {
+      ...emptyDoc(runId),
+      ...(identity ? { identity } : {}),
+      revision: 1,
+      updatedAt: new Date().toISOString(),
+    };
+    const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(doc, null, 2));
+    fs.renameSync(tmp, file);
+    return doc;
   }
 
   /**
@@ -189,7 +268,6 @@ function createRunGuard({ statePath }) {
     const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
     fs.renameSync(tmp, file);
-    prune();
     return next;
   }
 
@@ -245,15 +323,25 @@ function createRunGuard({ statePath }) {
 
   return {
     fileFor,
+    register,
     load: readDoc,
     save,
     mutate,
     count,
     bump,
     exceeded,
-    // Intentionally absent: reset / clearCounters. A budget spent inside a run
-    // is spent. Renewal is a new run.
+    // Intentionally absent: reset / clearCounters / prune / delete. A budget
+    // spent inside a run is spent, and a guard written stays written. Renewal
+    // is a new run; retirement is A1b.2's archiving model.
   };
 }
 
-module.exports = { createRunGuard, RunGuardConflictError, RunGuardCorruptError, SCHEMA_VERSION, GUARD_DIR };
+module.exports = {
+  createRunGuard,
+  RunGuardConflictError,
+  RunGuardCorruptError,
+  RunGuardMissingError,
+  RunGuardExistsError,
+  SCHEMA_VERSION,
+  GUARD_DIR,
+};

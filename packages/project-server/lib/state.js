@@ -2,7 +2,8 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const { createRunGuard, RunGuardCorruptError } = require('./run-guard');
+const { createRunGuard, RunGuardCorruptError, RunGuardMissingError } = require('./run-guard');
+const { createAdmissionRegistry } = require('./admission-registry');
 const {
   isTechnicalStop,
   applyToWorkflow,
@@ -101,7 +102,12 @@ const MAX_SNAPSHOTS = 10;
 function attachStateAuthority(state, config) {
   if (state.runGuard) return state;
   const statePath = config.statePath || path.join(config.projectRoot || process.cwd(), '.build-studio');
-  const runGuard = createRunGuard({ statePath });
+  // The guard consults the admission registry so a REGISTERED run whose guard
+  // file is missing fails closed (RUN_GUARD_MISSING) instead of loading as a
+  // brand-new run with fresh budgets. An unregistered (pre-admission) run id
+  // with no file keeps the old meaning: an in-memory empty document.
+  const admissionRegistry = createAdmissionRegistry({ statePath });
+  const runGuard = createRunGuard({ statePath, isRegistered: admissionRegistry.isRegistered });
 
   /** Stops that could not reach the guard yet, keyed by run id. */
   const pendingStops = new Map();
@@ -144,9 +150,12 @@ function attachStateAuthority(state, config) {
       const stop = authoritativeStop(wf.id);
       if (stop) applyToWorkflow(wf, stop);
     } catch (e) {
-      if (!(e instanceof RunGuardCorruptError)) throw e;
+      if (!(e instanceof RunGuardCorruptError) && !(e instanceof RunGuardMissingError)) throw e;
       // Reads may still render; transitions may not. The advance route and the
       // auto-advance tick refuse on this marker, and every save fails closed.
+      // RUN_GUARD_MISSING (a registered run whose guard file is gone) is the
+      // same posture as corruption: the run's terminal truth is unknowable,
+      // so it renders but never moves.
       wf.guardUnverifiable = { code: e.code, runId: String(wf.id), error: e.message };
     }
     return wf;

@@ -468,9 +468,18 @@ function collectMissingAcArtifacts(acFb, { projectRoot, strict = false, exists }
   return missing;
 }
 
-function createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast) {
+function createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast, deps = {}) {
   const router = express.Router();
   const { docsPath, projectRoot, worktreesPath, logsPath } = config;
+
+  /**
+   * The admission service (A1b.1). The PRIMARY gate is the Express seam in
+   * server.js, mounted before this router; what lives here is the stored-
+   * context lookup the launch funnel and the worktree/tmux backstops verify
+   * against. Constructed from config when the caller (a test mounting this
+   * router directly) does not inject one — the backstops hold either way.
+   */
+  const admission = deps.admission || require('../admission').createAdmission(config);
 
   /**
    * The state authority seam — the run guard enforced at the storage boundary.
@@ -1884,6 +1893,14 @@ ${EFFICIENCY_INSTRUCTIONS}`,
   }
 
   function launchWorkflowAgents(wf, agents, { useWorktrees = false, allowAll = true, cwd = projectRoot, stepKey = null } = {}) {
+    // A1b.1 backstop — BEFORE any side effect of a launch (the mkdirs below
+    // included): the run this launch serves must hold a verified, stored,
+    // server-generated admission. A run that was never admitted, or whose
+    // guard file has gone missing, refuses here with a typed error rather
+    // than starting a process. This is defence in depth: the Express seam is
+    // the primary gate, and a request that only this line stops is a
+    // primary-gate defect — but a forgotten wiring must not spawn agents.
+    const admissionCtx = admission.assertRunAdmitted(wf.id, 'launchWorkflowAgents');
     // Needed before the CLI probe below, which now checks the one CLI this
     // step resolves to rather than one per agent role.
     const resolvedStep = stepKey || wf.currentStep;
@@ -2024,7 +2041,7 @@ ${EFFICIENCY_INSTRUCTIONS}`,
 
       if (useWorktrees && branch) {
         try {
-          agentCwd = gitOps.createWorktree(branch);
+          agentCwd = gitOps.createWorktree(branch, admissionCtx);
         } catch (e) {
           agent.status = 'error';
           agent.error = `Worktree: ${e.message}`;
@@ -2270,7 +2287,7 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
         // finished agent's window can end the session (and take the tmux server
         // with it) part-way through a launch that already checked the session
         // was alive.
-        const target = tmuxOps.ensureWindow(wf.sessionName, windowName, projectRoot);
+        const target = tmuxOps.ensureWindow(wf.sessionName, windowName, projectRoot, admissionCtx);
         tmuxOps.sendKeys(target, `cd '${agentCwd}' && ${keyUnset}bash ${scriptName}`, projectRoot);
         tmuxOps.pipePaneToLog(target, logFile, projectRoot);
       } catch (e) {
@@ -2461,6 +2478,9 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
   function startDevServers(wf, worktreePath) {
     const devCmds = config.dev_commands || [];
     if (devCmds.length === 0) return;
+    // A1b.1 backstop — dev-server windows are long-lived processes started on
+    // the run's behalf; same rule as agent windows.
+    const startDevServersCtx = admission.assertRunAdmitted(wf.id, 'startDevServers');
 
     console.log(`[workflow] Starting ${devCmds.length} dev server(s) from ${worktreePath} (port offset: +${WORKTREE_PORT_OFFSET})`);
     let sessionExists = tmuxOps.hasSession(wf.sessionName);
@@ -2572,7 +2592,7 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
       }
 
       try {
-        const devTarget = tmuxOps.ensureWindow(wf.sessionName, windowName, projectRoot);
+        const devTarget = tmuxOps.ensureWindow(wf.sessionName, windowName, projectRoot, startDevServersCtx);
         sessionExists = true;
         tmuxOps.sendKeys(devTarget, `cd '${cwd}' && ${cmd}`, projectRoot);
       } catch (e) {
@@ -2590,17 +2610,24 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
    * In sequential execution, code is on the main branch — no review worktree exists yet.
    * Falls back to projectRoot if the review branch doesn't exist.
    */
-  function resolveReviewCwd(prdId, reviewBranch) {
+  function resolveReviewCwd(prdId, reviewBranch, admissionCtx) {
     try {
       const { execFileSync } = require('child_process');
       execFileSync('git', ['rev-parse', '--verify', reviewBranch], { cwd: projectRoot, stdio: 'ignore' });
-      return ensureReviewWorktree(prdId, reviewBranch);
+      return ensureReviewWorktree(prdId, reviewBranch, admissionCtx);
     } catch (_) {
       return projectRoot;
     }
   }
 
-  function ensureReviewWorktree(prdId, reviewBranch) {
+  function ensureReviewWorktree(prdId, reviewBranch, admissionCtx) {
+    // A1b.1 backstop — this path shells `git worktree add` directly, bypassing
+    // gitOps.createWorktree, so it carries the same refusal itself.
+    if (!require('../admission').isAdmissionContext(admissionCtx)) {
+      const err = new Error(`ensureReviewWorktree(${prdId}): refused — no verified admission context for this run (backstop; the primary admission seam should have refused earlier)`);
+      err.code = 'ADMISSION_BACKSTOP';
+      throw err;
+    }
     const wtName = `review-${prdId}`;
     const wtPath = path.join(worktreesPath, wtName);
     if (!fs.existsSync(wtPath)) {
@@ -2873,7 +2900,7 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
           }
           gitOps.createBranchFromMain(reviewBranch);
         }
-        reviewWtPath = resolveReviewCwd(prdId, reviewBranch);
+        reviewWtPath = resolveReviewCwd(prdId, reviewBranch, admission.assertRunAdmitted(wf.id, 'mergeDevBranches'));
         devBranches = [...new Set([
           ...(config.roles.execution || []).map(r => `${r.branch_prefix}-${prdId}`),
           ...(wf.fixBranches || []),
@@ -3609,7 +3636,21 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     }
 
     const wf = {
-      id: `${type}-${timestamp}`,
+      // The run identity was registered by the admission seam BEFORE this
+      // handler ran (A1b.1); the workflow must carry exactly that id, or the
+      // stored-context checks on every later mutation and launch would be
+      // looking at a different run. The legacy id shape survives only for a
+      // router mounted without the seam (unit tests) — such a run is
+      // unregistered and every launch backstop will refuse it.
+      id: req.admission ? req.admission.runId : `${type}-${timestamp}`,
+      ...(req.admission ? {
+        admission: {
+          runId: req.admission.runId,
+          requestDigest: req.admission.verdict.requestDigest,
+          admittedAt: req.admission.verdict.admittedAt,
+          admittedHead: req.admission.verdict.head,
+        },
+      } : {}),
       type, input, prdPath, itemId, currentStep, steps,
       // Bugfix synthesizes its single-task plan at start (no planning step). Left
       // undefined for other types, which build taskPlan during their planning step.
@@ -3650,7 +3691,10 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     // its specs carry — including AC-5's owner decision, which the run then
     // headed straight for (2026-08-09).
     //
-    res.json({ workflow: wf });
+    // The server-generated GateVerdict rides the start response so the caller
+    // can SEE what was admitted — it is informational there; the authority
+    // stays in the admission registry, keyed by the run id.
+    res.json({ workflow: wf, ...(req.admission ? { gateVerdict: req.admission.verdict } : {}) });
   });
 
   router.post('/workflow/feedback', (req, res) => {
@@ -9813,6 +9857,11 @@ ${FIX_EXECUTION_EFFICIENCY_INSTRUCTIONS}${STRUCTURED_FEEDBACK_INSTRUCTIONS}`,
     }
     if (err instanceof TerminalRunError) {
       return res.status(409).json(refusalPayload(err.technicalStop));
+    }
+    // A refused admission (a launch reached the backstop for a run with no
+    // stored admission, or a missing guard) is a typed refusal, not a crash.
+    if (err && (err.name === 'AdmissionRefusedError' || err.code === 'ADMISSION_BACKSTOP' || err.code === 'RUN_GUARD_MISSING')) {
+      return res.status(403).json({ code: err.code || 'ADMISSION_REFUSED', error: err.message, admission: 'refused' });
     }
     next(err);
   });

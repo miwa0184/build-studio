@@ -2,6 +2,7 @@
 
 import { useEffect, useLayoutEffect, useState, useCallback, useMemo, useRef } from 'react'
 import { useProjectApi } from '@/lib/use-project-api'
+import { buildRunRequest } from '@/lib/run-request'
 import {
   DndContext, DragOverlay, PointerSensor, useSensor, useSensors, useDroppable,
   closestCorners, type DragStartEvent, type DragEndEvent,
@@ -143,7 +144,11 @@ export function BacklogTab({
     setStarting(id)
     setStartError(null)
     try {
-      const res = await api.post('/workflow/start', { type: run, input: id })
+      // A1b.1: a start is admitted server-side against a RunRequest. The hub
+      // only assembles the envelope; the server re-verifies every field.
+      const { runRequest, error: rrError } = await buildRunRequest(api.get, { type: run, input: id })
+      if (!runRequest) { setStartError({ id, message: rrError || 'Could not build the run request' }); return }
+      const res = await api.post('/workflow/start', { type: run, input: id, runRequest })
       if (res && res.error) { setStartError({ id, message: res.error }); return }
       // Fixed per run type, per the owner's standing preference: reviews run
       // strict (any finding blocks), execution/bugfix skip the demo gate so they

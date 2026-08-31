@@ -77,6 +77,18 @@ function createRunRouter(config, state, gitOps, tmuxOps, broadcast, parseExecuti
   router.get('/worktrees', (req, res) => res.json({ worktrees: gitOps.listWorktrees() }));
 
   router.post('/launch', (req, res) => {
+    // A1b.1 — this route starts worktrees and agent processes, so it is a
+    // start ingress: the admission seam verifies the RunRequest and registers
+    // the run BEFORE this handler runs, and hands the context in on
+    // req.admission. No context (a mount without the seam) refuses before the
+    // first side effect — the mkdirs below.
+    if (!req.admission) {
+      return res.status(403).json({
+        error: 'launch refused — this route starts agent work and requires an admitted run (send a runRequest; see GET /api/admission/context)',
+        code: 'ADMISSION_REQUEST_MISSING',
+        admission: 'refused',
+      });
+    }
     const activeWorkflow = state.loadWorkflow();
     if (activeWorkflow && activeWorkflow.currentStep !== 'completed') {
       return res.status(409).json({ error: 'A workflow is active — cancel it before using the Execution tab' });
@@ -100,7 +112,7 @@ function createRunRouter(config, state, gitOps, tmuxOps, broadcast, parseExecuti
 
       let wtPath;
       try {
-        wtPath = gitOps.createWorktree(branch);
+        wtPath = gitOps.createWorktree(branch, req.admission);
       } catch (e) {
         workers.push({ branch, role: task.role, error: `Worktree: ${e.message}`, status: 'error' });
         continue;
@@ -130,7 +142,7 @@ function createRunRouter(config, state, gitOps, tmuxOps, broadcast, parseExecuti
       try {
         // ensureWindow also covers the session vanishing mid-launch (a reaped
         // last window takes the tmux server with it).
-        const target = tmuxOps.ensureWindow(sessionName, windowName, projectRoot);
+        const target = tmuxOps.ensureWindow(sessionName, windowName, projectRoot, req.admission);
         sessionCreated = true;
         tmuxOps.sendKeys(target, `cd '${wtPath}' && ${keyUnset}bash start.sh`, projectRoot);
         tmuxOps.pipePaneToLog(target, logFile, projectRoot);
@@ -145,7 +157,9 @@ function createRunRouter(config, state, gitOps, tmuxOps, broadcast, parseExecuti
     const plan = parseExecutionPlan();
     const titleLine = (plan.content || '').split('\n').find(l => l.startsWith('#')) || '';
     const run = {
-      id: new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19),
+      // The admitted, registered run identity — the id every later mutation's
+      // stored-context check is keyed by.
+      id: req.admission.runId,
       sessionName,
       title: titleLine.replace(/^#+\s*/, '') || 'Agent Run',
       state: 'executing',
