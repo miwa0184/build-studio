@@ -37,6 +37,22 @@ const DEFAULT_MAX_TASKS_PER_PLAN = 25;
 const DEFAULT_MAX_TASK_FIX_CYCLES = 3;
 /** Mirrors the existing AUTO_ADVANCE_MAX_REJECTS ceiling, now per run and on disk. */
 const DEFAULT_MAX_AUTO_ADVANCE_REFUSALS = 3;
+/**
+ * The run-wide refusal ceiling, which is a different question from the per-step
+ * one and must not share its number.
+ *
+ * Three refusals on ONE step means that step is stuck — pause it. Three
+ * refusals across a whole run means almost nothing: a long execution sequence
+ * has a dozen gated steps, and a run that pauses briefly at three of them is
+ * ordinary, not runaway. Sharing the ceiling made the third refusal anywhere in
+ * a run terminal, which turned a recoverable pause into a dead run in 24
+ * seconds of ticks.
+ *
+ * The run-wide budget exists only to stop a run burning refusals forever, so it
+ * is set well above what a healthy run spends: every step may pause several
+ * times before the run itself is called stuck.
+ */
+const AUTO_ADVANCE_TOTAL_MULTIPLIER = 5;
 
 const COUNTERS = {
   REVIEW_ROUNDS: 'review_rounds',
@@ -59,13 +75,16 @@ const COUNTERS = {
 function resolveBudgets(config) {
   const c = config || {};
   const maxTasksPerPlan = Number(c.max_tasks_per_plan) || DEFAULT_MAX_TASKS_PER_PLAN;
+  const perStepRefusals = Number(c.max_auto_advance_refusals) || DEFAULT_MAX_AUTO_ADVANCE_REFUSALS;
   return {
     maxReviewRounds: Number(c.max_review_rounds) || DEFAULT_MAX_REVIEW_ROUNDS,
     maxFixRounds: Number(c.max_fix_rounds) || Number(c.max_review_rounds) || DEFAULT_MAX_REVIEW_ROUNDS,
     maxTaskFixCycles: Number(c.max_task_fix_cycles) || DEFAULT_MAX_TASK_FIX_CYCLES,
     maxTasksPerPlan,
     maxFixPlanTasks: Number(c.max_fix_plan_tasks) || maxTasksPerPlan,
-    maxAutoAdvanceRefusals: Number(c.max_auto_advance_refusals) || DEFAULT_MAX_AUTO_ADVANCE_REFUSALS,
+    maxAutoAdvanceRefusals: perStepRefusals,
+    maxAutoAdvanceRefusalsTotal:
+      Number(c.max_auto_advance_refusals_total) || perStepRefusals * AUTO_ADVANCE_TOTAL_MULTIPLIER,
   };
 }
 
@@ -168,13 +187,26 @@ function checkFixPlanCeiling(tasks, budgets, ctx = {}) {
  */
 function noteAutoAdvanceRefusal(guard, runId, stepKey, budgets, errMsg) {
   const perStepKey = `${COUNTERS.AUTO_ADVANCE_REFUSALS}:${stepKey}`;
+  const totalMax = budgets.maxAutoAdvanceRefusalsTotal;
   const perStep = guard.bump(runId, perStepKey, budgets.maxAutoAdvanceRefusals);
-  const total = guard.bump(runId, COUNTERS.AUTO_ADVANCE_REFUSALS, budgets.maxAutoAdvanceRefusals);
+  const total = guard.bump(runId, COUNTERS.AUTO_ADVANCE_REFUSALS, totalMax);
 
+  // Pausing a step is not the same event as giving up on the run, so the two
+  // read different counters against different ceilings. `paused` fires when the
+  // step has used its allowance; `exhausted` only when the RUN has used a much
+  // larger one. `exceeded` carries the `> max` semantics stated at the top of
+  // this file — spending the Nth unit is within budget.
   const paused = perStep.value >= budgets.maxAutoAdvanceRefusals;
-  const exhausted = total.value >= budgets.maxAutoAdvanceRefusals;
+  const exhausted = total.exceeded;
 
-  const out = { paused, exhausted, stepCount: perStep.value, totalCount: total.value, max: budgets.maxAutoAdvanceRefusals };
+  const out = {
+    paused,
+    exhausted,
+    stepCount: perStep.value,
+    totalCount: total.value,
+    max: budgets.maxAutoAdvanceRefusals,
+    totalMax,
+  };
   if (!exhausted) return out;
 
   out.technicalStop = createTechnicalStop({
@@ -182,7 +214,7 @@ function noteAutoAdvanceRefusal(guard, runId, stepKey, budgets, errMsg) {
     runId,
     step: stepKey,
     evidence: [
-      `auto_advance_refusals=${total.value} of ${budgets.maxAutoAdvanceRefusals} allowed for this run`,
+      `auto_advance_refusals=${total.value} of ${totalMax} allowed for this run`,
       `last refusal on ${stepKey}: ${errMsg || 'no message'}`,
     ],
     recoveryHint:

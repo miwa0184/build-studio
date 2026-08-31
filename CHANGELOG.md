@@ -70,6 +70,19 @@ wrong. Design record: `docs/plans/a1a-state-correctness-and-transition-authority
   findings still open at the cap it fell back to "approve unless blocking". It
   now stops with the remaining findings as the outcome.
 
+- **Skipping a blocked task marks it skipped, not done.** The operator rescue for
+  a stuck task (`skip_blocked`) recorded it as completed, which made an
+  abandoned task indistinguishable from a finished one. It is now `skipped`,
+  with its acceptance coverage left unmet — the run still moves on, because you
+  decided it should, but nothing downstream counts the task as verified.
+
+- **Tasks nobody verified block the run from claiming their criteria are met.**
+  A skipped or force-completed task no longer auto-advances `ac_verification`,
+  `merge_for_review`, `merge_to_main`, `demo_review` or `device_testing`. You can
+  still advance those steps explicitly; only the automatic path is refused, and
+  the reason names the tasks. The task list shows them in orange with an
+  "N unverified" count rather than counting them as complete.
+
 - **Fix plans have a task ceiling.** Implementation plans have had one for a long
   time; fix plans were checked only for being *empty*, so any other length was
   accepted. The ceiling follows `max_tasks_per_plan` unless you set
@@ -82,6 +95,25 @@ wrong. Design record: `docs/plans/a1a-state-correctness-and-transition-authority
   Problems are now tracked as independent, deduplicated incidents. The banner
   still shows the most urgent one; dismissing it reveals the next rather than
   clearing everything.
+
+### Fixed
+
+- **A stopped run can be recovered instead of only cancelled.** A TECHNICAL_STOP
+  stays terminal for anything automatic, but `Relaunch task` and `Skip task` now
+  work from it — the routes its own recovery hint points at. The stop is kept on
+  the run as evidence after it is cleared. `Relaunch step` is refused on a
+  stopped run rather than resetting the step and erasing the stop record.
+
+- **Three gate refusals no longer end a run.** The per-step and run-wide refusal
+  ceilings shared one number, so the third refusal anywhere in a run was fatal —
+  in about 24 seconds of ticks. Pausing a step (3 refusals on that step) and
+  giving up on a run (15 across it) are separate budgets now; set
+  `max_auto_advance_refusals_total` to change the second.
+
+- **"Another round" at the round cap is refused, not fatal.** It correctly stops
+  granting rounds past the cap, but it was also ending the run — which deleted
+  the other exit that step exists to offer ("move on", which stops the loop
+  instead of extending it). The action is now declined with both options intact.
 
 ### Added
 
@@ -97,6 +129,10 @@ wrong. Design record: `docs/plans/a1a-state-correctness-and-transition-authority
 
 - **`max_fix_plan_tasks`** in `.build-studio/config.yaml` — ceiling on tasks in
   one fix plan. Defaults to `max_tasks_per_plan`.
+
+- **`max_auto_advance_refusals_total`** — how many times gates may refuse to
+  auto-advance across a whole run before it stops. Defaults to five times
+  `max_auto_advance_refusals` (so 15).
 
 ### Upgrade steps
 

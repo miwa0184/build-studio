@@ -58,7 +58,7 @@ test('the cap step offers both ways out, and defaults to neither', () => {
   const region = reviewRegion();
   const i = region.indexOf("wf.currentStep === 'review_cap_reached'");
   assert.ok(i > 0, 'review cap handler not found');
-  const handler = region.slice(i, i + 1600);
+  const handler = region.slice(i, i + 2600);
   assert.match(handler, /action === 'another_round'/);
   assert.match(handler, /wf\.currentStep = 'reviewing'/);
   assert.match(handler, /wf\.currentStep = 'companion_specs'/);
@@ -66,6 +66,10 @@ test('the cap step offers both ways out, and defaults to neither', () => {
   assert.match(handler, /res\.status\(400\)/);
   // And the run cannot finish from here.
   assert.doesNotMatch(handler, /wf\.currentStep = 'completed'/);
+  // A spent round budget refuses "another round" — but must NOT stop the run.
+  // Applying a terminal stop here would delete the "move on" exit this very
+  // test exists to protect, turning an owner-decidable state into a dead run.
+  assert.doesNotMatch(handler, /applyTechnicalStop/);
 });
 
 test('a clean in-round approval moves to companion_specs, not straight to completed', () => {

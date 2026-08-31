@@ -109,9 +109,19 @@ test('the review cap has one source, so the loop and the UI cannot disagree', ()
   // number: the direct `config.max_review_rounds || DEFAULT_MAX_REVIEW_ROUNDS`,
   // or `budgets()` — run-budgets.js, which resolves the run's budgets from the
   // same config key and is where the persistent round counters are checked.
-  const direct = (src.match(/config\.max_review_rounds \|\| DEFAULT_MAX_REVIEW_ROUNDS/g) || []).length;
-  const viaBudgets = (src.match(/budgets\(\)/g) || []).length;
-  assert.ok(direct + viaBudgets >= 3, `review-cap reads: ${direct} direct + ${viaBudgets} via budgets()`);
+  // The cap is now read in two places — directly here, and through
+  // run-budgets.js, which owns the persistent round counters. Counting call
+  // sites stopped being the useful assertion once the number moved; what
+  // matters is that NEITHER file spells its own fallback, so they cannot drift.
+  // A count of `budgets()` calls would not do: six unrelated budgets share that
+  // accessor, so such a count passes with every cap read deleted.
+  const budgetsSrc = fs.readFileSync(path.join(__dirname, 'run-budgets.js'), 'utf8');
+  const budgetsHardcoded = budgetsSrc.match(/max_review_rounds\)? \|\| \d+/g) || [];
+  assert.deepEqual(budgetsHardcoded, [], `hardcoded review-cap fallbacks in run-budgets.js: ${budgetsHardcoded.join(', ')}`);
+  assert.ok(
+    (src.match(/config\.max_review_rounds \|\| DEFAULT_MAX_REVIEW_ROUNDS/g) || []).length >= 1,
+    'workflow.js must still resolve the cap from the shared default',
+  );
 
   // …and run-budgets.js must agree with config.js about what that number is,
   // or the loop and the UI can disagree again through the new path.

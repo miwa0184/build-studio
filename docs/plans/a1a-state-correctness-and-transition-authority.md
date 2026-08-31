@@ -129,6 +129,42 @@ Also not done: rebuilding the workflow state system. The separate guard store is
 enough for what A1a has to guarantee, and a rewrite would have made the
 regression surface far larger than the defects being closed.
 
+## What the independent review caught
+
+A separate read-only review of the frozen head returned REPAIR_REQUIRED, and it
+was right on every point checked. The findings clustered, and the cluster is
+worth recording because it is the failure mode this kind of work invites.
+
+**Fail-closed was applied too widely.** Three of the new paths were terminal
+where they should only have refused. The per-step and run-wide auto-advance
+ceilings shared a number, so the third refusal anywhere in a run — an ordinary
+thing on a long sequence — ended it in 24 seconds of ticks. `another_round` at
+the cap correctly declined to grant a round but *also* stopped the run, which
+deleted the "move on" exit that `review_cap_reached` exists to offer: clicking a
+button the UI still rendered turned an owner-decidable state into a dead one.
+And a TECHNICAL_STOP had no recovery route at all, while the hub still rendered
+`Relaunch step` on it — an action that would have reset the step and erased the
+stop's own evidence.
+
+The correction is a distinction the first cut missed: **refusing an action is
+not the same as stopping a run.** A refused operator action must leave every
+other option standing. Only the engine's own autonomy fails closed.
+
+**Three invariants were written but never read.** Acceptance gaps were recorded
+on the task, in the guard, and nowhere consulted. Per-task fix cycles were
+counted in the guard while the workflow object stayed the authority — the exact
+shape the guard exists to remove. And `strictReviewOutcome`'s technical-stop
+branch was unreachable, because the guard counter lags `wf.round` by one for the
+life of a run, so the fail-open closed by falling through to a different halt
+rather than by the mechanism claimed for it. Unit tests could not see any of
+this: each helper was correct in isolation.
+
+**One operator route still laundered a blocked task.** `skip_blocked` wrote
+`done` — the same laundering that was fixed in kill-and-skip, in a sibling
+handler the diff never touched.
+
+Each is now closed with a regression test that fails on the first cut.
+
 ## Known limits
 
 - The per-step refusal count clears when that step genuinely advances; only the

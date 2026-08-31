@@ -115,13 +115,42 @@ test('the task-plan ceiling is a technical stop too', () => {
   assert.equal(over.technicalStop.reasonCode, REASON_CODES.TASK_PLAN_CEILING);
 });
 
+test('pausing a step is not the same event as giving up on the run', () => {
+  // These shared a ceiling, so the third refusal ANYWHERE in a run was terminal.
+  // A long execution sequence has a dozen gated steps; a run that pauses at
+  // three of them is ordinary, and the tick fires every 8 seconds — so an
+  // ordinary run died in 24 seconds. The per-step ceiling pauses a step; only a
+  // far larger run-wide one gives up on the run.
+  const b = resolveBudgets({});
+  assert.ok(
+    b.maxAutoAdvanceRefusalsTotal > b.maxAutoAdvanceRefusals,
+    `run-wide ceiling ${b.maxAutoAdvanceRefusalsTotal} must exceed the per-step ${b.maxAutoAdvanceRefusals}`,
+  );
+
+  const g = createRunGuard({ statePath: fs.mkdtempSync(path.join(os.tmpdir(), 'bs-budgets-pause-')) });
+  let last;
+  for (let i = 0; i < b.maxAutoAdvanceRefusals; i++) {
+    last = noteAutoAdvanceRefusal(g, 'run-a', 'qa_validation', b, 'gate said no');
+  }
+  assert.equal(last.paused, true, 'the step has used its allowance');
+  assert.equal(last.exhausted, false, 'the RUN has not — this must not be terminal');
+  assert.equal(last.technicalStop, undefined);
+
+  // Another step gets its own allowance, and pausing it is still not terminal.
+  const other = noteAutoAdvanceRefusal(g, 'run-a', 'code_review', b, 'gate said no');
+  assert.equal(other.stepCount, 1);
+  assert.equal(other.exhausted, false);
+});
+
 test('F4 — auto-advance refusals are counted on disk and are not renewed by re-enabling', () => {
   const statePath = fs.mkdtempSync(path.join(os.tmpdir(), 'bs-budgets-aa-'));
   const b = resolveBudgets({});
   const g1 = createRunGuard({ statePath });
   let last;
-  for (let i = 0; i < b.maxAutoAdvanceRefusals; i++) {
-    last = noteAutoAdvanceRefusal(g1, 'run-a', 'qa_validation', b, 'gate said no');
+  // Spend the RUN-wide budget across many steps. `> max`, per the semantics
+  // stated at the top of run-budgets.js: spending the Nth is within budget.
+  for (let i = 0; i <= b.maxAutoAdvanceRefusalsTotal; i++) {
+    last = noteAutoAdvanceRefusal(g1, 'run-a', `step_${i}`, b, 'gate said no');
   }
   assert.equal(last.exhausted, true);
   assert.equal(last.technicalStop.reasonCode, REASON_CODES.AUTO_ADVANCE_REFUSAL_BUDGET_EXHAUSTED);

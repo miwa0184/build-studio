@@ -99,7 +99,9 @@ interface TaskPlan {
 }
 
 interface TaskState {
-  status: 'pending' | 'running' | 'done' | 'error'
+  /** `blocked` is terminal (the run stops); `skipped` and `force_completed`
+   *  finish the task WITHOUT a verdict — see blocked-tasks.js. */
+  status: 'pending' | 'running' | 'reviewing' | 'fixing' | 'done' | 'error' | 'blocked' | 'skipped' | 'force_completed'
   startedAt: string | null
   completedAt: string | null
   tokenUsage: { inputTokens: number; outputTokens: number; costUSD: number; cacheRead: number; cacheCreate: number } | null
@@ -1777,7 +1779,13 @@ function TaskBoard({ wf, onSkipBlocked, onViewLog }: { wf: Workflow; onSkipBlock
   const tasks = wf.taskPlan!.tasks
   const { taskStates } = tex
   const totalTasks = tasks.length
+  // Only verified work counts as complete. A skipped or force-completed task is
+  // finished but uncertified, and counting it here reported coverage the run
+  // does not have.
   const doneTasks = Object.values(taskStates).filter(ts => ts.status === 'done').length
+  const unverifiedTasks = Object.values(taskStates).filter(
+    ts => ts.status === 'skipped' || ts.status === 'force_completed',
+  ).length
   const totalTokens = Object.values(taskStates)
     .reduce((sum, ts) => sum + (ts.tokenUsage ? ts.tokenUsage.inputTokens + ts.tokenUsage.outputTokens + ts.tokenUsage.cacheRead : 0), 0)
   const fmtTok = (n: number) => n >= 1_000_000 ? `${(n/1_000_000).toFixed(1)}M` : n >= 1000 ? `${Math.round(n/1000)}k` : String(n)
@@ -1788,6 +1796,11 @@ function TaskBoard({ wf, onSkipBlocked, onViewLog }: { wf: Workflow; onSkipBlock
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
         <span style={{ fontSize: 13, fontWeight: 600 }}>
           {doneTasks} / {totalTasks} tasks complete
+          {unverifiedTasks > 0 && (
+            <span style={{ color: 'var(--orange)' }}>
+              {' '}· {unverifiedTasks} unverified
+            </span>
+          )}
         </span>
         {totalTokens > 0 && (
           <span style={{ fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--text-dim)' }}>
@@ -1806,13 +1819,20 @@ function TaskBoard({ wf, onSkipBlocked, onViewLog }: { wf: Workflow; onSkipBlock
         {tasks.map((task, i) => {
           const ts = taskStates[String(i)]
           if (!ts) return null
-          const isRunning = ts.status === 'running'
+          const isRunning = ts.status === 'running' || ts.status === 'reviewing' || ts.status === 'fixing'
           const isDone = ts.status === 'done'
-          const isError = ts.status === 'error'
+          const isError = ts.status === 'error' || ts.status === 'blocked'
+          // Finished, but nobody verified it. Deliberately not green: these
+          // rendered as done before, which is the whole thing they are not.
+          const isUnverified = ts.status === 'skipped' || ts.status === 'force_completed'
           const isPending = ts.status === 'pending'
 
           // Status color
-          const statusColor = isDone ? 'var(--green)' : isRunning ? 'var(--blue)' : isError ? 'var(--red)' : 'var(--border)'
+          const statusColor = isDone ? 'var(--green)'
+            : isRunning ? 'var(--blue)'
+            : isError ? 'var(--red)'
+            : isUnverified ? 'var(--orange)'
+            : 'var(--border)'
 
           // Duration
           let durationStr: string | null = null

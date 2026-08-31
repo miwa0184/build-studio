@@ -43,6 +43,17 @@ const HUMAN_GATES = {
   demo_review: 'The owner watches the demo and approves it.',
 };
 
+/**
+ * Steps at which an unverified task stops being a note and becomes a lie.
+ *
+ * Before these, a skipped task is simply a task the operator dropped. At these,
+ * the run is about to assert that its acceptance criteria are met, or to merge
+ * on the strength of that assertion.
+ */
+const ACCEPTANCE_SENSITIVE_STEPS = new Set([
+  'ac_verification', 'merge_for_review', 'merge_to_main', 'demo_review', 'device_testing',
+]);
+
 function currentStepOf(wf) {
   if (!wf || !wf.currentStep || !wf.steps) return null;
   return wf.steps[wf.currentStep] || null;
@@ -119,6 +130,37 @@ function deriveNeedsAttention(wf) {
         title: blocked.length === 1 ? 'A task is blocked' : `${blocked.length} tasks are blocked`,
         detail: `${named.join('; ')}. The run cannot merge while a task is blocked, whatever task_execution reports.`,
         action: 'Address the findings and relaunch the blocked task(s), or cancel the run.',
+      };
+    }
+  }
+
+  // 0c. Tasks that finished without an agent verdict — an operator skipped them
+  //     or force-completed them. The step was allowed to move on, because a
+  //     person decided it should, but their acceptance criteria are covered by
+  //     nothing. Recording that on the task and never reading it would leave the
+  //     run claiming coverage it does not have, so it is surfaced here and
+  //     enforced by the auto-advance tick before acceptance and merge steps.
+  {
+    const states = (wf.taskExecution && wf.taskExecution.taskStates) || {};
+    const tasks = (wf.taskPlan && wf.taskPlan.tasks) || [];
+    const gaps = Object.keys(states)
+      .map((k) => ({ i: Number(k), ts: states[k] }))
+      .filter(({ i, ts }) => Number.isInteger(i) && ts
+        && (ts.status === 'skipped' || ts.status === 'aborted' || ts.forceCompleted === true || ts.acceptanceCovered === false))
+      .sort((a, b) => a.i - b.i);
+    if (gaps.length > 0 && ACCEPTANCE_SENSITIVE_STEPS.has(stepKey)) {
+      const named = gaps.map(({ i, ts }) => {
+        const t = tasks[i];
+        const name = (t && (t.name || t.title)) || `task ${i + 1}`;
+        return `#${i + 1} ${name} (${ts.status})`;
+      });
+      return {
+        reason: 'acceptance_gap',
+        principal: 'technical',
+        step: stepKey,
+        title: gaps.length === 1 ? 'A task was never verified' : `${gaps.length} tasks were never verified`,
+        detail: `${named.join('; ')}. No agent certified this work, so its acceptance criteria are covered by nothing — the run must not report them as met.`,
+        action: 'Relaunch the task for a real verdict, or accept the gap explicitly before signing the run off.',
       };
     }
   }
@@ -290,4 +332,4 @@ function deriveNeedsAttention(wf) {
   return null;
 }
 
-module.exports = { deriveNeedsAttention, HUMAN_GATES };
+module.exports = { deriveNeedsAttention, HUMAN_GATES, ACCEPTANCE_SENSITIVE_STEPS };

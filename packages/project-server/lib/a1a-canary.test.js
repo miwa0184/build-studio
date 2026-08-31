@@ -77,7 +77,16 @@ test('canary 3 — reload and restart do not restore a spent budget', () => {
 
   const first = createRunGuard({ statePath });
   for (let i = 0; i < 3; i++) assert.equal(consumeReviewRound(first, RUN_ID, budgets, { step: 'reviewing' }).allowed, true);
-  for (let i = 0; i < budgets.maxAutoAdvanceRefusals; i++) noteAutoAdvanceRefusal(first, RUN_ID, 'qa_validation', budgets, 'gate refused');
+
+  // Spend the RUN-wide refusal budget. Note it is not the per-step one: three
+  // refusals on one step means that step is stuck, three across a whole run
+  // means almost nothing, and sharing the ceiling made an ordinary run
+  // terminal in 24 seconds of ticks.
+  let last;
+  for (let i = 0; i <= budgets.maxAutoAdvanceRefusalsTotal; i++) {
+    last = noteAutoAdvanceRefusal(first, RUN_ID, `step_${i}`, budgets, 'gate refused');
+  }
+  assert.equal(last.exhausted, true);
 
   // "Reload the page" and "restart the server" are the same thing to the store:
   // a brand-new reader over the same disk.
@@ -138,4 +147,27 @@ test('canary 6 — the hub cannot autonomously advance the workflow', () => {
 
   const effectStart = src.indexOf('// Auto-advance logic');
   assert.equal(effectStart, -1, 'the client-side auto-advance effect still exists');
+});
+
+test('canary 7 — the strict-cap stop is reachable from its call site', () => {
+  // run-budgets.test.js proves strictReviewOutcome returns a technical stop at
+  // the cap. That is not the same as the engine ever asking it at the cap: the
+  // guard counter starts at 0 while wf.round starts at 1, so reading the
+  // counter alone made the condition unreachable while the run was still on the
+  // reviewing step — the fail-open closed only by falling through to
+  // review_cap_reached, which is an owner decision that can approve past the
+  // findings. A unit test cannot see an unreachable branch, so the call site is
+  // pinned here.
+  const src = fs.readFileSync(path.join(__dirname, 'api', 'workflow.js'), 'utf8');
+  const i = src.indexOf('const roundsUsed = ');
+  assert.ok(i > 0, 'the strict-review call site must compute roundsUsed');
+  const site = src.slice(i, i + 260);
+  assert.match(site, /Math\.max/, 'roundsUsed must not read the lagging counter alone');
+  assert.match(site, /wf\.round/, 'the round the run is actually on must be considered');
+
+  // And the boundary the call site feeds must be the one that stops.
+  const { resolveBudgets, strictReviewOutcome } = require('./run-budgets');
+  const budgets = resolveBudgets({ max_review_rounds: 5 });
+  const atCap = strictReviewOutcome({ hasFindings: true, roundsUsed: 5, budgets, ctx: { runId: RUN_ID, step: 'reviewing' } });
+  assert.equal(atCap.kind, 'technical_stop');
 });

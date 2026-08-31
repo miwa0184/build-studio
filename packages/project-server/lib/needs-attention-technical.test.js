@@ -96,3 +96,38 @@ test('a clean run with every task done still needs nothing', () => {
   wf.taskExecution.taskStates['1'] = { status: 'done' };
   assert.equal(deriveNeedsAttention(wf), null);
 });
+
+// ── Repair round 1 ────────────────────────────────────────────────────────────
+// Recording a task as unverified and never reading it left the coverage claim
+// exactly as false as before. Acceptance gaps are surfaced, and the
+// auto-advance tick refuses the steps where the claim is about to be made.
+
+test('a skipped task is reported once the run reaches an acceptance-sensitive step', () => {
+  const wf = afterBlockedTask('ac_verification');
+  wf.steps.ac_verification = { status: 'pending', agents: [] };
+  wf.taskExecution.taskStates['1'] = { status: 'skipped', acceptanceCovered: false };
+
+  const n = deriveNeedsAttention(wf);
+  assert.ok(n, 'an unverified task at ac_verification must not report "nothing needed"');
+  assert.equal(n.reason, 'acceptance_gap');
+  assert.equal(n.principal, 'technical');
+  assert.match(n.detail, /Sync engine/);
+  assert.match(n.detail, /covered by nothing/);
+});
+
+test('a force-completed task is an acceptance gap too', () => {
+  const wf = afterBlockedTask('merge_to_main');
+  wf.steps.merge_to_main = { status: 'pending', agents: [] };
+  wf.taskExecution.taskStates['1'] = { status: 'force_completed', forceCompleted: true, acceptanceCovered: false };
+  assert.equal(deriveNeedsAttention(wf).reason, 'acceptance_gap');
+});
+
+test('before an acceptance-sensitive step, a skipped task is not yet a problem', () => {
+  // The operator dropped a task and the run is still building. Reporting it at
+  // every step would be noise; it becomes a gap when the run is about to claim
+  // the criteria are met.
+  const wf = afterBlockedTask('task_execution');
+  wf.steps.task_execution = { status: 'running', agents: [] };
+  wf.taskExecution.taskStates['1'] = { status: 'skipped', acceptanceCovered: false };
+  assert.equal(deriveNeedsAttention(wf), null);
+});
