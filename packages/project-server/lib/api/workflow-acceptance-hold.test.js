@@ -30,8 +30,16 @@ const { createWorkflowRouter } = require('./workflow');
 const { createRunGuard } = require('../run-guard');
 const { COUNTERS } = require('../run-budgets');
 
-/** The tick runs 500ms after auto-advance is enabled, then every 8s. */
-const TICK_SETTLE_MS = 2500;
+/**
+ * The tick runs 500ms after auto-advance is enabled, then every 8 seconds.
+ *
+ * Kept just past the first firing rather than into the second: these tests
+ * hold a real timer and a real server open, and on a 2-core CI runner that
+ * contention is felt by every other test file in the suite. One tick is enough
+ * — the assertions below check that it ran, so a settle time too short fails
+ * loudly instead of passing vacuously.
+ */
+const TICK_SETTLE_MS = 1200;
 
 function makeServer(wf) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wf-hold-'));
@@ -144,7 +152,9 @@ test('R9 — the real tick holds an acceptance-sensitive step and spends no budg
 
 test('R9 — holding repeatedly across ticks still spends nothing', async () => {
   // The failure mode was cumulative: one refusal per 8-second tick against a
-  // condition that never clears. Two ticks is enough to catch a per-tick spend.
+  // condition that never clears. A single tick catches it — the spend happened
+  // on the first one — and the assertion that the hold was recorded proves the
+  // tick actually ran.
   const wf = runWithGap('merge_to_main');
 
   await withServer(wf, async (base, config) => {

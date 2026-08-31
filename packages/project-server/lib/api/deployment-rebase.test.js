@@ -56,46 +56,41 @@ beforeEach(async () => {
 });
 
 /**
- * Wait for the BACKGROUND git fetch to finish before the tree is deleted.
+ * Remove the temp tree, tolerating a background git process still writing to it.
  *
  * `GET /deployment` deliberately does not fetch inline — it answers from the
  * refs it has and schedules `git fetch --quiet origin` behind the response, so
  * the tab's 10-second poll is never blocked on the network (deployment.js,
- * `remoteFetch`). That fetch is still writing into `local/.git` after the
- * request returns and after the server is closed: it is a detached child
- * process, not an HTTP connection.
+ * `remoteFetch`). That fetch is a detached child: it outlives the request, the
+ * response, and `server.close()`, and it keeps writing into `local/.git`.
  *
- * Deleting the repository underneath it is what produced, on CI,
+ * Deleting the repository underneath it produced, on CI,
  * `ENOTEMPTY: directory not empty, rmdir '/tmp/bs-rebase-*\/local/.git'` from
  * this hook — rimraf empties a directory, git recreates an object or lock file
- * inside it, and the rmdir fails. The test that runs after this one already
- * knows about the background fetch and sleeps 1500ms for it; this one ends on a
- * `GET /deployment` and did not.
+ * inside it, and the rmdir fails.
  *
- * Load-dependent, so it stayed invisible until a busy 2-core runner.
+ * An earlier attempt waited for `*.lock` files to disappear. That was wrong
+ * twice over: a fetch is not holding a lock for most of its life, so the check
+ * samples quiet moments mid-write; and it busy-spun, burning CPU on a 2-core
+ * runner that the git process itself needed.
+ *
+ * So: retry asynchronously (yielding to the fetch), and if the tree still will
+ * not go, leave it. It is a directory in /tmp on a throwaway runner. A teardown
+ * must never be able to fail a test that passed.
  */
-function waitForGitQuiet(repo, timeoutMs = 5000) {
-  const deadline = Date.now() + timeoutMs;
-  const gitDir = path.join(repo, '.git');
-  while (Date.now() < deadline) {
-    let busy = false;
+async function removeTempTree(dir) {
+  const deadline = Date.now() + 15_000;
+  for (;;) {
     try {
-      // git holds a *.lock while it writes refs, the index, or the object store.
-      const stack = [gitDir];
-      while (stack.length && !busy) {
-        const dir = stack.pop();
-        for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-          if (e.isDirectory()) stack.push(path.join(dir, e.name));
-          else if (e.name.endsWith('.lock')) { busy = true; break; }
-        }
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      return;
+    } catch (e) {
+      if (Date.now() > deadline) {
+        console.warn(`[test] left ${dir} behind: ${e.code || e.message}`);
+        return;
       }
-    } catch (_) {
-      return; // the tree is already gone, or unreadable — nothing to wait for
+      await new Promise((r) => setTimeout(r, 250));
     }
-    if (!busy) return;
-    // Busy-wait briefly; this hook is synchronous by contract with node:test.
-    const until = Date.now() + 25;
-    while (Date.now() < until) { /* spin */ }
   }
 }
 
@@ -107,10 +102,7 @@ afterEach(async () => {
     server.closeAllConnections?.();
     await new Promise((resolve) => server.close(resolve));
   }
-  waitForGitQuiet(local);
-  // And retry rather than fail the file if the filesystem is still catching up.
-  // A teardown must not be able to fail a passing test.
-  fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 30, retryDelay: 100 });
+  await removeTempTree(tmp);
 });
 
 const rebase = () => fetch(`${baseUrl}/api/deployment/rebase`, { method: 'POST' });
