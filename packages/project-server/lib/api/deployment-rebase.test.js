@@ -55,9 +55,23 @@ beforeEach(async () => {
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });
 
-afterEach(() => {
-  if (server) server.close();
-  fs.rmSync(tmp, { recursive: true, force: true });
+afterEach(async () => {
+  // Wait for the server to actually be down before deleting the tree it is
+  // serving. `server.close()` only stops NEW connections and returns
+  // immediately, and undici (what `fetch` uses) holds its sockets open with
+  // keep-alive — so a request handler could still be shelling out to git in
+  // `local/` while rmSync walked it. That surfaced on CI as
+  // `ENOTEMPTY: rmdir '/tmp/bs-rebase-*/local/.git'` from the teardown hook:
+  // rimraf empties a directory, git recreates a lock or index file inside it,
+  // and the rmdir fails. It is load-dependent, which is why it only appeared on
+  // a busy 2-core runner.
+  if (server) {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
+  // Belt and braces: retry rather than fail the whole file if the filesystem is
+  // still catching up. A teardown must not be able to fail a passing test.
+  fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
 const rebase = () => fetch(`${baseUrl}/api/deployment/rebase`, { method: 'POST' });
