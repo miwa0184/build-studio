@@ -21,6 +21,128 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-31 — The engine stops instead of walking past its own halts
+
+Ten fail-open paths in the workflow engine, closed together. Each was reproduced
+against the previous head before anything was changed. No product behaviour
+changes; what changes is what the engine does when something has already gone
+wrong. Design record: `docs/plans/a1a-state-correctness-and-transition-authority.md`.
+
+### Changed
+
+- **A blocked task now stops the run instead of being skipped past.** A task that
+  exhausted its fix cycles was marked `blocked`, and the "what runs next" search
+  looked for tasks marked `pending` — so it found nothing, concluded every task
+  was done, marked the step completed and advanced to merge with code a reviewer
+  had refused three times. Nothing downstream re-read the task states, so the
+  refusal simply vanished. The run now halts with a machine-readable
+  TECHNICAL_STOP naming every blocking task and why. If you have a run that was
+  quietly carrying a blocked task, it will stop the next time it tries to move.
+
+- **The dashboard no longer advances workflows on its own.** Two auto-advance
+  policies used to run against the same workflow: the server's, and one in the
+  browser that re-derived the next transition from whatever it had last polled.
+  They disagreed by design, and the browser's ran on page load — opening the app
+  could carry a run past a halt the server had already decided on. The server is
+  now the only thing that advances a run autonomously. Your Auto-advance,
+  Strict and Skip Demo Review checkboxes work exactly as before, and so do the
+  manual Approve / Override / Skip buttons; what changed is that the page you
+  are looking at no longer makes transition decisions of its own.
+
+- **Round and refusal budgets survive restarts, reloads and "another round".**
+  They lived in server process memory and React state, so restarting the server
+  or reloading the page put them back to zero; `another_round` reset the round
+  counter outright. A ceiling of 5 now means exactly five rounds *in that run* —
+  no restart, reload, re-enable or "another round" gives it more. A run that has
+  spent its budget stops with a TECHNICAL_STOP rather than looping on.
+
+- **Force-complete and kill-and-skip can no longer read as an approval.** Both
+  wrote `**Approved:** yes` into the agent's feedback — force-complete over the
+  agent's terminal scrollback, kill-and-skip over a task nobody had done — and
+  every verdict check reads approval by matching that text. Ending a stuck agent
+  therefore produced positive review evidence out of nothing. The output is
+  still kept (it is useful for diagnosis) but is now labelled as operator-
+  generated and never counted as an agent verdict. Force-completed tasks are
+  marked `force_completed` and skipped ones `skipped` — neither counts as
+  verified work, and both leave that task's acceptance coverage unmet.
+
+- **Strict review at its round cap no longer approves findings away.** With
+  findings still open at the cap it fell back to "approve unless blocking". It
+  now stops with the remaining findings as the outcome.
+
+- **Fix plans have a task ceiling.** Implementation plans have had one for a long
+  time; fix plans were checked only for being *empty*, so any other length was
+  accepted. The ceiling follows `max_tasks_per_plan` unless you set
+  `max_fix_plan_tasks` separately.
+
+- **The overseer sees more than one problem at a time.** It had a single
+  escalation slot, and five of its six detectors were written "only if nothing
+  else is showing" — so one agent hitting a usage limit hid a merge conflict, a
+  step loop, and every other agent's overrun until someone dismissed the banner.
+  Problems are now tracked as independent, deduplicated incidents. The banner
+  still shows the most urgent one; dismissing it reveals the next rather than
+  clearing everything.
+
+### Added
+
+- **A run-guard store**, at `.build-studio/run-guard/<run-id>.json` in each
+  managed project. Holds the per-run budgets, incidents and terminal outcome,
+  with a revision check so a stale writer cannot roll them back. Written
+  automatically; nothing to configure.
+
+- **TECHNICAL_STOP**, a typed terminal outcome that is explicitly not an
+  approval, not an owner rejection, and cannot be auto-advanced or merged. The
+  dashboard labels it "Technical" so it reads as a fault to fix rather than a
+  decision to make.
+
+- **`max_fix_plan_tasks`** in `.build-studio/config.yaml` — ceiling on tasks in
+  one fix plan. Defaults to `max_tasks_per_plan`.
+
+### Upgrade steps
+
+**In Build Studio** — rebuild and restart, since both packages changed:
+
+```bash
+cd packages/hub && npx next build
+cd packages/desktop && node inject-resources.js
+```
+
+Then relaunch the Electron app and restart any running project-servers.
+
+**In each managed project** — nothing to do. The run-guard directory is created
+on demand, and existing workflow state is read as before. A run that is
+*currently* in flight will pick up the new gates at its next transition; if it
+is carrying a blocked task it will stop rather than merge, which is the point.
+
+### Known issues
+
+- A run already past a blocked task when you pull will not be retroactively
+  stopped — the gate applies at the next transition it attempts.
+- The per-step auto-advance refusal count still clears when that step genuinely
+  advances. Only the run-wide refusal budget is strictly monotonic.
+- `qa-suite-run.test.js` has a test that fails intermittently under full-suite
+  parallelism. It predates this change and is untouched by it.
+
+### Notes for forks
+
+- Approval must be read through `feedback-provenance.js`, never by matching
+  `**Approved:**` against `agent.feedback` directly. Anything that writes into
+  that field on an agent's behalf has to set `feedbackProvenance`, or it will be
+  trusted as a verdict.
+- Anything that can end `task_execution` goes through
+  `blocked-tasks.js` — do not re-derive "are we done" from task statuses.
+  `blocked` is terminal; `skipped` and `force_completed` finish the task without
+  verifying it.
+- Budgets belong in the run guard, not on the workflow object.
+  `saveWorkflow` writes that object whole with no revision check, so anything
+  stored there can be rolled back by a stale writer.
+- The hub must not decide transitions. It may render state, send an explicit
+  user action, and toggle the server's auto-advance policy — nothing else.
+  `packages/project-server/lib/hub-transition-authority.test.js` enforces this
+  structurally.
+
+---
+
 ## 2026-08-29 — Re-reviewers actually get the diff this time
 
 ### Fixed
