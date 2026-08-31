@@ -484,6 +484,27 @@ async function mountRouter(root) {
   const tmuxOps = { killSessionAndDevPorts: () => {}, killWindowAndChildren: () => {} };
   const app = express();
   app.use(express.json());
+  // This integration harness mounts the workflow router directly, so model
+  // the server seam's successful handoff for tests whose subject is bugfix
+  // behaviour after admission. The separate route-boundary contract mounts
+  // the same router without this context and proves it refuses before branch
+  // creation.
+  let admittedStart = 0;
+  app.use((req, res, next) => {
+    if (req.method === 'POST' && req.path === '/api/workflow/start') {
+      const runId = `bugfix-router-test-${++admittedStart}`;
+      req.admission = {
+        runId,
+        verdict: {
+          runId,
+          requestDigest: '0'.repeat(64),
+          admittedAt: '2026-09-01T00:00:00.000Z',
+          head: '1'.repeat(40),
+        },
+      };
+    }
+    next();
+  });
   app.use('/api', createWorkflowRouter(config, state, gitOps, tmuxOps, () => {}));
 
   const server = http.createServer(app);

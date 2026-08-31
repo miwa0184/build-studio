@@ -6,6 +6,18 @@
 > lifecycle that can tell a new run from a run whose history was deleted.
 > Second slice of the A1a/A1b/A1c track; no product change.
 
+> **Admission-boundary repair, 2026-09-01.** The first implementation compared
+> `req.path` to canonical strings while the Express routers were case
+> insensitive and accepted one optional trailing slash. The real server
+> therefore routed spellings the seam did not classify. Route classification
+> now compiles every start and mutation route through an Express route layer
+> with the same defaults as the real routers; query strings remain irrelevant,
+> one trailing slash and case variants are admitted to the gate, and double
+> trailing slashes or encoded route-literal spellings remain ordinary 404s.
+> `/workflow/start` also has a direct-mount backstop before its first state read,
+> and a common server error boundary serialises typed admission failures from
+> workflow, run, and server routes without recasting ordinary bugs as refusals.
+
 Owner request: before successor repair runs (A1b.2) and egress control (A1c)
 are built, give the engine a real front door. A run must be admitted by the
 server against the project's actual git state before its first work-related
@@ -173,6 +185,19 @@ guard with two spent review rounds, `load()` returned a fresh document
 (revision 0, empty counters, no stop), and creating 46 runs left 40 files —
 six runs' history auto-deleted. The lifecycle tests (`a1b1-identity.test.js`)
 and admission unit tests pin the closed behaviour.
+
+The route-boundary repair has its own real-server contract
+(`a1b1-route-boundary.test.js`). Run unchanged against parent
+`804409bf00a195013f336bb1ac3357d96dc42b32` in a detached temporary worktree,
+the suite failed on the actual bypasses: `workflow/start/` answered 200, wrote
+workflow state and created/checked out `exec/PRD-001`; trailing-slash
+model-override and auto-advance answered 200 and changed the planted legacy
+state; case-variant run merge reached its handler and answered 200. The direct
+workflow-router mount likewise started and branched without admission. Control
+cases established that query strings do not change classification and that
+double slashes plus the tested encoded route-literal spellings are 404s in the
+real Express server. The repaired suite covers R1-R18, including a typed
+`ADMISSION_BACKSTOP` injection and a plain `TypeError` control.
 
 ## Deliberately not in A1b.1
 

@@ -1,6 +1,7 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const { isAdmissionError } = require('../admission-error');
 // Shared model-name → CLI model-id map. Was a private inline copy pinned to
 // Opus/Sonnet 4.6, two generations behind the workflow launch path.
 const { MODEL_IDS } = require('@build-studio/shared/cli');
@@ -23,7 +24,7 @@ function createRunRouter(config, state, gitOps, tmuxOps, broadcast, parseExecuti
     res.json({ commits });
   });
 
-  router.post('/run/merge/:branch', (req, res) => {
+  router.post('/run/merge/:branch', (req, res, next) => {
     const { branch } = req.params;
     const run = state.loadRun();
     if (!run) return res.status(404).json({ error: 'no active run' });
@@ -43,6 +44,9 @@ function createRunRouter(config, state, gitOps, tmuxOps, broadcast, parseExecuti
       broadcast('worktrees-updated', {});
       res.json({ status: 'merged', message: msg });
     } catch (e) {
+      // Admission failures belong to the common server boundary; do not
+      // launder a backstop refusal into a generic merge-conflict 500.
+      if (isAdmissionError(e)) return next(e);
       gitOps.abortMerge(projectRoot);
       res.status(500).json({ status: 'conflict', error: e.message });
     }

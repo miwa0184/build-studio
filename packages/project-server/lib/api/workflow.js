@@ -3339,6 +3339,16 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
   }
 
   router.post('/workflow/start', (req, res) => {
+    // Defence in depth for direct router mounts: the central seam normally
+    // creates this context, but this handler must still refuse before its
+    // first state read, branch checkout, save, or launch if the seam is absent.
+    if (!req.admission) {
+      return res.status(403).json({
+        error: 'workflow start refused — this route requires an admitted run',
+        code: 'ADMISSION_REQUEST_MISSING',
+        admission: 'refused',
+      });
+    }
     const { type, input, reviewMode: startReviewMode, autoIterateRemaining: startAutoIterate, developerCli: startDeveloperCli, reviewerCli: startReviewerCli, override: startOverride } = req.body;
     if (!type) return res.status(400).json({ error: 'type required' });
     if (!['review', 'execution', 'kickoff', 'onboarding', 'bugfix'].includes(type)) return res.status(400).json({ error: 'type must be review, execution, kickoff, onboarding, or bugfix' });

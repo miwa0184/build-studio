@@ -29,6 +29,7 @@ const { createOverseer } = require('./overseer');
 const { parseAllowedOrigins, isAllowedOrigin } = require('./allowed-origins');
 const { createAdmission } = require('./admission');
 const { createAdmissionSeam } = require('./admission-seam');
+const { createAdmissionErrorHandler } = require('./admission-error');
 
 function startServer(projectRoot, opts = {}) {
   const config = loadConfig(projectRoot);
@@ -242,6 +243,11 @@ function startServer(projectRoot, opts = {}) {
 
   // Presets endpoint — lists available workflow presets
   app.get('/api/presets', (req, res) => res.json({ presets: listPresets() }));
+
+  // Common typed boundary for admission failures escaping any workflow, run,
+  // or server route. Non-admission errors pass through unchanged to Express's
+  // ordinary 500 handling.
+  app.use(createAdmissionErrorHandler());
 
   // WebSocket / persistent pty terminal
   const server = http.createServer(app);

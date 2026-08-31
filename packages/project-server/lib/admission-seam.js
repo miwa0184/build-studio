@@ -39,15 +39,17 @@
  */
 
 const { AdmissionRefusedError } = require('./admission');
+const express = require('express');
+const { admissionErrorPayload } = require('./admission-error');
 
 /** Start-ingress routes: path -> run id prefix source. */
-const START_INGRESS = {
-  '/api/workflow/start': (req) => {
+const START_INGRESS = new Map([
+  ['/api/workflow/start', (req) => {
     const t = req.body && req.body.type;
     return ['review', 'execution', 'kickoff', 'onboarding', 'bugfix'].includes(t) ? t : 'run';
-  },
-  '/api/launch': () => 'run',
-};
+  }],
+  ['/api/launch', () => 'run'],
+]);
 
 /** Work-advancing mutations on the active WORKFLOW run. */
 const WORKFLOW_MUTATIONS = new Set([
@@ -61,19 +63,62 @@ const WORKFLOW_MUTATIONS = new Set([
   '/api/overseer/kill-skip-task',
 ]);
 
-/** Work-advancing mutations on the active EXECUTION-TAB run (prefix match). */
-const RUN_MUTATION_PREFIXES = ['/api/run/merge/'];
+/** Work-advancing mutations on the active EXECUTION-TAB run. */
+const RUN_MUTATION_PREFIXES = ['/api/run/merge/:branch'];
+
+/**
+ * Compile through Express itself, rather than maintaining a second, narrower
+ * idea of route equality. The real routers use the same defaults: case
+ * insensitive, non-strict trailing slash, end-anchored route matching. Using
+ * an Express route layer also preserves its raw-path/percent-decoding rules.
+ */
+function compileExpressPostMatcher(routePath) {
+  const probe = express.Router();
+  probe.post(routePath, (req, res) => res.end());
+  const layer = probe.stack[0];
+  if (!layer || typeof layer.match !== 'function') {
+    throw new Error(`could not compile Express route matcher for ${routePath}`);
+  }
+  return (requestPath) => {
+    try {
+      return layer.match(requestPath) === true;
+    } catch (err) {
+      // Express found the route shape but could not decode a parameter. The
+      // real router treats that as a malformed URL (400), not as an admitted
+      // mutation and not as a policy refusal. Let the request reach that same
+      // router layer so it emits its native response without side effects.
+      if (err && err.status === 400) return false;
+      throw err;
+    }
+  };
+}
+
+const ROUTE_MATCHERS = [
+  ...[...START_INGRESS].map(([routePath, prefixFor]) => ({
+    kind: 'start', routePath, prefixFor, matches: compileExpressPostMatcher(routePath),
+  })),
+  ...[...WORKFLOW_MUTATIONS].map((routePath) => ({
+    kind: 'workflow-mutation', routePath, matches: compileExpressPostMatcher(routePath),
+  })),
+  ...RUN_MUTATION_PREFIXES.map((routePath) => ({
+    kind: 'run-mutation', routePath, matches: compileExpressPostMatcher(routePath),
+  })),
+];
+
+function classifyAdmissionRoute(req) {
+  if (!req || req.method !== 'POST') return null;
+  const requestPath = req.path;
+  if (typeof requestPath !== 'string') return null;
+  return ROUTE_MATCHERS.find((route) => route.matches(requestPath)) || null;
+}
 
 /** Body fields a client may never use to carry its own authority. */
 const CLIENT_AUTHORITY_FIELDS = /^(runRequest|.*verdict.*|.*approval.*|approved|bypass.*|admission)$/i;
 
 function refusalResponse(res, e) {
-  const code = e && e.code ? e.code : 'ADMISSION_VALIDATOR_FAILURE';
-  return res.status(403).json({
-    error: e && e.message ? e.message : 'admission failed',
-    code,
-    admission: 'refused',
-  });
+  const payload = admissionErrorPayload(e);
+  if (!e || !e.code) payload.code = 'ADMISSION_VALIDATOR_FAILURE';
+  return res.status(403).json(payload);
 }
 
 function createAdmissionSeam({ state, admission }) {
@@ -94,9 +139,10 @@ function createAdmissionSeam({ state, admission }) {
       // C — reads pass. A refused or stopped run must stay renderable.
       if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
 
+      const classifiedRoute = classifyAdmissionRoute(req);
+
       // A — start ingress.
-      const prefixFor = START_INGRESS[req.path];
-      if (prefixFor && req.method === 'POST') {
+      if (classifiedRoute && classifiedRoute.kind === 'start') {
         const body = req.body || {};
         for (const key of Object.keys(body)) {
           if (key !== 'runRequest' && CLIENT_AUTHORITY_FIELDS.test(key)) {
@@ -106,7 +152,7 @@ function createAdmissionSeam({ state, admission }) {
             ));
           }
         }
-        const { runId } = admission.admit(body.runRequest, { runIdPrefix: prefixFor(req) });
+        const { runId } = admission.admit(body.runRequest, { runIdPrefix: classifiedRoute.prefixFor(req) });
         // Re-load through the stored path so what the handler holds is exactly
         // what every later mutation will verify against.
         req.admission = admission.contextFor(runId);
@@ -114,8 +160,8 @@ function createAdmissionSeam({ state, admission }) {
       }
 
       // B — mutations of the active run use the STORED context.
-      const isWorkflowMutation = WORKFLOW_MUTATIONS.has(req.path);
-      const isRunMutation = RUN_MUTATION_PREFIXES.some((p) => req.path.startsWith(p));
+      const isWorkflowMutation = classifiedRoute && classifiedRoute.kind === 'workflow-mutation';
+      const isRunMutation = classifiedRoute && classifiedRoute.kind === 'run-mutation';
       if (isWorkflowMutation || isRunMutation) {
         const body = req.body || {};
         for (const key of Object.keys(body)) {
@@ -144,4 +190,10 @@ function createAdmissionSeam({ state, admission }) {
   };
 }
 
-module.exports = { createAdmissionSeam, START_INGRESS, WORKFLOW_MUTATIONS };
+module.exports = {
+  createAdmissionSeam,
+  classifyAdmissionRoute,
+  START_INGRESS,
+  WORKFLOW_MUTATIONS,
+  RUN_MUTATION_PREFIXES,
+};

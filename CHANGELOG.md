@@ -31,6 +31,25 @@ the same server verdict; the hub carries no admission authority. Design record
 (with the full re-measured ingress inventory and the red-first evidence):
 `docs/plans/a1b1-admission-and-run-identity.md`.
 
+### Admission-boundary repair
+
+- **The seam now classifies routes with Express's own matching semantics.**
+  Case variants and one optional trailing slash reach the same admission gate
+  as each canonical start or work-advancing mutation route; query strings are
+  ignored exactly as they are by the router. Paths Express does not route
+  (including repeated trailing slashes and encoded route-literal spellings in
+  the measured matrix) remain ordinary side-effect-free 404s.
+- **`POST /api/workflow/start` now has an immediate handler backstop.** A
+  direct router mount without the central seam returns typed 403 before state
+  reads, branch checkout, save, or launch.
+- **Typed admission failures share one server error boundary.**
+  `AdmissionRefusedError`, `ADMISSION_BACKSTOP`, and `RUN_GUARD_MISSING` become
+  stable JSON refusals across workflow, run, and server routes. Unrelated
+  programming errors retain normal server-error semantics.
+- **No additional upgrade step.** The repair changes only server-side route
+  enforcement; existing RunRequest callers and stored admission data keep the
+  same contract.
+
 ### Added
 
 - **A RunRequest/GateVerdict admission gate.** `POST /api/workflow/start` and
