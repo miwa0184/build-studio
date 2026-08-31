@@ -45,6 +45,12 @@ interface WorkflowAgent {
 interface NeedsAttention {
   reason: 'completed_not_finished' | 'review_cap_reached' | 'dead_step' | 'blocked' | 'human_gate'
     | 'auth_blocked' | 'finished_not_reported' | 'agent_waiting' | 'awaiting_decision' | 'gate_blocked'
+    | 'technical_stop' | 'blocked_task' | 'acceptance_gap'
+  /** Who this is for. A technical fault is never an owner decision — see
+   *  needs-attention.js. Absent on responses from a pre-A1a server. */
+  principal?: 'technical' | 'orchestrator' | 'founder'
+  /** Machine-stable code on a TECHNICAL_STOP (see technical-stop.js). */
+  reasonCode?: string
   step: string | null
   title: string
   detail: string
@@ -88,12 +94,33 @@ interface WorkflowStep {
   currentTask?: { id?: number; name: string; description: string; roles: string[] }
 }
 
+/** A run the engine parked. Terminal — see project-server/lib/technical-stop.js.
+ *  There is no action that resumes it; recovery is a successor repair run. */
+interface TechnicalStop {
+  outcome: 'TECHNICAL_STOP'
+  reasonCode: string
+  principal: 'technical'
+  runId: string | null
+  step: string | null
+  tasks: { index: number; name: string; reason: string }[]
+  evidence: string[]
+  recoveryHint: string
+  approved: false
+  founderRejection: false
+  autoAdvanceable: false
+  mergeEligible: false
+  acceptanceEligible: false
+  createdAt?: string
+}
+
 interface TaskPlan {
   tasks: { id: number; name: string; description: string; roles: string[]; dependencies: number[]; acs_covered: string[]; estimated_size: string }[]
 }
 
 interface TaskState {
-  status: 'pending' | 'running' | 'done' | 'error'
+  /** `blocked` is terminal (the run stops); `skipped` and `force_completed`
+   *  finish the task WITHOUT a verdict — see blocked-tasks.js. */
+  status: 'pending' | 'running' | 'reviewing' | 'fixing' | 'done' | 'error' | 'blocked' | 'skipped' | 'force_completed'
   startedAt: string | null
   completedAt: string | null
   tokenUsage: { inputTokens: number; outputTokens: number; costUSD: number; cacheRead: number; cacheCreate: number } | null
@@ -152,6 +179,8 @@ interface Workflow {
   fixTaskIndex?: number
   fixSource?: string
   overseer?: OverseerState
+  /** Set once the run is parked. Its presence means every transition is refused. */
+  technicalStop?: TechnicalStop | null
   /** ISO time the run was created (server-set). */
   createdAt?: string
 }
@@ -210,8 +239,6 @@ const WF_STEPS: Record<string, { key: string; name: string; loopHint?: string }[
     { key: 'owner_signoff',      name: 'Owner Sign-off' },
   ],
 }
-
-const AUTO_ADVANCE_MAX_ROUNDS = 3
 
 interface WorkflowViewProps {
   allowedTypes?: string[]
@@ -288,14 +315,9 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
       api.post('/workflow/auto-advance', { enabled: true, strict: autoAdvanceStrict, skipDemoReview: skipDemoReviewLocal }).catch(() => {})
     }
   }, [onAutoAdvanceChange, api, autoAdvanceStrict, skipDemoReviewLocal])
-  const [autoAdvanceRound, setAutoAdvanceRound] = useState(0)
   const [maxReviewRounds, setMaxReviewRounds] = useState(4)
   const [advanceError, setAdvanceError] = useState<string | null>(null)
   const [advancing, setAdvancing] = useState<string | null>(null)
-  const autoAdvancingRef = useRef(false)
-  // Tracks the workflow id we've already pushed the auto-advance preference to,
-  // so the self-heal below posts at most once per run.
-  const autoAdvanceSyncRef = useRef<string | null>(null)
   const [tokenStats, setTokenStats] = useState<{ projectTokens: number; projectCostUSD: number; prds: { prdId: string; tokens: number; costUSD: number }[] } | null>(null)
   // Providers hit by the project's effective CLI slots — drives the compact
   // usage meter above Start Workflow.
@@ -369,160 +391,24 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
     return () => clearInterval(interval)
   }, [loadTokenStats])
 
-  // Auto-advance logic — runs on each workflow state update
-  useEffect(() => {
-    if (!autoAdvance || !wf || wf.currentStep === 'completed' || autoAdvancingRef.current) return
+  // Auto-advance is the SERVER's job, and only the server's.
+  //
+  // There used to be a second auto-advance policy here: an effect that
+  // re-derived the next transition from whatever state it had last polled and
+  // POSTed it itself. Two autonomous drivers against one workflow disagreed by
+  // construction — this one deliberately left round-1 reviews manual and the
+  // server's did not; this one's safety budget lived in React state and the
+  // server's in process memory, so a reload restored one and a restart the
+  // other. Worse, the effect ran on MOUNT: on 2026-07-28 the server had halted
+  // a run at a dead code_review step for seven hours and simply opening the app
+  // advanced it to merge_to_main with the round-2 review never run.
+  //
+  // What the hub does now: render state, render incidents, send an EXPLICIT
+  // user action (advanceWorkflow, below), and toggle the server's auto-advance
+  // policy. It does not decide a transition, hold a budget, or re-enable
+  // autonomy as a side effect of being rendered. The server's tick — with its
+  // budgets in the run guard — is the only thing that advances a run on its own.
 
-    // Self-heal the server-side flag. The auto-advance checkbox persists
-    // client-side across runs, but a freshly-started workflow defaults to no
-    // server flag — and if the box was already checked when the run began (no
-    // toggle event fired), nothing ever POSTed it down. Without wf.autoAdvance
-    // the server-side tick never runs, so round-1 review steps (code_review,
-    // qa_validation) stall — the client-side tick intentionally leaves those
-    // manual on round 1, and while the project is backgrounded there's nothing
-    // else to advance them. Push the preference down once per run.
-    if (!wf.autoAdvance && autoAdvanceSyncRef.current !== wf.id) {
-      autoAdvanceSyncRef.current = wf.id
-      api.post('/workflow/auto-advance', { enabled: true, strict: autoAdvanceStrict, skipDemoReview: skipDemoReviewLocal }).catch(() => {})
-    }
-
-    if (autoAdvanceRound >= AUTO_ADVANCE_MAX_ROUNDS) {
-      setAutoAdvance(false)
-      return
-    }
-
-    const step = wf.steps[wf.currentStep]
-    if (!step) return
-
-    const agents = step.agents || []
-    const allDone = agents.length > 0 && agents.every(a => a.status === 'done' || a.status === 'error')
-    const isPending = step.status === 'pending' && agents.length === 0
-
-    // Review steps: manual on round 1, auto-launch + auto-advance on round 2+
-    // Round 2+ = fix loop iteration — reviews auto-launch and auto-advance if no blocking issues
-    // (if blocking issues are found, the verdict logic below sends to fix, which is correct)
-    const round = wf.round || 1
-    const reviewSteps = ['code_review', 'qa_validation', 'ac_verification', 'security_audit']
-    // owner_signoff fires the single onboarding commit; team_review for onboarding
-    // also requires owner judgment (artifacts are backfills, not fresh decisions).
-    // owner_consultations: kickoff manual gate between pm_scoping and team_review.
-    // demo_review is manual UNLESS Skip Demo Review is checked with Auto-advance.
-    const skipDemo = !!(wf.autoAdvanceSkipDemoReview ?? skipDemoReviewLocal)
-    const alwaysManual = ['device_testing', 'owner_signoff', 'owner_consultations']
-    if (!skipDemo) alwaysManual.push('demo_review')
-    if (alwaysManual.includes(wf.currentStep)) return
-    if (wf.type === 'onboarding' && wf.currentStep === 'team_review') return
-    if (round <= 1 && reviewSteps.includes(wf.currentStep)) return
-
-    // Don't auto-advance blocked steps (e.g. validation failure in planning)
-    if (step.status === 'blocked') return
-
-    // A step where EVERY agent errored without producing feedback has nothing to
-    // advance on. `allDone` above counts 'error' as done — deliberately, so a
-    // partly-failed step can still advance on the agents that did report — but a
-    // step where NOTHING reported is a dead step, and approving it forward walks
-    // the workflow to a green "completed" with zero output.
-    //
-    // The server-side tick has this guard (workflow.js, "halted instead of
-    // advancing past a dead step") and stashes step.autoAdvanceError. This copy
-    // did not, so the server would halt and then this loop would walk straight
-    // past it on the next mount — which is exactly what happened to fazon
-    // faz-197 on 2026-07-28: a Codex reviewer died 3s in on an MCP auth error,
-    // the server halted for seven hours, and simply opening the app advanced
-    // code_review → merge_to_main with the round-2 review never run.
-    const allErrored = agents.length > 0 && agents.every(a => a.status === 'error')
-    if (allErrored && agents.every(a => !a.feedback)) return
-
-    let action: string | null = null
-
-    // Skip Demo Review: same action the human Skip button fires
-    if (wf.currentStep === 'demo_review' && skipDemo) {
-      action = 'skip'
-    } else if (isPending) {
-      // Auto-launch pending steps (including merge steps).
-      // owner_signoff is a manual gate — never auto-approve (it fires a git commit).
-      // owner_consultations is a manual gate — owner must explicitly approve.
-      const manualSteps = ['merge_to_main', 'capture_learnings', 'owner_signoff', 'owner_consultations']
-      action = manualSteps.includes(wf.currentStep) ? 'approve' : 'launch'
-    } else if (allDone) {
-      // Determine action based on agent feedback — reuse detectVerdict for consistency
-      // qa_tests is TDD — failing tests are expected, never treat as blocking
-      const hasBlocking = wf.currentStep === 'qa_tests' ? false : agents.some(a => {
-        const v = detectVerdict(a)
-        return v === 'blocking' || v === 'changes'
-      })
-
-      const isReviewStep = ['code_review', 'qa_validation', 'ac_verification', 'security_audit'].includes(wf.currentStep)
-      const isReviewFlowStep = ['reviewing', 'team_review'].includes(wf.currentStep)
-
-      // Strict auto-advance: ANY finding (medium/low included, or a non-approval)
-      // bounces the review round back to PM — until clean or the round cap, so
-      // low-severity nitpicks can't loop forever. Mirrors the server-side tick.
-      const strictHasFindings = autoAdvanceStrict && wf.type === 'review'
-        && wf.currentStep === 'reviewing' && !hasBlocking
-        && agents.some(a => {
-          const fb = (a as { feedback?: string }).feedback
-          if (!fb) return false
-          if (/\*\*Approved:\*\*\s*no\b/i.test(fb)) return true
-          return [/\*\*Blocking:\*\*\s*(\d+)/i, /\*\*Medium:\*\*\s*(\d+)/i, /\*\*Low:\*\*\s*(\d+)/i]
-            .some(re => { const m = fb.match(re); return m ? parseInt(m[1]) > 0 : false })
-        })
-
-      if (hasBlocking && isReviewStep) {
-        action = 'send_to_devs'
-        setAutoAdvanceRound(r => r + 1)
-      } else if (hasBlocking && isReviewFlowStep) {
-        // team_review (kickoff/onboarding) accepts `approve` to advance to
-        // pm_revision; reviewing (review workflow) accepts `send_to_pm`.
-        action = wf.currentStep === 'team_review' ? 'approve' : 'send_to_pm'
-        setAutoAdvanceRound(r => r + 1)
-      } else if (strictHasFindings && round < maxReviewRounds) {
-        // Strict re-review bounce. Do NOT count this toward AUTO_ADVANCE_MAX_ROUNDS:
-        // a strict loop is meant to iterate until reviews are clean, and it is
-        // already bounded server-side by max_review_rounds (the `round <`
-        // condition here). Counting it would trip the client safety cap and
-        // silently disable auto-advance mid-loop (leaving pm_fix stranded).
-        action = 'send_to_pm'
-      } else {
-        action = 'approve'
-      }
-    }
-
-    if (action) {
-      autoAdvancingRef.current = true
-      console.log(`[auto-advance] step=${wf.currentStep} status=${step.status} agents=${agents.length} allDone=${allDone} isPending=${isPending} action=${action}`)
-      api.post('/workflow/advance', { action }).then((result: any) => {
-        console.log(`[auto-advance] result: needsAdvance=${result?.needsAdvance} error=${result?.error}`)
-        autoAdvancingRef.current = false
-        if (result?.error) {
-          // Gate rejected the action (e.g. qa_tests with no committed tests, or a
-          // qa_validation.strict failure) — surface it and stop looping instead of
-          // retrying silently. Re-enable Auto-advance to try again after fixing the cause.
-          setAdvanceError(result.error)
-          setAutoAdvance(false)
-          return
-        }
-        if (result?.needsAdvance) {
-          // Fix execution: approve returns needsAdvance — immediately launch next task
-          setTimeout(() => {
-            console.log(`[auto-advance] chaining launch after needsAdvance`)
-            autoAdvancingRef.current = true
-            api.post('/workflow/advance', { action: 'launch' }).then(() => {
-              autoAdvancingRef.current = false
-              load()
-            }).catch(() => {
-              autoAdvancingRef.current = false
-            })
-          }, 1500)
-        } else {
-          load()
-        }
-      }).catch((e: any) => {
-        console.error(`[auto-advance] error:`, e)
-        autoAdvancingRef.current = false
-      })
-    }
-  }, [wf, autoAdvance, autoAdvanceStrict, skipDemoReviewLocal, maxReviewRounds, autoAdvanceRound, api, load])
 
   // Poll workflow log if viewing one
   useEffect(() => {
@@ -561,12 +447,12 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
       setStartCanOverride(!!res.canOverride)
       return
     }
-    // Carry the persisted auto-advance preference into the fresh workflow now —
-    // the server flag defaults off, and without it the server-side tick won't
-    // advance round-1 review steps. The effect self-heals too; this closes the
-    // gap before its first render.
+    // Carry the persisted auto-advance preference into the fresh workflow the
+    // user just started. The server flag defaults off, and this is the same
+    // explicit toggle the checkbox sends — the user asked for auto-advance and
+    // then asked to start a run. It is not the client deciding a transition:
+    // the server still owns every decision about what to advance and when.
     if (autoAdvance) {
-      if (res?.workflow?.id) autoAdvanceSyncRef.current = res.workflow.id
       api.post('/workflow/auto-advance', {
         enabled: true,
         strict: autoAdvanceStrict,
@@ -592,6 +478,16 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
 
   async function advanceWorkflow(action?: string, extra?: Record<string, unknown>) {
     setAdvanceError(null)
+    // A parked run has no transitions. The server refuses these anyway, but a
+    // stale render or a shortcut should not put one on the wire at all — and
+    // surfacing the reason here is more useful than a 409 the user did not ask
+    // for. The gate is before the POST deliberately.
+    if (wf?.technicalStop) {
+      setAdvanceError(
+        `This run is parked (${wf.technicalStop.reasonCode}). It is terminal — recovery is a separate repair run.`,
+      )
+      return
+    }
     setAdvancing(action ?? 'advance')
     const res = await api.post('/workflow/advance', { action, notes: notes.trim() || undefined, ...extra })
     setAdvancing(null)
@@ -618,10 +514,12 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
     load()
   }
 
-  async function markAgentDone(role: string) {
-    await api.post('/workflow/feedback', { role, feedback: 'Manually marked as done.' })
-    load()
-  }
+  // There is deliberately no "mark agent as done" here. The old Cancel button
+  // posted a completion line as ordinary agent feedback — it never terminated
+  // the process, and it manufactured an agent report out of an operator click
+  // with no provenance. Ending a stuck agent is the overseer's job
+  // (force-complete / kill-and-skip), which terminates the process, labels the
+  // output as operator-generated, and parks the run.
 
   // Build the timeline from the project's resolved preset order. WF_STEPS is
   // used ONLY as a display-name dictionary; the canonical ORDER comes from
@@ -888,10 +786,10 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
                 <input
                   type="checkbox"
                   checked={autoAdvance}
-                  onChange={e => {
-                    setAutoAdvance(e.target.checked)
-                    if (e.target.checked) setAutoAdvanceRound(0)
-                  }}
+                  // Toggling the policy no longer zeroes a counter: the budget
+                  // is the run's, lives in the server's run guard, and is not
+                  // renewed by a checkbox.
+                  onChange={e => setAutoAdvance(e.target.checked)}
                   style={{ accentColor: 'var(--accent)' }}
                 />
                 Auto-advance
@@ -940,9 +838,12 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
                 </label>
               )}
               <span style={{ flex: 1 }} />
-              {autoAdvance && (
+              {autoAdvance && wf?.round != null && (
+                // The run's round, read from the server. The number here used to
+                // be a client-side counter of transitions this browser tab had
+                // posted, which meant something different in every tab.
                 <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--muted)' }}>
-                  {autoAdvanceRound}/{AUTO_ADVANCE_MAX_ROUNDS}
+                  round {wf.round}/{maxReviewRounds}
                 </span>
               )}
             </div>
@@ -1217,7 +1118,25 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
           }}>
             <span style={{ flexShrink: 0 }}>{['human_gate', 'auth_blocked', 'finished_not_reported', 'agent_waiting', 'awaiting_decision', 'gate_blocked'].includes(needsAttention.reason) ? '⏸' : '⚠'}</span>
             <span style={{ flex: 1 }}>
+              {/* A technical halt is labelled as one. Without this the banner
+                  reads identically to a gate waiting on the owner, which sends
+                  the wrong person at the problem — a run stopped by a blocked
+                  task is not a decision anybody is being asked to make. */}
+              {needsAttention.principal === 'technical' && (
+                <span style={{
+                  display: 'inline-block', marginRight: 6, padding: '1px 5px', borderRadius: 3,
+                  background: 'var(--red)', color: 'var(--surface)', fontSize: 9, fontWeight: 700,
+                  letterSpacing: '0.06em', textTransform: 'uppercase', verticalAlign: 'middle',
+                }}>
+                  Technical
+                </span>
+              )}
               <b>{needsAttention.title}</b>
+              {needsAttention.reasonCode && (
+                <span style={{ color: 'var(--muted)', marginLeft: 6, fontSize: 10 }}>
+                  {needsAttention.reasonCode}
+                </span>
+              )}
               <br />
               {needsAttention.detail}
               <br />
@@ -1293,7 +1212,6 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
             onAdvance={advanceWorkflow}
             onFinish={finishWorkflow}
             onViewLog={(w) => setViewingLog(w)}
-            onMarkDone={markAgentDone}
           />
         )}
       </div>
@@ -1355,7 +1273,7 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
 }
 
 function StepDetail({
-  wf, pathologySignals, findings, onFindingToggle, activeKey, notes, setNotes, advancing, onAdvance, onFinish, onViewLog, onMarkDone,
+  wf, pathologySignals, findings, onFindingToggle, activeKey, notes, setNotes, advancing, onAdvance, onFinish, onViewLog,
 }: {
   wf: Workflow | null
   pathologySignals: PathologySignals | null
@@ -1368,7 +1286,6 @@ function StepDetail({
   onAdvance: (action?: string, extra?: Record<string, unknown>) => void
   onFinish: () => void
   onViewLog: (window: string) => void
-  onMarkDone: (role: string) => void
 }) {
   if (!wf) {
     return <Empty icon="⚙" text="Select a workflow type and PRD to begin" />
@@ -1580,7 +1497,7 @@ function StepDetail({
             const taskLabel = activeKey === 'task_execution' && a.taskIndex !== undefined
               ? `Task ${a.taskIndex + 1}`
               : undefined
-            return <AgentFeedbackCard key={i} agent={a} taskLabel={taskLabel} onViewLog={onViewLog} onMarkDone={onMarkDone} onRelaunchTask={(idx) => onAdvance('relaunch_task', { taskIndex: idx })} />
+            return <AgentFeedbackCard key={i} agent={a} taskLabel={taskLabel} onViewLog={onViewLog} onRelaunchTask={wf.technicalStop ? undefined : (idx) => onAdvance('relaunch_task', { taskIndex: idx })} />
           })}
         </div>
       )}
@@ -1811,7 +1728,10 @@ function StepDetail({
         )
       })()}
 
-      {isCurrentStep && (step.status !== 'pending' || agents.length > 0) && !(step.status === 'error' && agents.length === 0) && (
+      {/* A parked run gets a status surface instead of controls. */}
+      {wf.technicalStop && <TechnicalStopPanel stop={wf.technicalStop} />}
+
+      {!wf.technicalStop && isCurrentStep && (step.status !== 'pending' || agents.length > 0) && !(step.status === 'error' && agents.length === 0) && (
         <StepActions
           activeKey={activeKey}
           wfType={wf.type}
@@ -1888,12 +1808,103 @@ function MonolithicProgress({ wf, signals, onViewLog }: { wf: Workflow; signals:
   )
 }
 
+/**
+ * A parked run: status only, no controls.
+ *
+ * Buttons are the honest signal of what a product believes is possible. The
+ * previous shape left Advance and Relaunch on a stopped run; both answered 409,
+ * so the only thing they communicated was that the UI and the engine disagreed
+ * about whether the run could continue. Nothing here is clickable, because
+ * nothing here can be done to this run — recovery is a separate repair run with
+ * its own run id and budget.
+ */
+function TechnicalStopPanel({ stop }: { stop: TechnicalStop }) {
+  const label: React.CSSProperties = {
+    fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 700, letterSpacing: '0.1em',
+    textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: 4,
+  }
+  const value: React.CSSProperties = { fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--text)' }
+
+  return (
+    <div style={{
+      marginBottom: 16, padding: '14px 16px', borderRadius: 6,
+      background: 'color-mix(in srgb, var(--red) 8%, transparent)',
+      border: '1px solid var(--red)',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+        <span style={{
+          padding: '1px 6px', borderRadius: 3, background: 'var(--red)', color: 'var(--surface)',
+          fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 700, letterSpacing: '0.06em',
+          textTransform: 'uppercase',
+        }}>
+          Technical
+        </span>
+        <span style={{ fontFamily: 'var(--mono)', fontSize: 13, fontWeight: 700, color: 'var(--red)' }}>
+          Run parked — {stop.reasonCode}
+        </span>
+      </div>
+
+      <div style={{ display: 'grid', gap: 10 }}>
+        <div>
+          <div style={label}>Stopped at</div>
+          <div style={value}>
+            {stop.step || 'unknown step'}
+            {stop.tasks.length > 0 && (
+              <> · {stop.tasks.map((t) => `#${t.index + 1} ${t.name}`).join(', ')}</>
+            )}
+          </div>
+        </div>
+
+        {stop.tasks.length > 0 && (
+          <div>
+            <div style={label}>Why</div>
+            <div style={{ ...value, color: 'var(--text-dim)' }}>
+              {stop.tasks.map((t, i) => <div key={i}>#{t.index + 1} {t.name}: {t.reason}</div>)}
+            </div>
+          </div>
+        )}
+
+        {stop.evidence.length > 0 && (
+          <div>
+            <div style={label}>Evidence</div>
+            <pre style={{
+              margin: 0, fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-dim)',
+              whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+            }}>
+              {stop.evidence.join('\n')}
+            </pre>
+          </div>
+        )}
+
+        <div>
+          <div style={label}>What happens next</div>
+          <div style={{ ...value, color: 'var(--text-dim)' }}>
+            This run is parked and cannot be resumed — no action here restarts it, and its
+            acceptance coverage cannot be rebuilt in place. Recovery is a separate repair run
+            with its own run id and budget. {stop.recoveryHint}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function TaskBoard({ wf, onSkipBlocked, onViewLog }: { wf: Workflow; onSkipBlocked: (action: string, extra?: Record<string, unknown>) => void; onViewLog: (window: string) => void }) {
+  // A parked run's tasks are a record, not a control panel. Relaunching one is
+  // in-place recovery of a terminal stop, which the engine refuses — so the
+  // button would only ever produce a 409.
+  const stopped = !!wf.technicalStop
   const tex = wf.taskExecution!
   const tasks = wf.taskPlan!.tasks
   const { taskStates } = tex
   const totalTasks = tasks.length
+  // Only verified work counts as complete. A skipped or force-completed task is
+  // finished but uncertified, and counting it here reported coverage the run
+  // does not have.
   const doneTasks = Object.values(taskStates).filter(ts => ts.status === 'done').length
+  const unverifiedTasks = Object.values(taskStates).filter(
+    ts => ts.status === 'skipped' || ts.status === 'force_completed',
+  ).length
   const totalTokens = Object.values(taskStates)
     .reduce((sum, ts) => sum + (ts.tokenUsage ? ts.tokenUsage.inputTokens + ts.tokenUsage.outputTokens + ts.tokenUsage.cacheRead : 0), 0)
   const fmtTok = (n: number) => n >= 1_000_000 ? `${(n/1_000_000).toFixed(1)}M` : n >= 1000 ? `${Math.round(n/1000)}k` : String(n)
@@ -1904,6 +1915,11 @@ function TaskBoard({ wf, onSkipBlocked, onViewLog }: { wf: Workflow; onSkipBlock
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
         <span style={{ fontSize: 13, fontWeight: 600 }}>
           {doneTasks} / {totalTasks} tasks complete
+          {unverifiedTasks > 0 && (
+            <span style={{ color: 'var(--orange)' }}>
+              {' '}· {unverifiedTasks} unverified
+            </span>
+          )}
         </span>
         {totalTokens > 0 && (
           <span style={{ fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--text-dim)' }}>
@@ -1922,13 +1938,20 @@ function TaskBoard({ wf, onSkipBlocked, onViewLog }: { wf: Workflow; onSkipBlock
         {tasks.map((task, i) => {
           const ts = taskStates[String(i)]
           if (!ts) return null
-          const isRunning = ts.status === 'running'
+          const isRunning = ts.status === 'running' || ts.status === 'reviewing' || ts.status === 'fixing'
           const isDone = ts.status === 'done'
-          const isError = ts.status === 'error'
+          const isError = ts.status === 'error' || ts.status === 'blocked'
+          // Finished, but nobody verified it. Deliberately not green: these
+          // rendered as done before, which is the whole thing they are not.
+          const isUnverified = ts.status === 'skipped' || ts.status === 'force_completed'
           const isPending = ts.status === 'pending'
 
           // Status color
-          const statusColor = isDone ? 'var(--green)' : isRunning ? 'var(--blue)' : isError ? 'var(--red)' : 'var(--border)'
+          const statusColor = isDone ? 'var(--green)'
+            : isRunning ? 'var(--blue)'
+            : isError ? 'var(--red)'
+            : isUnverified ? 'var(--orange)'
+            : 'var(--border)'
 
           // Duration
           let durationStr: string | null = null
@@ -2010,7 +2033,12 @@ function TaskBoard({ wf, onSkipBlocked, onViewLog }: { wf: Workflow; onSkipBlock
                       )}
                     </>
                   )}
-                  {isError && (
+                  {isError && stopped && (
+                    <span style={{ fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--red)' }}>
+                      {ts.status === 'blocked' ? 'blocked — run parked' : 'error — run parked'}
+                    </span>
+                  )}
+                  {isError && !stopped && (
                     <>
                       <span style={{ fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--red)' }}>error</span>
                       <button
@@ -2021,7 +2049,7 @@ function TaskBoard({ wf, onSkipBlocked, onViewLog }: { wf: Workflow; onSkipBlock
                       </button>
                     </>
                   )}
-                  {isPending && i <= tex.currentTaskIndex && (
+                  {isPending && !stopped && i <= tex.currentTaskIndex && (
                     <button
                       onClick={() => onSkipBlocked('relaunch_task', { taskIndex: i })}
                       style={{ padding: '2px 8px', fontSize: 10, fontFamily: 'var(--mono)', background: 'rgba(59,130,246,0.1)', border: '1px solid rgba(59,130,246,0.3)', borderRadius: 4, color: 'var(--blue)', cursor: 'pointer' }}
@@ -3014,7 +3042,7 @@ function OverseerCard({ overseer, onDismiss, onNudgeAgent }: { overseer: Oversee
   )
 }
 
-function AgentFeedbackCard({ agent, taskLabel, onViewLog, onMarkDone, onRelaunchTask }: { agent: WorkflowAgent; taskLabel?: string; onViewLog: (w: string) => void; onMarkDone: (role: string) => void; onRelaunchTask?: (taskIndex: number) => void }) {
+function AgentFeedbackCard({ agent, taskLabel, onViewLog, onRelaunchTask }: { agent: WorkflowAgent; taskLabel?: string; onViewLog: (w: string) => void; onRelaunchTask?: (taskIndex: number) => void }) {
   const [expanded, setExpanded] = useState(false)
   const verdict = detectVerdict(agent)
   const vc = VERDICT_CONFIG[verdict]
@@ -3175,18 +3203,6 @@ function AgentFeedbackCard({ agent, taskLabel, onViewLog, onMarkDone, onRelaunch
               }}
             >
               ↺ Relaunch
-            </button>
-          )}
-          {agent.status === 'running' && (
-            <button
-              onClick={(e) => { e.stopPropagation(); onMarkDone(agent.role) }}
-              style={{
-                padding: '2px 8px', borderRadius: 4,
-                border: '1px solid rgba(239,68,68,0.25)', background: 'rgba(239,68,68,0.08)',
-                color: 'var(--red)', fontFamily: 'var(--mono)', fontSize: 10, fontWeight: 600, cursor: 'pointer',
-              }}
-            >
-              ✗ Cancel
             </button>
           )}
           {agent.window && (

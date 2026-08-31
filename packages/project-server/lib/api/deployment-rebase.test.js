@@ -55,9 +55,54 @@ beforeEach(async () => {
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });
 
-afterEach(() => {
-  if (server) server.close();
-  fs.rmSync(tmp, { recursive: true, force: true });
+/**
+ * Remove the temp tree, tolerating a background git process still writing to it.
+ *
+ * `GET /deployment` deliberately does not fetch inline — it answers from the
+ * refs it has and schedules `git fetch --quiet origin` behind the response, so
+ * the tab's 10-second poll is never blocked on the network (deployment.js,
+ * `remoteFetch`). That fetch is a detached child: it outlives the request, the
+ * response, and `server.close()`, and it keeps writing into `local/.git`.
+ *
+ * Deleting the repository underneath it produced, on CI,
+ * `ENOTEMPTY: directory not empty, rmdir '/tmp/bs-rebase-*\/local/.git'` from
+ * this hook — rimraf empties a directory, git recreates an object or lock file
+ * inside it, and the rmdir fails.
+ *
+ * An earlier attempt waited for `*.lock` files to disappear. That was wrong
+ * twice over: a fetch is not holding a lock for most of its life, so the check
+ * samples quiet moments mid-write; and it busy-spun, burning CPU on a 2-core
+ * runner that the git process itself needed.
+ *
+ * So: retry asynchronously (yielding to the fetch), and if the tree still will
+ * not go, leave it. It is a directory in /tmp on a throwaway runner. A teardown
+ * must never be able to fail a test that passed.
+ */
+async function removeTempTree(dir) {
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      return;
+    } catch (e) {
+      if (Date.now() > deadline) {
+        console.warn(`[test] left ${dir} behind: ${e.code || e.message}`);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+}
+
+afterEach(async () => {
+  // Close the server first: `server.close()` alone only stops NEW connections
+  // and returns immediately, and undici (what `fetch` uses) holds its sockets
+  // open with keep-alive, so a handler could still be mid-request.
+  if (server) {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
+  await removeTempTree(tmp);
 });
 
 const rebase = () => fetch(`${baseUrl}/api/deployment/rebase`, { method: 'POST' });

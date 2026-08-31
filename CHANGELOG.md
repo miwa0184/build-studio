@@ -21,6 +21,250 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-08-31 — The engine stops instead of walking past its own halts
+
+Fail-open paths in the workflow engine, closed together — first the ten in the
+engine's transition logic, then (same day, after an independent review of the
+result) the deeper set at the storage boundary itself: restore, stale saves,
+restarts, a statistics route that wrote, and a guard store that could be reset
+by corruption. Each was reproduced against the unmodified head before anything
+was changed. No product behaviour changes; what changes is what the engine does
+when something has already gone wrong. Design record:
+`docs/plans/a1a-state-correctness-and-transition-authority.md`.
+
+### Changed
+
+- **A blocked task now stops the run instead of being skipped past.** A task that
+  exhausted its fix cycles was marked `blocked`, and the "what runs next" search
+  looked for tasks marked `pending` — so it found nothing, concluded every task
+  was done, marked the step completed and advanced to merge with code a reviewer
+  had refused three times. Nothing downstream re-read the task states, so the
+  refusal simply vanished. The run now halts with a machine-readable
+  TECHNICAL_STOP naming every blocking task and why. If you have a run that was
+  quietly carrying a blocked task, it will stop the next time it tries to move.
+
+- **The dashboard no longer advances workflows on its own.** Two auto-advance
+  policies used to run against the same workflow: the server's, and one in the
+  browser that re-derived the next transition from whatever it had last polled.
+  They disagreed by design, and the browser's ran on page load — opening the app
+  could carry a run past a halt the server had already decided on. The server is
+  now the only thing that advances a run autonomously. Your Auto-advance,
+  Strict and Skip Demo Review checkboxes work exactly as before, and so do the
+  manual Approve / Override / Skip buttons; what changed is that the page you
+  are looking at no longer makes transition decisions of its own.
+
+- **Round and refusal budgets survive restarts, reloads and "another round".**
+  They lived in server process memory and React state, so restarting the server
+  or reloading the page put them back to zero; `another_round` reset the round
+  counter outright. A ceiling of 5 now means exactly five rounds *in that run* —
+  no restart, reload, re-enable or "another round" gives it more. A run that has
+  spent its budget stops with a TECHNICAL_STOP rather than looping on.
+
+- **Force-complete and kill-and-skip can no longer read as an approval.** Both
+  wrote `**Approved:** yes` into the agent's feedback — force-complete over the
+  agent's terminal scrollback, kill-and-skip over a task nobody had done — and
+  every verdict check reads approval by matching that text. Ending a stuck agent
+  therefore produced positive review evidence out of nothing. The output is
+  still kept (it is useful for diagnosis) but is now labelled as operator-
+  generated and never counted as an agent verdict. Force-completed tasks are
+  marked `force_completed` and skipped ones `skipped` — neither counts as
+  verified work, and both leave that task's acceptance coverage unmet.
+
+- **Strict review at its round cap no longer approves findings away.** With
+  findings still open at the cap it fell back to "approve unless blocking". It
+  now stops with the remaining findings as the outcome.
+
+- **Skipping a blocked task marks it skipped, not done.** The operator rescue for
+  a stuck task (`skip_blocked`) recorded it as completed, which made an
+  abandoned task indistinguishable from a finished one. It is now `skipped`,
+  with its acceptance coverage left unmet — the run still moves on, because you
+  decided it should, but nothing downstream counts the task as verified.
+
+- **Tasks nobody verified block the run from claiming their criteria are met.**
+  A skipped or force-completed task no longer auto-advances `ac_verification`,
+  `merge_for_review`, `merge_to_main`, `demo_review` or `device_testing`. You can
+  still advance those steps explicitly; only the automatic path is held, and the
+  reason names the tasks. It is a standing hold, not a refusal — it consumes no
+  budget and will wait indefinitely rather than ending the run. The task list shows them in orange with an
+  "N unverified" count rather than counting them as complete.
+
+- **Fix plans have a task ceiling.** Implementation plans have had one for a long
+  time; fix plans were checked only for being *empty*, so any other length was
+  accepted. The ceiling follows `max_tasks_per_plan` unless you set
+  `max_fix_plan_tasks` separately.
+
+- **The overseer sees more than one problem at a time.** It had a single
+  escalation slot, and five of its six detectors were written "only if nothing
+  else is showing" — so one agent hitting a usage limit hid a merge conflict, a
+  step loop, and every other agent's overrun until someone dismissed the banner.
+  Problems are now tracked as independent, deduplicated incidents. The banner
+  still shows the most urgent one; dismissing it reveals the next rather than
+  clearing everything.
+
+- **The "Cancel" button on a running agent card is gone.** It did not cancel
+  anything: it posted a synthetic completion line as ordinary agent feedback,
+  so the process kept running while the workflow recorded an agent report that
+  no agent wrote and that carried no provenance. Ending a stuck agent is the
+  overseer's force-complete / kill-and-skip, which terminate the process,
+  label the output as operator-generated, and park the run.
+
+- **Terminal stops no longer advertise in-run recovery in their hint text.**
+  Several recovery hints on TECHNICAL_STOP outcomes still said "relaunch the
+  task" or "advance the step explicitly" — advice every route answers 409 to.
+  A terminal hint now names the only real route, the successor repair run.
+
+### Fixed
+
+- **A technically stopped run is parked, and stays parked.** A TECHNICAL_STOP is
+  terminal for the run it stops — for the timer, for the dashboard, and for you.
+  Every action is refused with a machine-readable answer naming the reason code,
+  where it stopped, and the evidence. There is no button that resumes it, and no
+  API route either: relaunching the task, skipping it and acknowledging the halt
+  have all been removed rather than left as dead endpoints.
+
+  Recovery is a *successor repair run* — a new run with its own run id and its
+  own budget. That is also the only honest way to rebuild acceptance coverage
+  for a task nobody verified, which is what the in-place routes could never do:
+  they put the run back on its feet while its coverage gap stayed open and
+  invisible. The successor run itself is A1b; this release makes the stop honest
+  about being terminal.
+
+  The Workflow tab shows a parked run as a status panel — reason code, which
+  task and step, the evidence, and what happens next — with no controls on it.
+
+- **Force-complete and kill-and-skip now park the run.** Both ended the stuck
+  agent and then launched the next task, which turned "this task cannot be
+  completed" into "carry on as though it had been". Everything downstream then
+  rested on work nobody checked. They still terminate the agent, keep its
+  terminal output as untrusted diagnostic evidence, and record an incident — but
+  the run stops, with `TASK_FORCE_COMPLETED_UNVERIFIED` or
+  `TASK_SKIPPED_UNVERIFIED`.
+
+- **A blocked task also stops an explicit advance, not just the timer.** The
+  guard used to sit only in the auto-advance tick, so a restored snapshot — or a
+  run that was already in flight — could be advanced past a blocked task by hand.
+
+- **Three gate refusals no longer end a run.** The per-step and run-wide refusal
+  ceilings shared one number, so the third refusal anywhere in a run was fatal —
+  in about 24 seconds of ticks. Pausing a step (3 refusals on that step) and
+  giving up on a run (15 across it) are separate budgets now; set
+  `max_auto_advance_refusals_total` to change the second.
+
+- **"Another round" at the round cap is refused, not fatal.** It correctly stops
+  granting rounds past the cap, but it was also ending the run — which deleted
+  the other exit that step exists to offer ("move on", which stops the loop
+  instead of extending it). The action is now declined with both options intact.
+
+- **A terminal stop can no longer be restored, saved or restarted away.** The
+  run guard recorded the stop, but nothing enforced it where state actually
+  moves: `POST /workflow/restore` could put back a pre-stop snapshot of the
+  same run — or a different run's snapshot — and the stop and the acceptance
+  gap behind it vanished together; a stale workflow copy that predated the
+  stop loaded as transitionable and saved straight over it; a restart trusted
+  whatever the file said. Terminal truth is now enforced at the storage
+  boundary itself (`attachStateAuthority` in `state.js`): every load projects
+  the guard's stop onto the workflow, every save re-applies it before writing,
+  and restoring anything over a terminal run is refused with the typed
+  refusal, leaving files byte-identical. This closes holes in the "parked, and
+  stays parked" claim earlier in this section — that was true of the routes
+  that checked; it is now true of the boundary every route, timer and overseer
+  write goes through.
+
+- **`GET /workflow/token-stats` no longer reads snapshots through a write
+  path.** It called `restoreSnapshot` per snapshot — a function that replaces
+  workflow-state.json, moves the step-transition tracker, rewrites
+  agent-status.json and broadcasts. (It also read a field `listSnapshots`
+  does not produce, so in practice it summed no snapshots at all; the two
+  bugs hid each other.) Snapshot reading is now a pure `readSnapshot`, and
+  the route both reports snapshot token usage for the first time and touches
+  nothing while doing it.
+
+- **A corrupt or mismatched run-guard file fails closed instead of resetting
+  the run.** An existing guard file that was unreadable, had an
+  unrecognisable schema, or claimed to belong to a different run was silently
+  replaced by an empty document — which renewed every budget and dropped any
+  recorded terminal stop. It now raises a machine-readable
+  `RUN_GUARD_UNREADABLE` error; no transition, save or restore proceeds until
+  the file is repaired, and the corrupt file is left in place as evidence. A
+  *missing* file still simply means a new run.
+
+- **A technical stop that cannot be written to the guard is reported as a
+  failure, never as a successfully parked run.** The park used to log the
+  guard error and answer as if it had taken. It now answers
+  `TECHNICAL_STOP_PERSIST_FAILED`, keeps the run non-transitionable in the
+  meantime (the stop is held at the state boundary and re-applied on every
+  load and save), and writes the guard as soon as it can.
+
+### Added
+
+- **A run-guard store**, at `.build-studio/run-guard/<run-id>.json` in each
+  managed project. Holds the per-run budgets, incidents and terminal outcome,
+  with a revision check so a stale writer cannot roll them back. Written
+  automatically; nothing to configure.
+
+- **TECHNICAL_STOP**, a typed terminal outcome that is explicitly not an
+  approval, not an owner rejection, and cannot be auto-advanced or merged. The
+  dashboard labels it "Technical" so it reads as a fault to fix rather than a
+  decision to make.
+
+- **`max_fix_plan_tasks`** in `.build-studio/config.yaml` — ceiling on tasks in
+  one fix plan. Defaults to `max_tasks_per_plan`.
+
+- **`max_auto_advance_refusals_total`** — how many times gates may refuse to
+  auto-advance across a whole run before it stops. Defaults to five times
+  `max_auto_advance_refusals` (so 15).
+
+### Upgrade steps
+
+**In Build Studio** — rebuild and restart, since both packages changed:
+
+```bash
+cd packages/hub && npx next build
+cd packages/desktop && node inject-resources.js
+```
+
+Then relaunch the Electron app and restart any running project-servers.
+
+**In each managed project** — nothing to do. The run-guard directory is created
+on demand, and existing workflow state is read as before. A run that is
+*currently* in flight will pick up the new gates at its next transition; if it
+is carrying a blocked task it will stop rather than merge, which is the point.
+
+### Known issues
+
+- A run already past a blocked task when you pull will not be retroactively
+  stopped — the gate applies at the next transition it attempts.
+- The per-step auto-advance refusal count still clears when that step genuinely
+  advances. Only the run-wide refusal budget is strictly monotonic.
+- `qa-suite-run.test.js` has a test that fails intermittently under full-suite
+  parallelism. It predates this change and is untouched by it.
+
+### Notes for forks
+
+- Approval must be read through `feedback-provenance.js`, never by matching
+  `**Approved:**` against `agent.feedback` directly. Anything that writes into
+  that field on an agent's behalf has to set `feedbackProvenance`, or it will be
+  trusted as a verdict.
+- Anything that can end `task_execution` goes through
+  `blocked-tasks.js` — do not re-derive "are we done" from task statuses.
+  `blocked` is terminal; `skipped` and `force_completed` finish the task without
+  verifying it.
+- Budgets belong in the run guard, not on the workflow object.
+  `saveWorkflow` writes that object whole with no revision check, so anything
+  stored there can be rolled back by a stale writer.
+- Terminal truth is enforced by the state boundary, not by callers. Read and
+  write workflow state only through the state manager (`attachStateAuthority`
+  in `state.js`); record a stop only through `state.recordTechnicalStop`; do
+  not build a second run-guard path with different semantics — use
+  `state.runGuard`. Anything that only needs to LOOK at a snapshot must use
+  `readSnapshot`, never `restoreSnapshot`.
+- The hub must not decide transitions. It may render state, send an explicit
+  user action, and toggle the server's auto-advance policy — nothing else.
+  `packages/project-server/lib/hub-transition-authority.test.js` enforces this
+  structurally.
+
+---
+
 ## 2026-08-29 — Re-reviewers actually get the diff this time
 
 ### Fixed

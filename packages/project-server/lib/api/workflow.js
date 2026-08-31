@@ -6,7 +6,7 @@ const path = require('path');
 const { stripAnsi, renderPipePaneLog } = require('../tmux');
 const opencodeTelemetry = require('../opencode-telemetry');
 const { transitionFeaturesForPRD, parseBacklogSection, writeBacklogSection, readItem, isValidId, writeItem } = require('../backlog');
-const { deriveNeedsAttention } = require('../needs-attention');
+const { deriveNeedsAttention, ACCEPTANCE_SENSITIVE_STEPS } = require('../needs-attention');
 const { DEFAULT_MAX_REVIEW_ROUNDS } = require('../config');
 const agentRecovery = require('../agent-recovery');
 const learningScope = require('../learning-scope');
@@ -18,6 +18,12 @@ const agentSkills = require('../agent-skills');
 const gateBlocked = require('../gate-blocked');
 const qaSuite = require('../qa-suite-run');
 const { extractFixPlan, checkFeedbackContract, rejectionOutcome, MAX_REJECTIONS } = require('../plan-contract');
+const { RunGuardCorruptError } = require('../run-guard');
+const { attachStateAuthority } = require('../state');
+const runBudgets = require('../run-budgets');
+const blockedTasks = require('../blocked-tasks');
+const { isAgentVerdict } = require('../feedback-provenance');
+const { isTechnicalStop, refusalPayload, TerminalRunError, TechnicalStopPersistError } = require('../technical-stop');
 const { assertInside } = require('../path-guard');
 
 // Common instruction fragments injected into all agent prompts.
@@ -465,6 +471,63 @@ function collectMissingAcArtifacts(acFb, { projectRoot, strict = false, exists }
 function createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast) {
   const router = express.Router();
   const { docsPath, projectRoot, worktreesPath, logsPath } = config;
+
+  /**
+   * The state authority seam — the run guard enforced at the storage boundary.
+   *
+   * The guard (run-guard.js) holds every budget that must not be renewable and
+   * the run's terminal outcome, in its own file with a revision check. What
+   * used to be missing is enforcement: this router consulted the guard where
+   * individual handlers remembered to, while loadWorkflow/saveWorkflow moved
+   * workflow-state.json whole. attachStateAuthority (state.js) closes that —
+   * every load projects the guard's stop, every save re-applies it, and a
+   * guard that cannot be read fails closed. The real state manager arrives
+   * with the seam already attached; attaching here covers a caller that hands
+   * in a bare persistence stub, so there is one behaviour either way.
+   *
+   * statePath is a frozen config key. The budget NUMBERS are read per call,
+   * because config hot-reloads.
+   */
+  attachStateAuthority(state, config);
+  const runGuard = state.runGuard;
+  const budgets = () => runBudgets.resolveBudgets(config);
+
+  /**
+   * Put the run into its typed terminal outcome.
+   *
+   * One write path, at the state boundary: the guard first (so a restart, a
+   * stale save or a restore cannot lose it), then the workflow projection
+   * (for the hub, deriveNeedsAttention, and consumers that only read steps).
+   * The step is `blocked`, which the auto-advance tick already refuses to act
+   * on.
+   *
+   * Throws TechnicalStopPersistError when the guard cannot take the stop —
+   * the run is still left non-transitionable, but the failure surfaces as a
+   * machine-readable error (see the router's error handler) instead of a
+   * response claiming the run was successfully parked.
+   */
+  function applyTechnicalStop(wf, stop) {
+    console.warn(`[workflow] TECHNICAL_STOP ${stop.reasonCode} on ${stop.step} (run ${stop.runId})`);
+    return state.recordTechnicalStop(wf, stop);
+  }
+
+  /**
+   * Record which tasks finished without a verdict, so acceptance cannot claim
+   * them. The caller is responsible for persisting `wf` — this only sets the
+   * field and mirrors it into the guard, which outlives the workflow object.
+   */
+  function recordAcceptanceGaps(wf, gaps) {
+    if (!gaps || gaps.length === 0) return;
+    wf.acceptanceGaps = gaps;
+    try {
+      runGuard.mutate(wf.id, (doc) => { doc.acceptanceGaps = gaps; });
+    } catch (e) {
+      // Not silently: an unwritable guard is the same fault recordTechnicalStop
+      // fails closed on. The gap still rides the workflow object; transitions
+      // that depend on the guard will fail closed on their own.
+      console.error(`[workflow] could not mirror acceptance gaps into the run guard: ${e.message}`);
+    }
+  }
 
   /**
    * Advance any backlog items (Feature, Bug, or Task) linked to this PRD to
@@ -3875,12 +3938,17 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
       }
     }
 
-    // Scan all snapshots — deduplicate by prdId (only count each workflow run once
-    // by using the latest snapshot per workflow id)
+    // Scan all snapshots — deduplicate by prdId (only count each workflow run
+    // once by using the latest snapshot per workflow id). Through the PURE
+    // read: this is a GET, and it used to go through restoreSnapshot — a write
+    // path that replaces workflow-state.json, moves the step tracker, rewrites
+    // agent-status.json and broadcasts. (It also read a `name` field that
+    // listSnapshots does not produce, so it summed nothing at all — the two
+    // bugs hid each other.)
     const seenWfIds = new Set();
     for (const snap of state.listSnapshots()) {
       try {
-        const wf = state.restoreSnapshot(snap.name);
+        const wf = state.readSnapshot(snap.file);
         if (!wf || seenWfIds.has(wf.id)) continue;
         seenWfIds.add(wf.id);
         sumWorkflow(wf);
@@ -3908,6 +3976,15 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
       const wf = state.restoreSnapshot(snapshotFile);
       res.json({ workflow: wf, restored: snapshotFile });
     } catch (e) {
+      // A terminal active run refuses ANY restore — same-run pre-stop snapshots
+      // and other runs' snapshots alike. Restoring is how a stop, and the
+      // acceptance gap behind it, used to be walked back out of existence.
+      if (e instanceof TerminalRunError) {
+        return res.status(409).json({ ...refusalPayload(e.technicalStop), restoreRefused: true });
+      }
+      if (e instanceof RunGuardCorruptError) {
+        return res.status(503).json({ code: e.code, error: e.message, runId: e.runId || null });
+      }
       res.status(400).json({ error: e.message });
     }
   });
@@ -4112,14 +4189,17 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
   // Runs on a timer, checking workflow state and advancing when appropriate.
   let _autoAdvanceTimer = null;
 
-  // Track consecutive auto-advance rejections (HTTP 4xx from /workflow/advance). A gate
-  // that keeps refusing — e.g. qa_tests with no committed tests, or qa_validation.strict
-  // with failing tests — used to loop every 8s with no signal ("approved but stuck"). After
-  // a small ceiling we stash the gate error on the step (wf.steps[x].autoAdvanceError) and
-  // stop hammering, so it surfaces instead of spinning silently. Reset on success, on a
-  // step change, or when auto-advance is re-enabled.
-  let _aaReject = { step: null, count: 0, error: null };
-  const AUTO_ADVANCE_MAX_REJECTS = 3;
+  // Auto-advance rejections (HTTP 4xx from /workflow/advance, or a 200 that
+  // declined). A gate that keeps refusing — qa_tests with no committed tests,
+  // qa_validation.strict with failing tests — used to loop every 8s with no
+  // signal, so a small ceiling pauses it and stashes the reason on the step.
+  //
+  // The counter used to be a `let` in this process, cleared on restart and
+  // deliberately cleared again whenever auto-advance was re-enabled. So the
+  // ceiling meant "three refusals since the last time anything was touched",
+  // which is not a budget. It lives in the run guard now: per step so a step
+  // that genuinely advances gets a clean slate, and per run so a workflow
+  // cannot spend three refusals on each of five steps forever.
 
   /**
    * Record an advance the server refused to act on, and pause once it keeps
@@ -4127,19 +4207,41 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
    * a 200 that declined to do anything (see `declined` below).
    */
   function noteAdvanceRefusal(stepKey, action, errMsg) {
-    _aaReject = _aaReject.step === stepKey
-      ? { step: stepKey, count: _aaReject.count + 1, error: errMsg }
-      : { step: stepKey, count: 1, error: errMsg };
-    console.warn(`[auto-advance] ${stepKey} ${action} refused (#${_aaReject.count}): ${errMsg}`);
-    if (_aaReject.count < AUTO_ADVANCE_MAX_REJECTS) return;
+    let outcome;
+    try {
+      outcome = runBudgets.noteAutoAdvanceRefusal(runGuard, _runId(), stepKey, budgets(), errMsg);
+    } catch (e) {
+      console.error(`[auto-advance] could not record refusal: ${e.message}`);
+      return;
+    }
+    console.warn(`[auto-advance] ${stepKey} ${action} refused (#${outcome.stepCount}): ${errMsg}`);
+    if (!outcome.paused && !outcome.exhausted) return;
     try {
       const w = state.loadWorkflow();
-      if (w && w.steps && w.steps[stepKey]) {
-        w.steps[stepKey].autoAdvanceError = errMsg;
-        state.saveWorkflow(w);
+      if (!w) return;
+      if (w.steps && w.steps[stepKey]) w.steps[stepKey].autoAdvanceError = errMsg;
+      if (outcome.exhausted && outcome.technicalStop && !w.technicalStop) {
+        applyTechnicalStop(w, outcome.technicalStop);
+        return;
       }
-    } catch (_) {}
-    console.warn(`[auto-advance] paused on step=${stepKey} after ${_aaReject.count} refusals — needs manual attention (fix + re-enable, override, or skip)`);
+      state.saveWorkflow(w);
+    } catch (e) {
+      // Fail closed, but never silently: a stop that could not be persisted is
+      // still enforced by the state boundary, and the fault must be visible.
+      console.error(`[auto-advance] could not persist the refusal outcome: ${e.message}`);
+    }
+    console.warn(`[auto-advance] paused on step=${stepKey} after ${outcome.stepCount} refusals — the run's refusal budget is not renewed by restarting or re-enabling; advance the step explicitly once the cause is fixed`);
+  }
+
+  /** The run id every guard counter is keyed by. */
+  function _runId() {
+    try { return (state.loadWorkflow() || {}).id || 'no-run'; } catch (_) { return 'no-run'; }
+  }
+
+  /** Has this step already spent its refusal budget? */
+  function stepRefusalsSpent(wf, stepKey) {
+    const b = budgets();
+    return runGuard.count(wf.id, `${runBudgets.COUNTERS.AUTO_ADVANCE_REFUSALS}:${stepKey}`) >= b.maxAutoAdvanceRefusals;
   }
 
   function startAutoAdvanceTimer() {
@@ -4167,13 +4269,51 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     const step = wf.steps[wf.currentStep];
     if (!step) return;
 
+    // A guard that cannot be verified means the run's terminal truth is
+    // unknowable — the timer must not act until a human has repaired it. The
+    // timer keeps ticking so a repaired guard resumes without a restart.
+    if (wf.guardUnverifiable) return;
+
+    // A run that already stopped does not get advanced by a timer. The stop is
+    // projected from the run guard on every load, so a stale workflow file
+    // cannot hide it from this check.
+    if (isTechnicalStop(wf.technicalStop) || wf.currentStep === 'technical_stop') {
+      stopAutoAdvanceTimer();
+      return;
+    }
+
+    // A task blocked mid-run stops the tick wherever the run currently sits, not
+    // only at task_execution — a manual advance or a restored snapshot can leave
+    // the run on a later step with the blocked task still there.
+    {
+      const stop = blockedTasks.blocksTransition(wf);
+      if (stop) { applyTechnicalStop(wf, stop); return; }
+    }
+
+    // A task that finished without a verdict does not stop the run — an
+    // operator decided to skip or force-complete it — but it must stop the run
+    // from AUTONOMOUSLY asserting that its acceptance criteria are met, or from
+    // merging on the strength of that assertion. Recording the gap and never
+    // reading it would have left the coverage claim exactly as false as before.
+    // A person can still advance these steps explicitly; only the timer is
+    // refused.
     // Don't keep hammering a step the gate has repeatedly rejected — it's surfaced via
-    // step.autoAdvanceError and needs manual attention (fix + re-enable, override, or skip).
-    if (_aaReject.step === wf.currentStep && _aaReject.count >= AUTO_ADVANCE_MAX_REJECTS) return;
+    // step.autoAdvanceError and needs manual attention (fix the cause, then advance
+    // explicitly; the refusal budget is spent for this run).
+    if (stepRefusalsSpent(wf, wf.currentStep)) return;
 
     const agents = step.agents || [];
     const allDone = agents.length > 0 && agents.every(a => a.status === 'done' || a.status === 'error');
     const isPending = step.status === 'pending' && agents.length === 0;
+
+    // Only an agent's OWN feedback is a verdict. Force-complete and
+    // kill-and-skip write into the same field, and used to write an
+    // `**Approved:** yes` header while doing it — so an operator ending a
+    // runaway agent produced an approval the tick then acted on. Provenance is
+    // structured (feedback-provenance.js) precisely because the text cannot be
+    // trusted to describe its own origin: a pane echoes the prompt, and the
+    // prompt contains the format example.
+    const verdictAgents = agents.filter(isAgentVerdict);
 
     // Steps that always require manual intervention — owner_consultations is
     // the manual gate where the owner reviews PM output and provides notes;
@@ -4183,6 +4323,40 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     const alwaysManual = ['device_testing', 'owner_consultations'];
     if (!wf.autoAdvanceSkipDemoReview) alwaysManual.push('demo_review');
     if (alwaysManual.includes(wf.currentStep)) return;
+
+    // A task nobody verified holds this step against the TIMER — and only the
+    // timer. An operator can still advance it explicitly to accept the gap.
+    //
+    // This is a standing condition, not a refusal, and the difference is the
+    // whole point: a refusal is an event that spends budget, and the first cut
+    // of this gate called noteAdvanceRefusal on every 8-second tick against a
+    // condition that never clears on its own. That burned the run-wide refusal
+    // budget in about two minutes and terminally stopped a run whose only sin
+    // was an operator legitimately skipping a task — reintroducing exactly the
+    // failure the budget separation had just removed. A hold spends nothing and
+    // waits.
+    if (ACCEPTANCE_SENSITIVE_STEPS.has(wf.currentStep)) {
+      const gaps = blockedTasks.findAcceptanceGaps(wf);
+      if (gaps.length > 0) {
+        // Says what is true and nothing more. It used to promise "relaunch them
+        // for a real verdict" — a route that did not exist: an unverified task
+        // is not relaunchable, and the operator actions that create these gaps
+        // now park the run outright. Coverage comes back from a successor
+        // repair run, or the operator advances explicitly and owns the gap.
+        const detail = `${gaps.length} task(s) finished without an agent verdict `
+          + `(${gaps.map((g) => `#${g.index + 1} ${g.name}`).join(', ')}) — acceptance coverage is unmet, so `
+          + `${wf.currentStep} will not auto-advance. A real verdict for those tasks needs a successor repair `
+          + 'run; advancing this step explicitly accepts the gap as it stands.';
+        if (step.acceptanceHold !== detail) {
+          step.acceptanceHold = detail;
+          recordAcceptanceGaps(wf, gaps);
+          state.saveWorkflow(wf);
+          console.warn(`[auto-advance] holding ${wf.currentStep}: ${detail}`);
+        }
+        return;
+      }
+      if (step.acceptanceHold) { delete step.acceptanceHold; state.saveWorkflow(wf); }
+    }
 
     // Review steps used below for verdict-based routing (send_to_devs on blocking).
     // coverage_matrix is intentionally NOT here — it is advisory (its findings are
@@ -4222,7 +4396,7 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     } else if (allDone) {
       // Detect verdict from agent feedback (server-side detectVerdict)
       const qaStrict = (config.qa_validation && config.qa_validation.strict) !== false;
-      const hasBlocking = wf.currentStep === 'qa_tests' ? false : agents.some(a => {
+      const hasBlocking = wf.currentStep === 'qa_tests' ? false : verdictAgents.some(a => {
         if (!a.feedback) return false;
         const fb = a.feedback;
         // PRD-002: qa_validation strict mode treats ANY failing test as blocking,
@@ -4264,6 +4438,15 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
       const isReviewStep = reviewSteps.includes(wf.currentStep);
       const isReviewFlowStep = ['reviewing', 'team_review'].includes(wf.currentStep);
 
+      // A review step where nothing an agent wrote survives the provenance
+      // filter has no verdict to approve on. Refuse rather than read an
+      // operator's diagnostic output as a clean review.
+      if ((isReviewStep || isReviewFlowStep) && agents.length > 0 && verdictAgents.length === 0) {
+        noteAdvanceRefusal(wf.currentStep, 'approve',
+          `no agent verdict on ${wf.currentStep}: all ${agents.length} agent(s) carry operator-generated feedback, which is diagnostic evidence and never an approval`);
+        return;
+      }
+
       // Strict auto-advance (review workflows, opt-in checkbox): ANY reported
       // finding — medium/low included, or a non-approval — sends the round back
       // to PM instead of approving. Default behavior only bounces on blocking.
@@ -4272,18 +4455,45 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
       // blocking). Scoped to the 'reviewing' step — that's where send_to_pm lives.
       let strictEscalate = false;
       if (wf.autoAdvanceStrict && wf.currentStep === 'reviewing' && !hasBlocking) {
-        const maxRounds = config.max_review_rounds || DEFAULT_MAX_REVIEW_ROUNDS;
-        const anyFindings = agents.some(a => {
+        const b = budgets();
+        const findings = [];
+        const anyFindings = verdictAgents.some(a => {
           const fb = a.feedback;
           if (!fb) return false;
-          if (/\*\*Approved:\*\*\s*no\b/i.test(fb)) return true;
+          if (/\*\*Approved:\*\*\s*no\b/i.test(fb)) { findings.push(`${a.role}: Approved: no`); return true; }
           return [/\*\*Blocking:\*\*\s*(\d+)/i, /\*\*Medium:\*\*\s*(\d+)/i, /\*\*Low:\*\*\s*(\d+)/i]
-            .some(re => { const m = fb.match(re); return m && parseInt(m[1]) > 0; });
+            .some(re => {
+              const m = fb.match(re);
+              if (m && parseInt(m[1]) > 0) { findings.push(`${a.role}: ${m[0]}`); return true; }
+              return false;
+            });
         });
-        strictEscalate = anyFindings && (wf.round || 1) < maxRounds;
-        if (anyFindings && !strictEscalate) {
-          console.log(`[auto-advance] strict: findings remain but round cap reached (${wf.round}/${maxRounds}) — approving`);
+
+        // At the cap with findings still open, this used to fall back to
+        // "approve unless blocking" — the log line said so itself: "findings
+        // remain but round cap reached — approving". Reaching a cap is a fact
+        // about the budget, not about the code, so it cannot mean approval.
+        // The guard counter starts at 0 while wf.round starts at 1, so the
+        // counter lags the round by one for the whole run. Reading the counter
+        // alone meant the cap condition could never be true while the run was
+        // still ON the reviewing step — the technical-stop branch was
+        // unreachable, and the fail-open closed only by falling through to
+        // review_cap_reached. Take whichever is further along.
+        const roundsUsed = Math.max(
+          runGuard.count(wf.id, runBudgets.COUNTERS.REVIEW_ROUNDS),
+          wf.round || 1,
+        );
+        const outcome = runBudgets.strictReviewOutcome({
+          hasFindings: anyFindings,
+          roundsUsed,
+          budgets: b,
+          ctx: { runId: wf.id, step: wf.currentStep, findings },
+        });
+        if (outcome.kind === 'technical_stop') {
+          applyTechnicalStop(wf, outcome.technicalStop);
+          return;
         }
+        strictEscalate = outcome.kind === 'escalate';
       }
 
       if (hasBlocking && isReviewStep) {
@@ -4333,8 +4543,10 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
           return;
         }
 
-        // Success — clear any rejection state for this step and continue the chain.
-        if (_aaReject.step === wf.currentStep) _aaReject = { step: null, count: 0, error: null };
+        // Success — this step genuinely advanced, so its refusal count is
+        // cleared. That is progress, not renewal: the run-wide budget is
+        // untouched and stays spent.
+        try { runBudgets.clearStepRefusals(runGuard, wf.id, wf.currentStep); } catch (_) {}
         if (result.needsAdvance) {
           // Fire the follow-up launch IMMEDIATELY, not on a timer. A backgrounded
           // project-server naps the instant this response socket closes, and a
@@ -4376,12 +4588,16 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     // Auto-advance off → clear the skip flag (checkbox is disabled/unchecked in UI).
     if (req.body.enabled === false) wf.autoAdvanceSkipDemoReview = false;
     const enabled = !!wf.autoAdvance;
-    if (enabled) {
-      // Re-enabling is the owner's "try again" — clear any prior rejection pause + stashed
-      // error so a step that previously stalled gets a fresh attempt.
-      _aaReject = { step: null, count: 0, error: null };
-      const cur = wf.steps && wf.steps[wf.currentStep];
-      if (cur && cur.autoAdvanceError) delete cur.autoAdvanceError;
+    // Re-enabling used to clear the refusal counter — the owner's "try again".
+    // That made the ceiling renewable by clicking a checkbox, which is the whole
+    // reason a runaway loop could keep running. The budget is now the run's, and
+    // toggling a policy does not buy more of it. The manual advance/override/skip
+    // buttons are unaffected: they are explicit actions, not autonomy.
+    if (enabled && wf.id) {
+      const spent = runGuard.count(wf.id, runBudgets.COUNTERS.AUTO_ADVANCE_REFUSALS);
+      if (spent > 0) {
+        console.warn(`[auto-advance] re-enabled with ${spent} refusal(s) already spent this run — the budget is not restored`);
+      }
     }
     state.saveWorkflow(wf);
     if (enabled) startAutoAdvanceTimer();
@@ -4415,10 +4631,78 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     return res.json({ status: 'none' });
   });
 
+  /**
+   * A parked run has no transitions — not even for a person.
+   *
+   * This used to hold a set of "recovery actions" a person could still take:
+   * relaunch the task, skip it, acknowledge the halt. Every one of them was a
+   * way for a run that had failed closed to be walked back open, and each had
+   * to answer a question none of them could — whether the original cause had
+   * actually gone. It had not: `acceptanceCovered` went false and nothing set
+   * it true, so a "recovered" run carried a permanent gap while reporting
+   * itself healthy, and three review rounds each found a different route into
+   * that state.
+   *
+   * So the answer is the same for everyone now, which is what makes it
+   * checkable: the run is parked, and recovery is a successor repair run with
+   * its own run id and its own budget (A1b). Not implemented here — this
+   * mandate only makes the stop honest about being terminal.
+   */
+
   router.post('/workflow/advance', (req, res) => {
     const { action, notes } = req.body;
     const wf = state.loadWorkflow();
     if (!wf) return res.status(404).json({ error: 'no active workflow' });
+
+    // --- An unverifiable guard has no transitions either ---
+    //
+    // The guard file exists but cannot be read, so whether this run is
+    // terminal is unknowable. Fail closed with the same machine-readable
+    // answer every save gives, before any handler can mutate anything.
+    if (wf.guardUnverifiable) {
+      return res.status(503).json({
+        code: 'RUN_GUARD_UNREADABLE',
+        error: `The run guard for ${wf.id} exists but cannot be verified — no transition can proceed until it is repaired. ${wf.guardUnverifiable.error}`,
+        workflow: wf,
+      });
+    }
+
+    // --- A stopped run has no transitions, only recovery ---
+    //
+    // The terminality used to be incidental: nothing matched the step key
+    // 'technical_stop', so handlers fell through to "no valid transition". That
+    // is not a guarantee — it holds only until someone adds a handler, or a
+    // restored snapshot puts the run on a step that does have one. Refuse here,
+    // before any handler can mutate anything. loadWorkflow projects the stop
+    // from the run guard, so a stale workflow file cannot slip past this; a
+    // stop the workflow carries but the guard does not know yet (a run that was
+    // in flight when it landed) is made durable through the one write path.
+    if (isTechnicalStop(wf.technicalStop)) {
+      try {
+        if (!state.authoritativeStop(wf.id)) {
+          state.recordTechnicalStop(wf, wf.technicalStop);
+        }
+      } catch (e) {
+        // The refusal below stands either way; the boundary keeps enforcing
+        // the stop in memory until the guard can hold it.
+        console.error(`[workflow] could not mirror the workflow-carried stop into the run guard: ${e.message}`);
+      }
+      return res.status(409).json({ ...refusalPayload(wf.technicalStop), workflow: wf });
+    }
+
+    // A blocked task with no stop recorded against it stops an explicit advance
+    // too. The tick asks blocksTransition; this route did not, so terminality
+    // held by convention — nothing matched the step key 'technical_stop' — and
+    // not by a guard. A restored snapshot, a run already in flight when this
+    // landed, or any future path that marks a task blocked without going through
+    // taskExecutionOutcome would have walked straight to merge.
+    {
+      const stop = blockedTasks.blocksTransition(wf);
+      if (stop) {
+        applyTechnicalStop(wf, stop);
+        return res.status(409).json({ ...refusalPayload(stop), workflow: wf });
+      }
+    }
 
     // --- Relaunch: reset current step and re-enter it ---
     if (action === 'relaunch') {
@@ -4735,11 +5019,35 @@ Use the /${role.skill} skill. Commit your changes when done. ${COMMIT_ON_CURRENT
   }
 
   function launchNextTask(wf) {
-    const tasks = wf.taskPlan.tasks;
-    const tex = wf.taskExecution;
-    // Find first pending task
-    const idx = tasks.findIndex((_, i) => tex.taskStates[String(i)]?.status === 'pending');
-    if (idx === -1) {
+    // The old selection was `findIndex(status === 'pending')`, and "no pending
+    // task left" was taken to mean "every task is done". A task that exhausted
+    // its fix cycles is `blocked`, which is also not `pending` — so the search
+    // came up empty for the wrong reason and the step reported completed. The
+    // run then advanced to merge_for_review carrying code a reviewer had refused
+    // three times, and nothing downstream re-read the task states.
+    //
+    // blocked-tasks.js answers the question explicitly instead: launch, finish,
+    // or stop — and `blocked` is terminal.
+    const outcome = blockedTasks.taskExecutionOutcome(wf);
+
+    if (outcome.kind === 'technical_stop') {
+      recordAcceptanceGaps(wf, outcome.acceptanceGaps);
+      applyTechnicalStop(wf, outcome.technicalStop);
+      return;
+    }
+
+    if (outcome.kind === 'launch_next') {
+      launchTaskImpl(wf, outcome.nextIndex);
+      state.saveWorkflow(wf);
+      return;
+    }
+
+    // outcome.kind === 'complete' — every task reached a terminal state and none
+    // of them is blocked. Tasks an operator skipped or force-completed do not
+    // stop the step (a person decided that), but they are recorded so nothing
+    // downstream can claim their acceptance criteria are covered.
+    recordAcceptanceGaps(wf, outcome.acceptanceGaps);
+    {
       wf.steps.task_execution.status = 'completed';
       const fakeRes = { json: () => {}, status: () => ({ json: () => {} }) };
       // Bugfix has no merge_for_review step and runs the single fix task directly
@@ -4764,10 +5072,7 @@ Use the /${role.skill} skill. Commit your changes when done. ${COMMIT_ON_CURRENT
       try { mergeDevBranches(wf, fakeRes); } catch (e) {
         console.error('[workflow] merge after task execution failed:', e.message);
       }
-      return;
     }
-    launchTaskImpl(wf, idx);
-    state.saveWorkflow(wf);
   }
 
   function launchTaskReview(wf, taskIdx) {
@@ -5027,22 +5332,40 @@ Fix only the issues raised. Commit your changes.`,
           !(/no blocking/i.test(reviewFeedback) || /0 blocking/i.test(reviewFeedback))
         );
 
-        if (hasBlockingIssues && (ts2.fixCycles || 0) < MAX_FIX_CYCLES) {
+        // The cycle budget is the run guard's. `ts2.fixCycles` lives on the
+        // workflow object, which a stale whole-object save can roll back — the
+        // exact shape the guard exists to remove — so it is kept only as the
+        // number the prompt and the UI display. The guard's count is what
+        // decides whether another cycle is allowed.
+        const cyclesSpent = runGuard.count(wf2.id, runBudgets.COUNTERS.taskFixCycles(taskIdx));
+        const cyclesUsed = Math.max(cyclesSpent, ts2.fixCycles || 0);
+        const cycleBudget = budgets().maxTaskFixCycles;
+
+        if (hasBlockingIssues && cyclesUsed < cycleBudget) {
           // Record fix history for context in next cycle
           if (!ts2.fixHistory) ts2.fixHistory = [];
           ts2.fixHistory.push({
             reviewFeedback: reviewFeedback.slice(0, 800),
             fixSummary: (ts2.agents || []).find(a => a.feedback && a.status === 'done')?.feedback?.slice(0, 400) || null,
           });
-          ts2.fixCycles = (ts2.fixCycles || 0) + 1;
-          console.log(`[workflow] Task ${taskIdx + 1} has blocking issues. Fix cycle ${ts2.fixCycles}/${MAX_FIX_CYCLES}.`);
+          const spend = runBudgets.consumeTaskFixCycle(runGuard, wf2.id, taskIdx, budgets());
+          ts2.fixCycles = spend.used;
+          console.log(`[workflow] Task ${taskIdx + 1} has blocking issues. Fix cycle ${ts2.fixCycles}/${cycleBudget}.`);
           launchTaskFix(wf2, taskIdx, reviewFeedback);
           state.saveWorkflow(wf2);
         } else {
-          // No blocking issues or max fix cycles reached → mark task done
-          if ((ts2.fixCycles || 0) >= MAX_FIX_CYCLES) {
-            console.log(`[workflow] Task ${taskIdx + 1} hit max fix cycles (${MAX_FIX_CYCLES}). Marking done.`);
+          // No blocking issues left, or the task ran out of fix cycles.
+          //
+          // The second case is not a completion. The reviewer refused this task
+          // on every cycle it was allowed, so `blocked` is terminal now: the
+          // gate in launchNextTask turns it into a TECHNICAL_STOP rather than
+          // letting the run walk past it into merge.
+          if (cyclesUsed >= cycleBudget) {
+            const reason = `reached max fix cycles (${cyclesUsed}/${cycleBudget}) with blocking review findings still open`;
+            console.warn(`[workflow] Task ${taskIdx + 1} ${reason} — blocking the run.`);
             ts2.status = 'blocked';
+            ts2.blockedReason = reason;
+            ts2.acceptanceCovered = false;
           } else {
             ts2.status = 'done';
           }
@@ -5954,6 +6277,11 @@ Fix only the issues raised. Commit your changes.`,
     if (wf.currentStep === 'pm_fix' && action === 'approve') {
       wf.steps.pm_fix.status = 'completed';
       wf.round++;
+      // The budget is the run's, counted on disk. wf.round is the label on the
+      // round — `another_round` may reset it, and did — so the cap below still
+      // reads wf.round for the message the owner sees, while the decision about
+      // whether another round is affordable comes from the guard.
+      runBudgets.consumeReviewRound(runGuard, wf.id, budgets(), { step: 'reviewing' });
 
       // Hard cap: STOP and wait for a decision. Hitting the cap is not a
       // verdict on the PRD — it only says the loop has run as long as the owner
@@ -5996,6 +6324,20 @@ Fix only the issues raised. Commit your changes.`,
     if (wf.currentStep === 'review_cap_reached') {
       const rounds = (wf.steps.review_cap_reached && wf.steps.review_cap_reached.rounds) || wf.round;
       if (action === 'another_round') {
+        // Another round is only available if the RUN can still afford one. The
+        // cap used to be checked against wf.round, which this path reset, so a
+        // ceiling of five meant five rounds since the last click.
+        const spend = runBudgets.consumeReviewRound(runGuard, wf.id, budgets(), { step: 'reviewing' });
+        if (!spend.allowed) {
+          // Refused, not stopped — see the execution fix loop below for why.
+          // "Move on to companion specs" stays reachable, and it is the exit
+          // that does not spend another round.
+          return res.status(409).json({
+            workflow: wf,
+            error: `${spend.technicalStop.recoveryHint} "Move on" is still available: it stops reviewing and writes companion specs.`,
+            budgetExhausted: { counter: 'review_rounds', used: spend.used, max: spend.max },
+          });
+        }
         wf.steps.review_cap_reached.status = 'skipped';
         wf.currentStep = 'reviewing';
         wf.steps.reviewing = { status: 'pending', agents: [] };
@@ -6285,8 +6627,29 @@ Fix only the issues raised. Commit your changes.`,
       const rounds = (wf.steps.review_cap_reached && wf.steps.review_cap_reached.rounds) || wf.round;
       const source = wf.fixSource || wf.returnTo || 'code_review';
       if (action === 'another_round') {
+        // `wf.round = 1` used to sit here, with the comment "restart the
+        // budget" — and every cap check reads wf.round, so it did exactly that.
+        // Simulated against the old code, twenty rounds ran under a cap of five
+        // via four clicks. The run's fix-round budget is now counted on disk and
+        // is not renewable inside the run; wf.round stays as the loop's own
+        // label so the per-loop routing and the UI still read the way they did.
+        const spend = runBudgets.consumeFixRound(runGuard, wf.id, budgets(), { step: source, fixSource: wf.fixSource });
+        if (!spend.allowed) {
+          // Refuse the action; do NOT stop the run. review_cap_reached exists
+          // precisely because the engine must not pick between "go round again"
+          // and "stop reviewing" — and its OTHER exit (approve/skip, which
+          // records a capOverride and re-enters the source step) is the one that
+          // does not spend more budget. Applying a terminal stop here deleted
+          // that exit, so clicking a button the UI still offers turned an
+          // owner-decidable state into a dead run.
+          return res.status(409).json({
+            workflow: wf,
+            error: `${spend.technicalStop.recoveryHint} "Move on" is still available: it stops the loop rather than running another round.`,
+            budgetExhausted: { counter: 'fix_rounds', used: spend.used, max: spend.max },
+          });
+        }
         wf.steps.review_cap_reached.status = 'skipped';
-        wf.round = 1; // the cap counts rounds since the loop began; restart the budget
+        wf.round = 1; // loop label only — the budget above is what bounds the loop
         wf.currentStep = source;
         wf.steps[source] = { status: 'pending', agents: [] };
         state.saveWorkflow(wf);
@@ -7070,9 +7433,19 @@ ${EFFICIENCY_INSTRUCTIONS}`,
       // Tests belong inside their implementation task, not in a downstream
       // "test phase". Cap at 25 to force bundling; configurable via
       // `max_tasks_per_plan` in config.yaml if a specific project needs more.
-      const maxTasksPerPlan = (config && Number(config.max_tasks_per_plan)) || 25;
-      if ((taskPlan.tasks || []).length > maxTasksPerPlan) {
-        const n = taskPlan.tasks.length;
+      //
+      // The number now comes from run-budgets.js, which is also where the fix
+      // plan's ceiling reads it from — the two used to be one enforced ceiling
+      // and one that did not exist. This gate stays a REJECTION rather than a
+      // terminal stop: re-planning is a real way out of an oversized plan, and
+      // the ceiling is re-checked on every attempt, so it cannot be spent down.
+      const maxTasksPerPlan = budgets().maxTasksPerPlan;
+      const planCeiling = runBudgets.checkTaskPlanCeiling(taskPlan.tasks || [], budgets(), { runId: wf.id, step: 'planning' });
+      if (!planCeiling.ok) {
+        const n = planCeiling.count;
+        try {
+          runGuard.mutate(wf.id, (doc) => { doc.counters.task_plan_rejections = Number(doc.counters.task_plan_rejections || 0) + 1; });
+        } catch (_) {}
         const msg = `Plan rejected — ${n} tasks exceeds ceiling of ${maxTasksPerPlan}. Most common cause: separate test-writing tasks for each AC. Tests for a given surface belong INSIDE the task that implements the surface, not as standalone tasks afterward. Re-run planner with explicit instruction: "Merge each XCUITest-writing task into the task that implements the corresponding view/screen/flow." If the merged plan still exceeds ${maxTasksPerPlan}, the PRD is too large for one workflow — split it.`;
         wf.steps.planning.status = 'blocked';
         wf.steps.planning.validationFailure = {
@@ -7212,6 +7585,13 @@ ${EFFICIENCY_INSTRUCTIONS}`,
         const ts = tex?.taskStates[String(tIdx)];
         if (!ts) return res.status(400).json({ error: `Task ${tIdx} not found` });
         const phase = ts.status;
+        // Transient states only. `blocked`, `skipped`, `aborted` and
+        // `force_completed` are deliberately absent: each of them means the run
+        // is parked, and relaunching a task inside a parked run is the in-place
+        // recovery this model removed. A fresh attempt at that task belongs to a
+        // successor repair run, which can also rebuild the acceptance evidence
+        // the original attempt never produced. (The terminal guard above refuses
+        // these before they reach here; this is the second lock on the door.)
         if (!['running', 'error', 'pending'].includes(phase)) {
           return res.status(400).json({ error: `Task ${tIdx} is not in a relaunchable phase (${phase})` });
         }
@@ -7239,21 +7619,12 @@ ${EFFICIENCY_INSTRUCTIONS}`,
         return res.json({ workflow: wf });
       }
 
-      // Skip a blocked/errored task (user-initiated rescue)
-      if (action === 'skip_blocked' && body.taskIndex !== undefined) {
-        const tex = wf.taskExecution;
-        const tIdx = Number(body.taskIndex);
-        const ts = tex?.taskStates[String(tIdx)];
-        if (!ts || !['blocked', 'error'].includes(ts.status)) {
-          return res.status(400).json({ error: `Task ${tIdx} is not blocked or errored` });
-        }
-        ts.status = 'done';
-        ts.completedAt = ts.completedAt || new Date().toISOString();
-        updateStepAgents(wf);
-        state.saveWorkflow(wf);
-        launchNextTask(wf);
-        return res.json({ workflow: wf });
-      }
+      // `skip_blocked` used to live here: it took a blocked task, marked it
+      // skipped, and carried the same run on. That is in-place recovery of a
+      // parked run — the pattern this model removed — and it was also the last
+      // route that could put a blocked task behind the run without anything
+      // ever re-verifying it. A blocked task now parks the run, and the next
+      // attempt is a successor repair run.
     }
 
     // API contract step — Architect defines API contracts before frontend/backend implement in parallel
@@ -7580,8 +7951,13 @@ Report honestly. Note: this step does NOT block — even Approved: no advances t
 
       // Check if E2E tests were already run during task execution (e.g. a "verify E2E" task)
       const taskStates = wf.taskExecution?.taskStates || {};
+      // isAgentVerdict, not just `a.feedback`: a force-completed agent's body
+      // is 2000 characters of captured pane, and a pane that scrolled past a
+      // Playwright invocation would match the filter below. That would tell QA
+      // "E2E already ran — do NOT re-run them" on the strength of terminal
+      // output nobody verified. Operator diagnostics are never test evidence.
       const taskE2EFeedback = Object.values(taskStates)
-        .flatMap(ts => (ts.agents || []).filter(a => a.feedback))
+        .flatMap(ts => (ts.agents || []).filter(a => a.feedback && isAgentVerdict(a)))
         .filter(a => /e2e|playwright|\.spec\./i.test(a.instruction || '') || /e2e|playwright|\.spec\./i.test(a.feedback || ''))
         .map(a => a.feedback).join('\n');
       const e2eAlreadyRan = taskE2EFeedback.length > 200; // substantial E2E feedback exists
@@ -8954,6 +9330,27 @@ Before adding new entries, scan existing files in docs/learnings/:
         return res.status(400).json({ error: 'No valid fix plan found in planner feedback. The fix planner must output a ```json code block with a tasks array. Relaunch the fix plan step.' });
       }
 
+      // The implementation plan has had a task ceiling for a long time — the
+      // planning gate refuses a plan past `max_tasks_per_plan` and says a PRD
+      // that large should be split. The fix plan had no upper bound at all: it
+      // was filtered, normalised, and checked for being EMPTY, and any other
+      // length was accepted. A fix planner that decomposes findings finely
+      // enough could therefore hand a single run an unbounded task list.
+      //
+      // Same ceiling, for the same reason. It defaults to max_tasks_per_plan
+      // rather than a separately-guessed number: a fix plan is a plan for the
+      // same run against the same PRD, and a second bound would drift from the
+      // first. `max_fix_plan_tasks` separates them where a project needs it.
+      {
+        const ceiling = runBudgets.checkFixPlanCeiling(fixPlan.tasks, budgets(), { runId: wf.id, step: 'fix_plan' });
+        if (!ceiling.ok) {
+          wf.steps.fix_plan.status = 'blocked';
+          wf.steps.fix_plan.error = `Fix plan rejected — ${ceiling.count} tasks exceeds the ceiling of ${ceiling.max}. ${ceiling.technicalStop.recoveryHint}`;
+          applyTechnicalStop(wf, ceiling.technicalStop);
+          return res.status(400).json({ error: wf.steps.fix_plan.error, technicalStop: ceiling.technicalStop, workflow: wf });
+        }
+      }
+
       // 0 tasks is ambiguous: either everything is clean (legit shortcut) or the
       // planner had no input feedback to plan against. Distinguish by checking
       // whether the source step actually produced findings — if not, block here
@@ -9232,6 +9629,7 @@ ${FIX_EXECUTION_EFFICIENCY_INSTRUCTIONS}${STRUCTURED_FEEDBACK_INSTRUCTIONS}`,
           fixStep.status = 'completed';
           wf.fixTaskIndex = fixPlan.tasks.length; // mark all done so the existing "all tasks done" path picks up
           wf.round++;
+          runBudgets.consumeFixRound(runGuard, wf.id, budgets(), { step: 'fix_execution', fixSource: wf.fixSource });
 
           if (wf.round > MAX_REVIEW_ROUNDS) {
             wf.currentStep = 'review_cap_reached';
@@ -9253,6 +9651,7 @@ ${FIX_EXECUTION_EFFICIENCY_INSTRUCTIONS}${STRUCTURED_FEEDBACK_INSTRUCTIONS}`,
       if (currentIdx >= fixPlan.tasks.length) {
         fixStep.status = 'completed';
         wf.round++;
+        runBudgets.consumeFixRound(runGuard, wf.id, budgets(), { step: 'fix_execution', fixSource: wf.fixSource });
 
         if (wf.round > MAX_REVIEW_ROUNDS) {
           console.log(`[workflow] Fix loop capped at ${MAX_REVIEW_ROUNDS} rounds (source: ${wf.fixSource}). Blocking — requires user decision.`);
@@ -9356,6 +9755,7 @@ ${FIX_EXECUTION_EFFICIENCY_INSTRUCTIONS}${STRUCTURED_FEEDBACK_INSTRUCTIONS}`,
           // All fix tasks done — merge and go to code_review
           fixStep.status = 'completed';
           wf.round++;
+          runBudgets.consumeFixRound(runGuard, wf.id, budgets(), { step: 'fix_execution', fixSource: wf.fixSource });
 
           if (wf.round > MAX_REVIEW_ROUNDS) {
             console.log(`[workflow] Fix loop capped at ${MAX_REVIEW_ROUNDS} rounds (source: ${wf.fixSource}). Blocking.`);
@@ -9395,6 +9795,27 @@ ${FIX_EXECUTION_EFFICIENCY_INSTRUCTIONS}${STRUCTURED_FEEDBACK_INSTRUCTIONS}`,
 
     return res.status(400).json({ error: `no valid transition for step=${wf.currentStep} action=${action}` });
   }
+
+  // Typed authority failures thrown anywhere in this router — a guard that
+  // cannot be read, a stop that could not be made durable, a terminal run
+  // something tried to replace — surface as machine-readable refusals rather
+  // than an HTML 500. Failing closed only counts if the caller can tell WHY.
+  router.use((err, req, res, next) => {
+    if (err instanceof TechnicalStopPersistError) {
+      return res.status(503).json({
+        code: err.code,
+        error: err.message,
+        technicalStop: err.technicalStop || null,
+      });
+    }
+    if (err instanceof RunGuardCorruptError) {
+      return res.status(503).json({ code: err.code, error: err.message, runId: err.runId || null });
+    }
+    if (err instanceof TerminalRunError) {
+      return res.status(409).json(refusalPayload(err.technicalStop));
+    }
+    next(err);
+  });
 
   return router;
 }

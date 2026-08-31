@@ -1,0 +1,250 @@
+# Plan: A1a — state correctness and a single autonomous transition authority
+
+> **Status: implemented 2026-08-31.** Ten verified fail-open paths in the
+> workflow engine, each reproduced against the unchanged head before anything
+> was written. This is the first of three technical slices (A1a/A1b/A1c) and
+> carries no product change.
+
+Owner request: before budgets, no-progress detection and acceptance receipts are
+built on top of the workflow engine, close the paths where the engine already
+walks past its own halts. An autonomy layer inherits whatever the state machine
+underneath it will let through, so the fail-opens have to go first.
+
+## The shape of the problem
+
+The ten defects are not ten unrelated bugs. They fall into four groups, and each
+group has one cause.
+
+**A halt that no reader treats as terminal.** A task that exhausts its fix
+cycles is marked `blocked`, and `launchNextTask` looks for the next task with
+status `pending`. `blocked` is not `pending`, so the search comes up empty — for
+the wrong reason — and the step reports completed. The run then advances to
+`merge_for_review` carrying code a reviewer refused three times, and nothing
+downstream re-reads the task states. `deriveNeedsAttention`, the one function
+every consumer asks "does this need a human?", reads *step* status, so it
+answered `null` about that run.
+
+**Budgets kept where the loop can reach them.** The auto-advance refusal counter
+was a `let` in the project-server process; the hub's round counter was React
+state. A restart reset one, a reload the other. `another_round` set
+`wf.round = 1` with the comment "restart the budget", and every cap check reads
+`wf.round` — so a ceiling of five meant five rounds since the last click.
+`fixPlan.tasks` had no ceiling at all: it was checked for being *empty*, and any
+other length was accepted. And what did reach disk lived inside the workflow
+object, which `saveWorkflow` writes whole with no revision check.
+
+**Two autonomous drivers.** The server's 8-second tick and a React effect in
+`workflow-view.tsx` both derived transitions and both POSTed them. They
+disagreed by construction — the client deliberately left round-1 reviews manual
+and the server did not — and the effect ran on *mount*, so opening the app could
+carry a run past a halt the server had already decided on.
+
+**No way to say "this broke".** Every halt had to borrow a shape that meant
+something else. A strict review at its round cap with findings still open was
+recorded as an approval, because "approve unless blocking" was the only fallback
+available; the code said so in its own log line. Force-complete pasted an
+agent's terminal scrollback into `agent.feedback` under a literal
+`**Approved:** yes`, and every verdict parser reads approval by regexing that
+string — so an operator ending a runaway agent manufactured positive review
+evidence. And a single `pendingEscalation` slot, with five detectors written
+`if (!overseer.pendingEscalation)`, meant the first symptom to fire hid all the
+others.
+
+## What was measured before writing anything
+
+Each defect was reproduced against the unchanged head. Where an existing export
+could express the defect, the permanent regression test itself fails on
+behaviour; where the logic sits inline in a route handler, a probe drove the
+real code paths and its output is recorded in the PR. Selected results:
+
+- The `launchNextTask` selection returns `-1` with a blocked task present, and
+  the branch it falls into sets `currentStep = 'merge_for_review'`.
+- A save from a stale whole-object snapshot took `round` 4 → 1, dropped an
+  intervention record, and dropped `capOverrides` entirely.
+- Simulated against the old cap check, twenty review rounds ran under a cap of
+  five, via four `another_round` renewals.
+- Six overseer detectors sit behind the single-slot guard.
+- At round 5/5 with findings open, the strict path computes `action = 'approve'`.
+
+## What was decided
+
+**A run guard, not a bigger workflow object.** The budgets that must not be
+renewable moved to a separate file per run, with a monotonic revision and
+lost-update detection. Deliberately small: it is not a replacement for the
+workflow state, only the handful of fields a loop must not be able to rewind.
+One file per run is also the seam a later multi-lane scheduler needs.
+
+Rejected: adding a revision to `saveWorkflow` itself. That would touch every
+write in the engine to fix a problem that only affects a dozen fields, and the
+reproduced failure is specifically *stale whole-object* saves — the fix is to
+stop keeping guard state inside that object.
+
+**`blocked` is terminal, `skipped` is not.** A blocked task fails the run
+closed: no transition toward merge, a typed stop naming every blocking task. An
+operator-skipped task does *not* stop the step — a person decided that — but its
+acceptance coverage stays unmet, so nothing can later claim it was verified.
+Conflating the two would either strand operators or launder skips into passes.
+
+**TECHNICAL_STOP as a type, with its properties stated as fields.** Not
+approved, not a founder rejection, not auto-advanceable, not merge-eligible, not
+acceptance-eligible — asserted as data as well as behaviour, so a reader holding
+only the serialised object reaches the same conclusion as one holding the
+helpers. `principal` is always `technical`: a technical fault is never a founder
+question.
+
+**Provenance, not a better regex.** Text cannot be trusted to describe its own
+origin — a pane echoes the prompt, and the prompt contains the format example,
+so scrollback legitimately contains approval markers that were never a verdict.
+Origin is a separate structured field. Operator output is *kept*, because it is
+genuinely useful diagnostic evidence, and labelled untrusted.
+
+**Incidents, deduplicated.** Replacing one slot with an unbounded stream of
+banners trades one failure for another. An incident is deduplicated by symptom
+while open, several can be open at once, and resolving one leaves the rest.
+`pendingEscalation` survives as a derived mirror of the most urgent open
+incident so the existing banner keeps rendering — it is a view now, never a gate.
+
+**The fix-plan ceiling follows `max_tasks_per_plan`.** A fix plan is a plan for
+the same run against the same PRD, and the implementation-plan ceiling is the
+one bound this codebase has already tuned against real runs. A second,
+separately-guessed number would drift from it. `max_fix_plan_tasks` separates
+them where a project needs it.
+
+**The hub keeps its explicit actions.** It may render state and incidents, send
+a user's explicit action, and toggle the server's auto-advance *policy*. It may
+not decide a transition, hold a budget, or re-enable autonomy as a side effect
+of being rendered. The manual advance / override / skip buttons are untouched —
+they are the operator's escape hatch, and a fail-closed engine needs one.
+
+## Deliberately not in A1a
+
+Wallclock and agent-start budgets, progress fingerprinting and no-progress
+detection, admission control, acceptance modes, the Founder Acceptance Receipt,
+PR egress for managed projects, platform onboarding, dependency triage, a
+general multi-lane scheduler. A1a is the state-correctness floor those are built
+on; each of them is easier to reason about once the engine cannot walk past its
+own halts.
+
+Also not done: rebuilding the workflow state system. The separate guard store is
+enough for what A1a has to guarantee, and a rewrite would have made the
+regression surface far larger than the defects being closed.
+
+## What the independent review caught
+
+A separate read-only review of the frozen head returned REPAIR_REQUIRED, and it
+was right on every point checked. The findings clustered, and the cluster is
+worth recording because it is the failure mode this kind of work invites.
+
+**Fail-closed was applied too widely.** Three of the new paths were terminal
+where they should only have refused. The per-step and run-wide auto-advance
+ceilings shared a number, so the third refusal anywhere in a run — an ordinary
+thing on a long sequence — ended it in 24 seconds of ticks. `another_round` at
+the cap correctly declined to grant a round but *also* stopped the run, which
+deleted the "move on" exit that `review_cap_reached` exists to offer: clicking a
+button the UI still rendered turned an owner-decidable state into a dead one.
+And a TECHNICAL_STOP had no recovery route at all, while the hub still rendered
+`Relaunch step` on it — an action that would have reset the step and erased the
+stop's own evidence.
+
+The correction is a distinction the first cut missed: **refusing an action is
+not the same as stopping a run.** A refused operator action must leave every
+other option standing. Only the engine's own autonomy fails closed.
+
+**Three invariants were written but never read.** Acceptance gaps were recorded
+on the task, in the guard, and nowhere consulted. Per-task fix cycles were
+counted in the guard while the workflow object stayed the authority — the exact
+shape the guard exists to remove. And `strictReviewOutcome`'s technical-stop
+branch was unreachable, because the guard counter lags `wf.round` by one for the
+life of a run, so the fail-open closed by falling through to a different halt
+rather than by the mechanism claimed for it. Unit tests could not see any of
+this: each helper was correct in isolation.
+
+**One operator route still laundered a blocked task.** `skip_blocked` wrote
+`done` — the same laundering that was fixed in kill-and-skip, in a sibling
+handler the diff never touched.
+
+Each is now closed with a regression test that fails on the first cut.
+
+## The second review, and the same mistake twice
+
+A second independent review of the repaired head also returned REPAIR_REQUIRED,
+and the headline finding was that the *fix* for "acceptance gaps are recorded but
+never read" had reintroduced precisely the failure the round before it removed.
+
+The gate was written as a refusal: each tick called the refusal recorder, which
+spends run budget. But an acceptance gap is not an event — it is a standing
+condition that never clears on its own until a replacement run passes. So the
+run burned its whole run-wide refusal budget in about two minutes and stopped
+terminally, on nothing worse than an operator legitimately skipping a task. On
+`device_testing` that means a person standing at a device comes back to a dead
+run.
+
+The distinction that was missing, and is now explicit in the code: **a refusal is
+an event that spends budget; a hold is a condition that waits.** A gate that can
+never clear itself must be a hold.
+
+The same review found the recovery route added in round one reached only one of
+the six reason codes — `relaunch_task` and `skip_blocked` live under
+`task_execution`, and only `BLOCKED_TASKS` stops there. A run that hit a spent
+round budget stops on `reviewing`, where neither handler exists, so it had *no*
+action at all. `clear_technical_stop` is the general route: explicit, logged,
+and it decides nothing except that the halt has been read.
+
+Two rounds, and both regressions were the same shape — fail-closed applied to a
+case that needed to fail *open to a person*. Worth stating plainly, because the
+instinct that produced them is the right instinct for the ten original defects
+and the wrong one for the operator's escape hatch.
+
+## The recovery model reset
+
+Three review rounds each found a different hole in the recovery routes, and the
+fourth reading is that they were all the same hole. The first design treated a
+TECHNICAL_STOP as a pause a person could lift: relaunch the task, skip it, or
+acknowledge the halt, and the same run carried on. Every one of those routes had
+to answer a question none of them could — *has the original cause actually
+gone?* It had not. `acceptanceCovered` went false when a task finished without a
+verdict, and nothing anywhere set it back to true, so a "recovered" run carried
+a permanent coverage gap while reporting itself healthy. Patching each route in
+turn kept producing a new variant of the same defect: an advertised recovery
+that answered 400, a recovery that reached one reason code out of six, a gate
+that spent the run's budget until it killed the run.
+
+So the model changed rather than the routes. **A stop is terminal for the run it
+stops.** One check, in one place, with the same answer for the timer, the
+dashboard and the operator. Recovery is a successor repair run with a new run id
+and a fresh budget (A1b) — which is also the only honest source of acceptance
+evidence for a task nobody verified, because a new run can actually produce it.
+
+What that removed, deliberately and completely rather than leaving dead
+endpoints for the next reader to wire back up: `clear_technical_stop`, the
+`skip_blocked` handler, the in-run recovery action set, the clearing helper, and
+the hub controls that implied any of it was possible. `relaunch_task` survives
+for transient `running`/`error`/`pending` states *before* a run is stopped —
+restarting a wedged agent is ordinary operation, and taking it away would have
+been its own regression.
+
+The one thing this did not change is the operator's real escape hatch: cancel.
+A parked run can still be cancelled, and its evidence is on the run and in the
+guard for whatever comes next.
+
+## Known limits
+
+- The per-step refusal count clears when that step genuinely advances; only the
+  run-wide refusal budget is strictly monotonic. A step that alternates between
+  refusing and advancing can therefore spend more than the per-step ceiling
+  suggests — bounded by the run-wide budget, which is the one that matters.
+- `wf.round` still exists and still drives per-loop routing and display. It is
+  no longer the budget, but two numbers describing adjacent things is a
+  simplification A1b should revisit.
+- A parked run cannot be resumed at all, by design. Until A1b ships the
+  successor repair run, the operator's only actions are to read the evidence or
+  cancel. That is a deliberate trade: a run that cannot be resumed is worse to
+  live with than one that can, and better than one that resumes onto a coverage
+  gap nobody can see.
+- `acceptanceCovered` is never set back to true anywhere. That is the invariant,
+  not an omission — coverage is regained by a successor run producing a real
+  verdict, and a route that flipped the field would let a run claim criteria
+  nothing verified.
+- A pre-existing intermittent failure in `qa-suite-run.test.js` ("a full run is
+  streamed to the log and parsed") reproduces on the unchanged head under
+  full-suite parallelism and is untouched by this work.

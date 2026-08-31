@@ -104,5 +104,29 @@ test('the review cap has one source, so the loop and the UI cannot disagree', ()
   const src = fs.readFileSync(path.join(__dirname, 'api', 'workflow.js'), 'utf8');
   const hardcoded = src.match(/config\.max_review_rounds \|\| \d+/g) || [];
   assert.deepEqual(hardcoded, [], `hardcoded review-cap fallbacks: ${hardcoded.join(', ')}`);
-  assert.ok((src.match(/config\.max_review_rounds \|\| DEFAULT_MAX_REVIEW_ROUNDS/g) || []).length >= 3);
+
+  // Every read of the cap goes through one of two spellings of the same
+  // number: the direct `config.max_review_rounds || DEFAULT_MAX_REVIEW_ROUNDS`,
+  // or `budgets()` — run-budgets.js, which resolves the run's budgets from the
+  // same config key and is where the persistent round counters are checked.
+  // The cap is now read in two places — directly here, and through
+  // run-budgets.js, which owns the persistent round counters. Counting call
+  // sites stopped being the useful assertion once the number moved; what
+  // matters is that NEITHER file spells its own fallback, so they cannot drift.
+  // A count of `budgets()` calls would not do: six unrelated budgets share that
+  // accessor, so such a count passes with every cap read deleted.
+  const budgetsSrc = fs.readFileSync(path.join(__dirname, 'run-budgets.js'), 'utf8');
+  const budgetsHardcoded = budgetsSrc.match(/max_review_rounds\)? \|\| \d+/g) || [];
+  assert.deepEqual(budgetsHardcoded, [], `hardcoded review-cap fallbacks in run-budgets.js: ${budgetsHardcoded.join(', ')}`);
+  assert.ok(
+    (src.match(/config\.max_review_rounds \|\| DEFAULT_MAX_REVIEW_ROUNDS/g) || []).length >= 1,
+    'workflow.js must still resolve the cap from the shared default',
+  );
+
+  // …and run-budgets.js must agree with config.js about what that number is,
+  // or the loop and the UI can disagree again through the new path.
+  const { resolveBudgets, DEFAULT_MAX_REVIEW_ROUNDS: BUDGET_DEFAULT } = require('./run-budgets');
+  assert.equal(BUDGET_DEFAULT, DEFAULT_MAX_REVIEW_ROUNDS);
+  assert.equal(resolveBudgets({}).maxReviewRounds, DEFAULT_MAX_REVIEW_ROUNDS);
+  assert.equal(resolveBudgets({ max_review_rounds: 9 }).maxReviewRounds, 9);
 });

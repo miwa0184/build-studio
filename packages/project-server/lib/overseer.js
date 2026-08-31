@@ -11,6 +11,10 @@
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const incidentsLib = require('./incidents');
+const { PROVENANCE, syntheticFeedback } = require('./feedback-provenance');
+const { createTechnicalStop, REASON_CODES } = require('./technical-stop');
+const { attachStateAuthority } = require('./state');
 
 const CHECK_INTERVAL_MS = 15_000;
 const STALL_THRESHOLD_MS = 10 * 60 * 1000; // 10 min — agent stall warning
@@ -66,6 +70,11 @@ const TURN_COMPLETE_PATTERN = /✻\s+\S+\s+for\s+\d+[smh]\b/;
  * @param {function} broadcast — SSE broadcast function
  */
 function createOverseer(config, state, broadcast) {
+  // The real state manager arrives with the authority seam already attached;
+  // attaching here covers a bare persistence stub, so the overseer's writes go
+  // through the same run-guard enforcement either way. No-op when present.
+  attachStateAuthority(state, config);
+
   let intervalId = null;
   let running = false;
 
@@ -81,7 +90,8 @@ function createOverseer(config, state, broadcast) {
         status: 'watching',      // watching | acting | escalating | idle
         activity: 'Monitoring workflow…',
         interventions: [],       // { at, symptom, action, result }
-        pendingEscalation: null, // { symptom, description, askedAt } | null
+        incidents: [],           // independent, deduplicated — see incidents.js
+        pendingEscalation: null, // DERIVED mirror of the most urgent open incident
         stepVisits: {},          // { [stepKey]: count }
         lastCheckedStep: null,   // persisted — deduplicates visit counting across restarts
         workflowId: null,        // persisted — detects new workflow without in-memory state
@@ -93,6 +103,114 @@ function createOverseer(config, state, broadcast) {
   /** Returns true if the same symptom has already been attempted once this run. */
   function alreadyAttempted(overseer, symptom) {
     return overseer.interventions.some(i => i.symptom === symptom);
+  }
+
+  /**
+   * Incidents, and the single-slot banner they replaced.
+   *
+   * `pendingEscalation` used to BE the state: one slot, and every detector after
+   * the first was written `if (!overseer.pendingEscalation)`. So one agent's
+   * usage limit made the overseer blind to a merge conflict, a step loop and
+   * every other agent's overrun until somebody dismissed the banner.
+   *
+   * Incidents are now the state, and each detector asks only about its OWN
+   * symptom. `pendingEscalation` is kept as a derived mirror of the most urgent
+   * open incident so the existing hub banner keeps rendering unchanged — it is a
+   * view now, never a gate.
+   */
+  const SEVERITY_RANK = { critical: 0, warning: 1, info: 2 };
+
+  function syncEscalationMirror(overseer) {
+    const open = incidentsLib.openIncidents(overseer.incidents);
+    const top = [...open].sort(
+      (a, b) => (SEVERITY_RANK[a.severity] ?? 9) - (SEVERITY_RANK[b.severity] ?? 9),
+    )[0];
+    overseer.pendingEscalation = top
+      ? {
+        symptom: top.symptom,
+        description: top.description,
+        askedAt: top.createdAt,
+        action: top.allowedRecoveryAction || undefined,
+        actionTarget: top.agent || undefined,
+        actionTaskIdx: top.task === null ? undefined : top.task,
+        incidentId: top.id,
+        openIncidentCount: open.length,
+      }
+      : null;
+  }
+
+  /** True when this exact symptom is already open — the per-symptom dedupe. */
+  function incidentOpen(overseer, symptom) {
+    return incidentsLib.openIncidents(overseer.incidents).some((i) => i.symptom === symptom);
+  }
+
+  function raiseIncident(overseer, runId, input) {
+    overseer.incidents = incidentsLib.pruneIncidents(
+      incidentsLib.openIncident(overseer.incidents || [], { runId, ...input }),
+    );
+    syncEscalationMirror(overseer);
+  }
+
+  function resolveIncidentSymptom(overseer, symptom) {
+    if (!overseer) return;
+    overseer.incidents = incidentsLib.resolveIncident(overseer.incidents || [], symptom);
+    syncEscalationMirror(overseer);
+  }
+
+  /**
+   * Park the run after an operator action that no agent verified.
+   *
+   * Both force-complete and kill-and-skip used to fire a loopback POST to
+   * /workflow/advance so the next task launched. That is the fail-open at its
+   * purest: the operator's intervention says "this task cannot be completed",
+   * and the engine answered by carrying on as though it had been. Whatever the
+   * run produced from there rested on a task nobody checked.
+   *
+   * The task record stays honest — provenance, untrusted pane evidence, an
+   * incident — and the agent process is still terminated. What stops is the
+   * run. A real attempt at that task is a successor repair run (A1b), which is
+   * also the only place acceptance evidence for it can honestly come from.
+   */
+  function parkRun(wf, { reasonCode, taskIndex, taskName, agentWindow, detail }) {
+    const stop = createTechnicalStop({
+      reasonCode,
+      runId: wf.id,
+      step: 'task_execution',
+      tasks: [{
+        index: typeof taskIndex === 'number' ? taskIndex : Number(taskIndex) || 0,
+        name: taskName || `task ${(Number(taskIndex) || 0) + 1}`,
+        reason: detail,
+      }],
+      evidence: [
+        `agent ${agentWindow} ended by operator without an agent verdict`,
+        `taskStates.${taskIndex}.acceptanceCovered=false`,
+      ],
+      recoveryHint:
+        'This run is parked because a task finished with no agent verdict. Acceptance coverage for it cannot '
+        + 'be rebuilt inside this run — start a successor repair run.',
+    });
+    log(`TECHNICAL_STOP ${reasonCode} — run parked (${agentWindow})`);
+    // One write path for terminal truth: the state boundary writes the guard
+    // and persists the parked workflow together, and THROWS when the guard
+    // cannot take the stop — the operator action then reports failure instead
+    // of claiming a park that would not survive a restart.
+    return state.recordTechnicalStop(wf, stop);
+  }
+
+  /** Any open incident other than this one — i.e. is something still wrong? */
+  function hasOpenIncidentsBesides(overseer, symptom) {
+    return incidentsLib.openIncidents(overseer.incidents).some((i) => i.symptom !== symptom);
+  }
+
+  /** Resolve whichever open incident is about this agent window. */
+  function resolveIncidentsForAgent(overseer, windowName) {
+    if (!overseer) return;
+    for (const inc of incidentsLib.openIncidents(overseer.incidents)) {
+      if (inc.agent === windowName) {
+        overseer.incidents = incidentsLib.resolveIncident(overseer.incidents, inc.symptom);
+      }
+    }
+    syncEscalationMirror(overseer);
   }
 
   function recordIntervention(overseer, symptom, action, result) {
@@ -461,6 +579,7 @@ function createOverseer(config, state, broadcast) {
       overseer.workflowId = wf.id || null;
       overseer.stepVisits = {};
       overseer.interventions = [];
+      overseer.incidents = [];
       overseer.pendingEscalation = null;
       log(`Migrated overseer state: lastCheckedStep=${overseer.lastCheckedStep}, workflowId=${overseer.workflowId}`);
     }
@@ -471,6 +590,7 @@ function createOverseer(config, state, broadcast) {
       overseer.workflowId = wf.id;
       overseer.stepVisits = {};
       overseer.interventions = [];
+      overseer.incidents = [];
       overseer.pendingEscalation = null;
       overseer.lastCheckedStep = wf.currentStep || null;
     }
@@ -499,28 +619,34 @@ function createOverseer(config, state, broadcast) {
           recordIntervention(overseer, symptom, 'delete-and-reinstall', `failed: ${e.message}`);
           overseer.status = 'escalating';
           overseer.activity = 'Could not auto-fix package-lock.json conflict.';
-          overseer.pendingEscalation = {
+          raiseIncident(overseer, wf.id, {
             symptom,
+            principal: incidentsLib.PRINCIPALS.ORCHESTRATOR,
+            severity: incidentsLib.SEVERITIES.CRITICAL,
+            step: wf.currentStep,
             description: `package-lock.json has merge conflicts and auto-fix failed: ${e.message}. Please resolve manually.`,
-            askedAt: new Date().toISOString(),
-          };
+            allowedRecoveryAction: 'resolve-conflict',
+          });
         }
         changed = true;
-      } else if (!overseer.pendingEscalation) {
+      } else if (!incidentOpen(overseer, symptom)) {
         // Tried once and it persists — escalate
         overseer.status = 'escalating';
         overseer.activity = 'package-lock.json conflict persists after auto-fix attempt.';
-        overseer.pendingEscalation = {
+        raiseIncident(overseer, wf.id, {
           symptom,
+          principal: incidentsLib.PRINCIPALS.ORCHESTRATOR,
+          severity: incidentsLib.SEVERITIES.CRITICAL,
+          step: wf.currentStep,
           description: 'package-lock.json still has merge conflicts after one auto-fix attempt. Please resolve manually.',
-          askedAt: new Date().toISOString(),
-        };
+          allowedRecoveryAction: 'resolve-conflict',
+        });
         changed = true;
       }
     }
 
     // --- Check: missing node_modules ---
-    if (!overseer.pendingEscalation && detectMissingNodeModules(config.projectRoot)) {
+    if (detectMissingNodeModules(config.projectRoot)) {
       const symptom = 'missing-node-modules';
       if (!alreadyAttempted(overseer, symptom)) {
         overseer.status = 'acting';
@@ -534,29 +660,35 @@ function createOverseer(config, state, broadcast) {
         } catch (e) {
           recordIntervention(overseer, symptom, 'npm-install', `failed: ${e.message}`);
           overseer.status = 'escalating';
-          overseer.pendingEscalation = {
+          raiseIncident(overseer, wf.id, {
             symptom,
+            principal: incidentsLib.PRINCIPALS.ORCHESTRATOR,
+            severity: incidentsLib.SEVERITIES.CRITICAL,
+            step: wf.currentStep,
             description: `npm install failed: ${e.message}`,
-            askedAt: new Date().toISOString(),
-          };
+            allowedRecoveryAction: 'install-dependencies',
+          });
         }
         changed = true;
       }
     }
 
     // --- Check: step loop ---
-    if (!overseer.pendingEscalation && detectStepLoop(overseer, wf.currentStep)) {
+    if (detectStepLoop(overseer, wf.currentStep)) {
       const symptom = `loop-${wf.currentStep}`;
       if (!alreadyAttempted(overseer, symptom)) {
         const visits = overseer.stepVisits[wf.currentStep];
         recordIntervention(overseer, symptom, 'escalate', `step '${wf.currentStep}' visited ${visits} times`);
         overseer.status = 'escalating';
         overseer.activity = `Workflow may be stuck in a loop at: ${wf.currentStep}`;
-        overseer.pendingEscalation = {
+        raiseIncident(overseer, wf.id, {
           symptom,
+          principal: incidentsLib.PRINCIPALS.ORCHESTRATOR,
+          severity: incidentsLib.SEVERITIES.WARNING,
+          step: wf.currentStep,
           description: `The workflow has visited step '${wf.currentStep}' ${visits} times. This may indicate a loop. Consider cancelling or inspecting the workflow.`,
-          askedAt: new Date().toISOString(),
-        };
+          allowedRecoveryAction: 'inspect-or-cancel',
+        });
         changed = true;
       }
     }
@@ -566,7 +698,7 @@ function createOverseer(config, state, broadcast) {
     // print their full output and consider their turn done, never running the
     // curl command to submit feedback. We type a reminder into their tmux pane
     // before the 10-min stall watchdog fires.
-    if (!overseer.pendingEscalation) {
+    {
       const forgot = detectAgentForgotFeedback(wf);
       for (const { agent, stepLabel } of forgot) {
         const symptom = `forgot-feedback-${agent.role.toLowerCase().replace(/\s+/g, '-')}-${stepLabel}`;
@@ -583,22 +715,26 @@ function createOverseer(config, state, broadcast) {
     // just burn through nothing. Surface the agent + window to the UI via the
     // pendingEscalation banner, which renders a Nudge button when the user
     // believes the limit has lifted.
-    if (!overseer.pendingEscalation) {
-      const hitLimit = detectAgentHitUsageLimit(wf);
-      if (hitLimit.length > 0) {
-        const { agent, stepLabel } = hitLimit[0];
+    {
+      // Every agent that hit the limit, not just the first: two agents capped at
+      // once is the common case, and reporting one of them hid the other.
+      for (const { agent, stepLabel } of detectAgentHitUsageLimit(wf)) {
         const symptom = `usage-limit-${agent.window}`;
+        if (incidentOpen(overseer, symptom)) continue;
         log(`Detected usage-limit stall: ${agent.role} in ${agent.window} (${stepLabel})`);
         agent.usageLimitNotifiedAt = new Date().toISOString();
         overseer.status = 'escalating';
         overseer.activity = `Usage limit hit: ${agent.role} (${agent.window})`;
-        overseer.pendingEscalation = {
+        raiseIncident(overseer, wf.id, {
           symptom,
+          principal: incidentsLib.PRINCIPALS.TECHNICAL,
+          severity: incidentsLib.SEVERITIES.WARNING,
+          step: stepLabel,
+          agent: agent.window,
+          task: agent.taskIndex,
           description: `${agent.role} (${agent.window}) hit a Claude usage limit and stopped. Click Nudge to retry — only works if the limit has lifted; otherwise the agent will hit it again and the banner will reappear.`,
-          action: 'nudge-agent',
-          actionTarget: agent.window,
-          askedAt: new Date().toISOString(),
-        };
+          allowedRecoveryAction: 'nudge-agent',
+        });
         recordIntervention(overseer, symptom, 'await-nudge', `pane in ${agent.window} matched usage-limit pattern; awaiting user nudge`);
         changed = true;
       }
@@ -613,42 +749,49 @@ function createOverseer(config, state, broadcast) {
     //   • kill-and-skip: kills the agent, marks task done with a synthetic
     //     "skipped by operator" feedback. Used when the task itself is
     //     ill-conceived (e.g. an Nx flake check that slipped past G1).
-    if (!overseer.pendingEscalation) {
-      const overrun = detectTaskWallclockOverrun(wf);
-      if (overrun.length > 0) {
-        const { agent, taskIdx, ageMin } = overrun[0];
+    {
+      // One incident per overrunning agent. The t36/t37/t38 case this rule was
+      // written for was THREE agents at once; the old single slot reported one.
+      for (const { agent, taskIdx, ageMin } of detectTaskWallclockOverrun(wf)) {
         const symptom = `task-wallclock-${agent.window}`;
+        if (incidentOpen(overseer, symptom)) continue;
         log(`Task wallclock overrun: ${agent.role} in ${agent.window} (task_${taskIdx}, ${ageMin}min)`);
         agent.wallclockWarnedAt = new Date().toISOString();
         overseer.status = 'escalating';
         overseer.activity = `Task running ${ageMin}min: ${agent.window}`;
-        overseer.pendingEscalation = {
+        raiseIncident(overseer, wf.id, {
           symptom,
-          description: `${agent.role} (${agent.window}, task ${parseInt(taskIdx,10)+1}) has been running ${ageMin}min without POSTing feedback. Likely an oversized task (full-suite run, Nx flake check, omnibus). Force-complete uses the agent's pane output as feedback; Kill-and-skip marks the task done with no work attribution. Both stop the wasted runtime.`,
-          action: 'task-overrun',
-          actionTarget: agent.window,
-          actionTaskIdx: taskIdx,
-          askedAt: new Date().toISOString(),
-        };
+          principal: incidentsLib.PRINCIPALS.TECHNICAL,
+          severity: incidentsLib.SEVERITIES.WARNING,
+          step: 'task_execution',
+          agent: agent.window,
+          task: taskIdx,
+          description: `${agent.role} (${agent.window}, task ${parseInt(taskIdx,10)+1}) has been running ${ageMin}min without POSTing feedback. Likely an oversized task (full-suite run, Nx flake check, omnibus). Force-complete keeps the agent's pane output as untrusted diagnostic evidence — it is not an approval; Kill-and-skip aborts the task and leaves its acceptance coverage unmet. Both stop the wasted runtime.`,
+          allowedRecoveryAction: 'task-overrun',
+        });
         recordIntervention(overseer, symptom, 'await-decision', `${agent.role} task_${taskIdx} running ${ageMin}min; awaiting operator force-complete or kill-skip`);
         changed = true;
       }
     }
 
     // --- Check: agent stall (warning only, no auto-fix) ---
-    const stalledAgents = !overseer.pendingEscalation && !changed ? detectAgentStall(wf) : false;
+    const stalledAgents = !changed ? detectAgentStall(wf) : false;
     if (stalledAgents) {
       const symptom = 'agent-stall';
-      if (!alreadyAttempted(overseer, symptom)) {
+      if (!alreadyAttempted(overseer, symptom) && !incidentOpen(overseer, symptom)) {
         const stalledDesc = stalledAgents.map(a => `${a.role} (${a.step}, ${a.stalledFor}min)`).join(', ');
         recordIntervention(overseer, symptom, 'warn', `stalled agents: ${stalledDesc}`);
         overseer.status = 'escalating';
         overseer.activity = `Agent stall detected: ${stalledAgents[0].role} (${stalledAgents[0].stalledFor}min)`;
-        overseer.pendingEscalation = {
+        raiseIncident(overseer, wf.id, {
           symptom,
+          principal: incidentsLib.PRINCIPALS.TECHNICAL,
+          severity: incidentsLib.SEVERITIES.WARNING,
+          step: wf.currentStep,
+          agent: stalledAgents[0].role,
           description: `These agents have not updated in 10+ minutes and may be stuck: ${stalledDesc}. Check their tmux windows or consider relaunching.`,
-          askedAt: new Date().toISOString(),
-        };
+          allowedRecoveryAction: 'inspect-or-relaunch',
+        });
         changed = true;
       }
     }
@@ -749,6 +892,7 @@ function createOverseer(config, state, broadcast) {
         // Reset step visits and interventions for a fresh run
         overseer.stepVisits = {};
         overseer.interventions = [];
+        overseer.incidents = [];
         overseer.pendingEscalation = null;
         overseer.lastCheckedStep = wf.currentStep || null;
         overseer.workflowId = wf.id || null;
@@ -792,8 +936,13 @@ function createOverseer(config, state, broadcast) {
     try {
       const wf = state.loadWorkflow();
       if (!wf || !wf.overseer) return;
-      wf.overseer.pendingEscalation = null;
-      if (wf.overseer.status === 'escalating') {
+      // Dismissing the banner resolves the incident it was showing — and only
+      // that one. Any other open incident takes its place in the mirror rather
+      // than disappearing with it.
+      const shown = wf.overseer.pendingEscalation;
+      if (shown && shown.symptom) resolveIncidentSymptom(wf.overseer, shown.symptom);
+      else wf.overseer.pendingEscalation = null;
+      if (incidentsLib.openIncidents(wf.overseer.incidents).length === 0 && wf.overseer.status === 'escalating') {
         wf.overseer.status = 'watching';
         wf.overseer.activity = `Monitoring step: ${wf.currentStep || 'workflow'}`;
       }
@@ -833,10 +982,8 @@ function createOverseer(config, state, broadcast) {
       }
 
       if (wf.overseer) {
-        if (wf.overseer.pendingEscalation?.actionTarget === windowName) {
-          wf.overseer.pendingEscalation = null;
-        }
-        if (wf.overseer.status === 'escalating') {
+        resolveIncidentsForAgent(wf.overseer, windowName);
+        if (incidentsLib.openIncidents(wf.overseer.incidents).length === 0 && wf.overseer.status === 'escalating') {
           wf.overseer.status = 'watching';
           wf.overseer.activity = `Nudged ${windowName} — awaiting agent`;
         }
@@ -850,14 +997,22 @@ function createOverseer(config, state, broadcast) {
   }
 
   /**
-   * G2 — Force-complete a stuck task. Reads the agent's tmux pane scrollback,
-   * uses it as synthetic feedback, marks the task done. For when the work is
+   * G2 — Force-complete a stuck task. Keeps the agent's tmux pane scrollback as
+   * diagnostic evidence and stops the wasted runtime. For when the work is
    * committed but the agent is iterating uselessly.
    *
-   * Used from the UI's task-overrun escalation. Server-side this is a
-   * sanctioned-by-operator action, so we set status=done directly without
-   * going through the /api/workflow/feedback (which is gated for non-operator
-   * feedback POSTs).
+   * What this deliberately does NOT do any more: it used to write the captured
+   * pane into `agent.feedback` under a literal `**Approved:** yes` header, and
+   * mark the task `done`. Every downstream verdict parser reads approval by
+   * regexing that string, so an operator ending a runaway agent manufactured a
+   * positive review out of terminal scrollback — including, on a pane that had
+   * echoed its own prompt, out of the format example.
+   *
+   * Now the output is preserved and labelled: provenance is recorded on the
+   * agent (feedback-provenance.js), the body carries no approval marker in any
+   * form, and the task is marked force-completed with its acceptance coverage
+   * explicitly unmet. The run continues — the operator decided that — but
+   * nothing can later claim the task was verified.
    *
    * @returns {{ok: boolean, error?: string}}
    */
@@ -887,52 +1042,65 @@ function createOverseer(config, state, broadcast) {
       // ran the curl POST.
       const pane = captureTmuxPane(wf.sessionName, windowName, 200) || '';
       const summary = pane.trim().split('\n').slice(-80).join('\n').slice(-2000);
-      const syntheticFeedback = `**Approved:** yes\n**Force-completed:** operator after wallclock overrun\n\n### Summary\nTask force-completed by operator after wallclock overrun. Agent's pane output (last 80 lines, truncated to 2000 chars):\n\n\`\`\`\n${summary || '(empty pane)'}\n\`\`\``;
 
       foundAgent.status = 'done';
-      foundAgent.feedback = syntheticFeedback;
+      foundAgent.feedbackProvenance = PROVENANCE.OPERATOR_FORCE_COMPLETE;
+      foundAgent.feedback = syntheticFeedback(
+        PROVENANCE.OPERATOR_FORCE_COMPLETE,
+        summary,
+        'Agent force-completed by operator after a wallclock overrun. The pane below is the last 80 lines of terminal output, not a verdict the agent submitted.',
+      );
       foundAgent.completedAt = new Date().toISOString();
       foundAgent.forceCompletedAt = foundAgent.completedAt;
-      foundTaskState.status = 'done';
+      // `force_completed`, not `done`: no agent certified this task, so nothing
+      // downstream may count it as verified work.
+      foundTaskState.status = 'force_completed';
+      foundTaskState.forceCompleted = true;
+      foundTaskState.acceptanceCovered = false;
       foundTaskState.completedAt = foundAgent.completedAt;
 
       // Send /exit to terminate the claude CLI
       exitAgentPane(wf.sessionName, windowName);
       foundAgent.exitedAt = new Date().toISOString();
 
-      // Clear the matching escalation
-      if (wf.overseer?.pendingEscalation?.actionTarget === windowName) {
-        wf.overseer.pendingEscalation = null;
-      }
+      ensureOverseer(wf);
       if (wf.overseer) {
-        if (wf.overseer.status === 'escalating') {
-          wf.overseer.status = 'watching';
-          wf.overseer.activity = `Force-completed ${windowName} — advancing`;
-        }
-        recordIntervention(wf.overseer, `force-complete-${windowName}`, 'user-force-complete', `task force-completed using pane scrollback as feedback`);
-      }
-      state.saveWorkflow(wf);
-
-      // Trigger launch of the next pending task. Done via HTTP loopback to
-      // /api/workflow/advance because launchNextTask lives in workflow.js and
-      // overseer.js doesn't depend on it directly. Same pattern force-complete
-      // mirrors from skip_blocked (workflow.js:4300).
-      try {
-        const http = require('http');
-        const data = JSON.stringify({ action: 'launch' });
-        const req = http.request({
-          hostname: 'localhost',
-          port: config.port,
-          path: '/api/workflow/advance',
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+        // The overrun incident is resolved; a new one records the override, so
+        // the run carries the fact that a task advanced without a verdict.
+        resolveIncidentsForAgent(wf.overseer, windowName);
+        raiseIncident(wf.overseer, wf.id, {
+          symptom: `force-completed-${windowName}`,
+          principal: incidentsLib.PRINCIPALS.TECHNICAL,
+          severity: incidentsLib.SEVERITIES.WARNING,
+          step: 'task_execution',
+          agent: windowName,
+          task: foundAgent.taskIndex,
+          description: `Task force-completed by operator. Pane output is kept as untrusted diagnostic evidence — it is not an agent verdict and does not count as approval or acceptance evidence. The run is parked; a successor repair run is the route to a real verdict.`,
+          allowedRecoveryAction: 'successor-repair-run',
         });
-        req.on('error', (e) => log(`force-complete: loopback advance failed: ${e.message}`));
-        req.write(data);
-        req.end();
-      } catch (e) {
-        log(`force-complete: could not trigger next-task launch: ${e.message}`);
+        // Ignore the incident just raised: it records the override, it is not a
+        // problem waiting on anyone. Counting it meant the condition could never
+        // hold, so the overseer stayed 'escalating' with its activity frozen on
+        // the overrun text until somebody dismissed a banner by hand.
+        wf.overseer.status = 'idle';
+        wf.overseer.activity = `Force-completed ${windowName} — run parked, no agent verdict`;
+        recordIntervention(wf.overseer, `force-complete-${windowName}`, 'user-force-complete', `task force-completed; pane scrollback kept as untrusted diagnostic evidence, not as approval; run parked`);
       }
+
+      parkRun(wf, {
+        reasonCode: REASON_CODES.TASK_FORCE_COMPLETED_UNVERIFIED,
+        taskIndex: foundAgent.taskIndex,
+        taskName: (wf.taskPlan && wf.taskPlan.tasks && wf.taskPlan.tasks[foundAgent.taskIndex]
+          && (wf.taskPlan.tasks[foundAgent.taskIndex].name)) || undefined,
+        agentWindow: windowName,
+        detail: 'force-completed by operator after a wallclock overrun — no agent verdict was produced',
+      });
+
+      // parkRun persisted the workflow through the state boundary. No loopback
+      // to /workflow/advance: both actions used to fire one so the next task
+      // launched — which turned "this task cannot be completed" into "carry on
+      // as though it had been". The run is parked; nothing follows it in this
+      // run.
       return { ok: true };
     } catch (e) {
       return { ok: false, error: e.message };
@@ -940,10 +1108,16 @@ function createOverseer(config, state, broadcast) {
   }
 
   /**
-   * G2 — Kill-and-skip a stuck task. Terminates the agent, marks the task
-   * `done` with a synthetic "skipped" note. For when the task itself is
-   * ill-conceived (e.g. an Nx flake check that slipped past the planner
-   * anti-pattern check). Workflow advances to next task.
+   * G2 — Kill-and-skip a stuck task. Terminates the agent and marks the task
+   * SKIPPED. For when the task itself is ill-conceived (e.g. an Nx flake check
+   * that slipped past the planner anti-pattern check).
+   *
+   * It used to mark the task `done` under a `**Approved:** yes` header, which
+   * said the opposite of what happened: no work was attributed and no agent
+   * reviewed anything. The task is now `skipped`, its acceptance coverage stays
+   * unmet, and the feedback body carries no approval marker. The run is PARKED
+   * (TASK_SKIPPED_UNVERIFIED) — nothing follows the skipped task in this run;
+   * a real attempt at it belongs to a successor repair run.
    *
    * @returns {{ok: boolean, error?: string}}
    */
@@ -971,43 +1145,53 @@ function createOverseer(config, state, broadcast) {
       exitAgentPane(wf.sessionName, windowName);
 
       foundAgent.status = 'done';
-      foundAgent.feedback = `**Approved:** yes\n**Skipped by operator:** wallclock overrun\n\n### Summary\nTask skipped by operator after wallclock overrun. No work attributed; review downstream tasks for missing coverage.`;
+      foundAgent.feedbackProvenance = PROVENANCE.OPERATOR_KILL_SKIP;
+      foundAgent.feedback = syntheticFeedback(
+        PROVENANCE.OPERATOR_KILL_SKIP,
+        '',
+        'Task aborted by operator after a wallclock overrun. No work is attributed to this task; review downstream tasks for missing coverage.',
+      );
       foundAgent.completedAt = new Date().toISOString();
       foundAgent.skippedAt = foundAgent.completedAt;
       foundAgent.exitedAt = foundAgent.completedAt;
-      foundTaskState.status = 'done';
+      foundTaskState.status = 'skipped';
       foundTaskState.completedAt = foundAgent.completedAt;
       foundTaskState.skipped = true;
+      foundTaskState.acceptanceCovered = false;
+      foundTaskState.skipReason = 'aborted by operator after wallclock overrun — no work attributed';
 
-      if (wf.overseer?.pendingEscalation?.actionTarget === windowName) {
-        wf.overseer.pendingEscalation = null;
-      }
+      ensureOverseer(wf);
       if (wf.overseer) {
-        if (wf.overseer.status === 'escalating') {
-          wf.overseer.status = 'watching';
-          wf.overseer.activity = `Skipped ${windowName} — advancing`;
-        }
-        recordIntervention(wf.overseer, `kill-skip-${windowName}`, 'user-kill-skip', `task killed + marked done without work attribution`);
-      }
-      state.saveWorkflow(wf);
-
-      // Trigger next-task launch via loopback (same as forceCompleteTaskAgent).
-      try {
-        const http = require('http');
-        const data = JSON.stringify({ action: 'launch' });
-        const req = http.request({
-          hostname: 'localhost',
-          port: config.port,
-          path: '/api/workflow/advance',
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+        resolveIncidentsForAgent(wf.overseer, windowName);
+        raiseIncident(wf.overseer, wf.id, {
+          symptom: `skipped-${windowName}`,
+          principal: incidentsLib.PRINCIPALS.TECHNICAL,
+          severity: incidentsLib.SEVERITIES.WARNING,
+          step: 'task_execution',
+          agent: windowName,
+          task: foundAgent.taskIndex,
+          description: 'Task aborted by operator with no work attributed. Its acceptance coverage stays unmet; the run is parked and a successor repair run is the route to a real verdict.',
+          allowedRecoveryAction: 'successor-repair-run',
         });
-        req.on('error', (e) => log(`kill-skip: loopback advance failed: ${e.message}`));
-        req.write(data);
-        req.end();
-      } catch (e) {
-        log(`kill-skip: could not trigger next-task launch: ${e.message}`);
+        wf.overseer.status = 'idle';
+        wf.overseer.activity = `Skipped ${windowName} — run parked, no work attributed`;
+        recordIntervention(wf.overseer, `kill-skip-${windowName}`, 'user-kill-skip', `task aborted and marked skipped; acceptance coverage left unmet; run parked`);
       }
+
+      parkRun(wf, {
+        reasonCode: REASON_CODES.TASK_SKIPPED_UNVERIFIED,
+        taskIndex: foundAgent.taskIndex,
+        taskName: (wf.taskPlan && wf.taskPlan.tasks && wf.taskPlan.tasks[foundAgent.taskIndex]
+          && (wf.taskPlan.tasks[foundAgent.taskIndex].name)) || undefined,
+        agentWindow: windowName,
+        detail: 'aborted by operator after a wallclock overrun — no work attributed',
+      });
+
+      // parkRun persisted the workflow through the state boundary. No loopback
+      // to /workflow/advance: both actions used to fire one so the next task
+      // launched — which turned "this task cannot be completed" into "carry on
+      // as though it had been". The run is parked; nothing follows it in this
+      // run.
       return { ok: true };
     } catch (e) {
       return { ok: false, error: e.message };
