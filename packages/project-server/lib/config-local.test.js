@@ -104,5 +104,19 @@ test('the review cap has one source, so the loop and the UI cannot disagree', ()
   const src = fs.readFileSync(path.join(__dirname, 'api', 'workflow.js'), 'utf8');
   const hardcoded = src.match(/config\.max_review_rounds \|\| \d+/g) || [];
   assert.deepEqual(hardcoded, [], `hardcoded review-cap fallbacks: ${hardcoded.join(', ')}`);
-  assert.ok((src.match(/config\.max_review_rounds \|\| DEFAULT_MAX_REVIEW_ROUNDS/g) || []).length >= 3);
+
+  // Every read of the cap goes through one of two spellings of the same
+  // number: the direct `config.max_review_rounds || DEFAULT_MAX_REVIEW_ROUNDS`,
+  // or `budgets()` — run-budgets.js, which resolves the run's budgets from the
+  // same config key and is where the persistent round counters are checked.
+  const direct = (src.match(/config\.max_review_rounds \|\| DEFAULT_MAX_REVIEW_ROUNDS/g) || []).length;
+  const viaBudgets = (src.match(/budgets\(\)/g) || []).length;
+  assert.ok(direct + viaBudgets >= 3, `review-cap reads: ${direct} direct + ${viaBudgets} via budgets()`);
+
+  // …and run-budgets.js must agree with config.js about what that number is,
+  // or the loop and the UI can disagree again through the new path.
+  const { resolveBudgets, DEFAULT_MAX_REVIEW_ROUNDS: BUDGET_DEFAULT } = require('./run-budgets');
+  assert.equal(BUDGET_DEFAULT, DEFAULT_MAX_REVIEW_ROUNDS);
+  assert.equal(resolveBudgets({}).maxReviewRounds, DEFAULT_MAX_REVIEW_ROUNDS);
+  assert.equal(resolveBudgets({ max_review_rounds: 9 }).maxReviewRounds, 9);
 });

@@ -41,6 +41,15 @@ const DEFAULTS = {
   agent_defaults: { unset_api_key: true, model: 'opus' },
   cli: CLI_DEFAULTS,
   max_review_rounds: DEFAULT_MAX_REVIEW_ROUNDS,
+  // max_fix_plan_tasks: ceiling on how many tasks ONE fix plan may carry.
+  //   Left unset it follows `max_tasks_per_plan`, which is the ceiling this
+  //   codebase has already tuned against real runs — the planning gate's own
+  //   message says a plan past it means the PRD should have been split, and a
+  //   fix plan is a plan for the same run against the same PRD. Set it only to
+  //   separate the two deliberately. The fix plan previously had no upper bound
+  //   at all: it was checked for being EMPTY and any other length was accepted.
+  //   Resolved in run-budgets.js, where the run's other budgets live.
+  max_fix_plan_tasks: null,
   review_mode: 'parallel',
   // builder_strategy: how the monolithic task_execution builder is driven.
   //   'role' — classic role-prompted session (default).

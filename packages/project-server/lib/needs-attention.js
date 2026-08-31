@@ -14,11 +14,26 @@
  * the moment a step advances, and a stale "needs you" is worse than none.
  *
  * Returns null when the workflow can proceed on its own, otherwise:
- *   { reason, step, title, detail, action }
+ *   { reason, principal, step, title, detail, action }
  *
  * `reason` is a stable machine key; `title` and `detail` are for humans; and
- * `action` says what actually clears it. Every case here is waiting on a
- * PERSON — nothing in this list resolves itself with time.
+ * `action` says what actually clears it. Nothing in this list resolves itself
+ * with time.
+ *
+ * `principal` says WHO the condition is for, and it is the field that stops a
+ * technical fault being handed to the owner as a decision:
+ *
+ *   technical    — an engineer must look. Not a product question.
+ *   orchestrator — the engine can act on it once told to.
+ *   founder      — a genuine product or device decision.
+ *
+ * Two of the rules below exist because this function used to answer `null`
+ * about a run that was already broken. It reads STEP status, and a task that
+ * exhausted its fix cycles is marked blocked on the TASK while task_execution
+ * is marked completed — so the one function every consumer asks "does this need
+ * a human?" said no about a workflow carrying code a reviewer had refused three
+ * times. See blocked-tasks.js for the gate that stops that state arising, and
+ * technical-stop.js for the outcome it produces.
  */
 
 /** Gates that exist to stop for a human, regardless of anything going wrong. */
@@ -59,6 +74,55 @@ function deriveNeedsAttention(wf) {
   const stepKey = wf.currentStep || null;
   const step = currentStepOf(wf);
 
+  // 0. A recorded TECHNICAL_STOP outranks everything. It is terminal, it is
+  //    already carrying its own evidence and recovery hint, and describing it as
+  //    anything else — a blocked step, a human gate — points the wrong person at
+  //    it. Reported as `technical`, never as an owner decision.
+  if (wf.technicalStop && wf.technicalStop.outcome === 'TECHNICAL_STOP') {
+    const ts = wf.technicalStop;
+    const taskList = (ts.tasks || [])
+      .map((t) => `#${(Number(t.index) || 0) + 1} ${t.name}: ${t.reason}`)
+      .join('; ');
+    return {
+      reason: 'technical_stop',
+      reasonCode: ts.reasonCode,
+      principal: 'technical',
+      step: ts.step || stepKey,
+      title: `Run halted: ${ts.reasonCode}`,
+      detail: [taskList, ...(ts.evidence || [])].filter(Boolean).join(' — ')
+        || `The run stopped with ${ts.reasonCode}.`,
+      action: ts.recoveryHint,
+    };
+  }
+
+  // 0b. A blocked task with no stop recorded against it. Reachable on runs that
+  //     were already in flight when this gate landed, and on any path that marks
+  //     a task blocked without going through taskExecutionOutcome. Surfaced the
+  //     same way so a pre-existing run is not silently exempt.
+  {
+    const states = (wf.taskExecution && wf.taskExecution.taskStates) || {};
+    const tasks = (wf.taskPlan && wf.taskPlan.tasks) || [];
+    const blocked = Object.keys(states)
+      .map((k) => ({ i: Number(k), ts: states[k] }))
+      .filter(({ i, ts }) => Number.isInteger(i) && ts && (ts.status === 'blocked' || ts.status === 'error'))
+      .sort((a, b) => a.i - b.i);
+    if (blocked.length > 0) {
+      const named = blocked.map(({ i, ts }) => {
+        const t = tasks[i];
+        const name = (t && (t.name || t.title)) || `task ${i + 1}`;
+        return `#${i + 1} ${name}: ${ts.blockedReason || ts.error || `task is ${ts.status}`}`;
+      });
+      return {
+        reason: 'blocked_task',
+        principal: 'technical',
+        step: 'task_execution',
+        title: blocked.length === 1 ? 'A task is blocked' : `${blocked.length} tasks are blocked`,
+        detail: `${named.join('; ')}. The run cannot merge while a task is blocked, whatever task_execution reports.`,
+        action: 'Address the findings and relaunch the blocked task(s), or cancel the run.',
+      };
+    }
+  }
+
   // Ordered most-specific first: a completed run and a capped loop are both
   // terminal states that a generic "blocked" check would describe far less
   // usefully.
@@ -69,6 +133,7 @@ function deriveNeedsAttention(wf) {
   if (stepKey === 'completed') {
     return {
       reason: 'completed_not_finished',
+      principal: 'orchestrator',
       step: stepKey,
       title: 'Run finished — waiting to be closed',
       detail: `The ${wf.type || 'workflow'} run for ${wf.input || 'this item'} completed. It still holds the project's workflow slot, so nothing else can start here.`,
@@ -85,6 +150,7 @@ function deriveNeedsAttention(wf) {
     const isPrdReview = (step && step.cap) === 'review';
     return {
       reason: 'review_cap_reached',
+      principal: 'orchestrator',
       step: stepKey,
       title: isPrdReview ? 'PRD review hit its round cap' : 'Fix loop hit its round cap',
       detail: isPrdReview
@@ -120,6 +186,7 @@ function deriveNeedsAttention(wf) {
       if (a && a.stalled && !a.feedback && a.status !== 'done') {
         return {
           reason: a.stalled.reason,
+          principal: 'technical',
           step: key,
           title: a.stalled.title,
           detail: `${a.role}: ${a.stalled.detail}`,
@@ -135,6 +202,7 @@ function deriveNeedsAttention(wf) {
     if (step.autoAdvanceError) {
       return {
         reason: 'dead_step',
+        principal: 'technical',
         step: stepKey,
         title: `${stepKey} cannot advance`,
         detail: String(step.autoAdvanceError),
@@ -152,6 +220,7 @@ function deriveNeedsAttention(wf) {
       const firstError = agents.map((a) => a.error).find(Boolean);
       return {
         reason: 'dead_step',
+        principal: 'technical',
         step: stepKey,
         title: `${stepKey} cannot advance`,
         detail: firstError
@@ -166,6 +235,7 @@ function deriveNeedsAttention(wf) {
     if (step.status === 'blocked') {
       return {
         reason: 'blocked',
+        principal: 'technical',
         step: stepKey,
         title: `${stepKey} is blocked`,
         detail: String(step.error || 'The step was blocked by a guardrail and needs a decision.'),
@@ -186,6 +256,7 @@ function deriveNeedsAttention(wf) {
         if (hit) {
           return {
             reason: 'gate_blocked',
+            principal: 'technical',
             step: key,
             title: `${key} could not run a check`,
             detail: `${a.role} reported: ${hit.reason}. The code is not implicated — a check could not execute, so there is nothing for a developer to fix.`,
@@ -207,6 +278,7 @@ function deriveNeedsAttention(wf) {
     if (!skipped && (!step || step.status !== 'completed')) {
       return {
         reason: 'human_gate',
+        principal: 'founder',
         step: stepKey,
         title: `${stepKey} is waiting for you`,
         detail: HUMAN_GATES[stepKey],

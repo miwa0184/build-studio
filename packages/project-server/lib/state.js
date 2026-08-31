@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 function syncAgentStatus(wf, docsPath) {
   const statusFile = path.join(docsPath, 'agent-status.json');
@@ -106,7 +107,14 @@ function createStateManager(config, broadcast) {
         _lastStep = wf.currentStep;
       }
       wf.updatedAt = new Date().toISOString();
-      const tmp = wfFile + '.tmp';
+      // A unique temp name per write. The constant `.tmp` is not known to have
+      // corrupted anything in normal single-process operation — the rename is
+      // what makes the swap atomic, and that part was already right — but two
+      // writers meeting on one path is a hazard worth not having. The real
+      // lost-update problem (a stale whole-object save rolling back guard
+      // state) is fixed by moving that state out of here entirely: see
+      // run-guard.js, which has its own file and a revision check.
+      const tmp = `${wfFile}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
       fs.writeFileSync(tmp, JSON.stringify(wf, null, 2));
       fs.renameSync(tmp, wfFile);
       syncAgentStatus(wf, config.docsPath);
