@@ -13,6 +13,8 @@ const fs = require('fs');
 const path = require('path');
 const incidentsLib = require('./incidents');
 const { PROVENANCE, syntheticFeedback } = require('./feedback-provenance');
+const { createTechnicalStop, REASON_CODES, applyToWorkflow } = require('./technical-stop');
+const { createRunGuard } = require('./run-guard');
 
 const CHECK_INTERVAL_MS = 15_000;
 const STALL_THRESHOLD_MS = 10 * 60 * 1000; // 10 min — agent stall warning
@@ -148,6 +150,52 @@ function createOverseer(config, state, broadcast) {
     if (!overseer) return;
     overseer.incidents = incidentsLib.resolveIncident(overseer.incidents || [], symptom);
     syncEscalationMirror(overseer);
+  }
+
+  /**
+   * Park the run after an operator action that no agent verified.
+   *
+   * Both force-complete and kill-and-skip used to fire a loopback POST to
+   * /workflow/advance so the next task launched. That is the fail-open at its
+   * purest: the operator's intervention says "this task cannot be completed",
+   * and the engine answered by carrying on as though it had been. Whatever the
+   * run produced from there rested on a task nobody checked.
+   *
+   * The task record stays honest — provenance, untrusted pane evidence, an
+   * incident — and the agent process is still terminated. What stops is the
+   * run. A real attempt at that task is a successor repair run (A1b), which is
+   * also the only place acceptance evidence for it can honestly come from.
+   */
+  function parkRun(wf, { reasonCode, taskIndex, taskName, agentWindow, detail }) {
+    const stop = createTechnicalStop({
+      reasonCode,
+      runId: wf.id,
+      step: 'task_execution',
+      tasks: [{
+        index: typeof taskIndex === 'number' ? taskIndex : Number(taskIndex) || 0,
+        name: taskName || `task ${(Number(taskIndex) || 0) + 1}`,
+        reason: detail,
+      }],
+      evidence: [
+        `agent ${agentWindow} ended by operator without an agent verdict`,
+        `taskStates.${taskIndex}.acceptanceCovered=false`,
+      ],
+      recoveryHint:
+        'This run is parked because a task finished with no agent verdict. Acceptance coverage for it cannot '
+        + 'be rebuilt inside this run — start a successor repair run.',
+    });
+    applyToWorkflow(wf, stop);
+    try {
+      const statePath = config.statePath || path.join(config.projectRoot || process.cwd(), '.build-studio');
+      createRunGuard({ statePath }).mutate(wf.id, (doc) => {
+        doc.technicalStop = stop;
+        doc.blockingTasks = stop.tasks;
+      });
+    } catch (e) {
+      log(`could not persist the technical stop to the run guard: ${e.message}`);
+    }
+    log(`TECHNICAL_STOP ${reasonCode} — run parked (${agentWindow})`);
+    return stop;
   }
 
   /** Any open incident other than this one — i.e. is something still wrong? */
@@ -1028,41 +1076,32 @@ function createOverseer(config, state, broadcast) {
           step: 'task_execution',
           agent: windowName,
           task: foundAgent.taskIndex,
-          description: `Task force-completed by operator. Pane output is kept as untrusted diagnostic evidence — it is not an agent verdict and does not count as approval or acceptance evidence.`,
-          allowedRecoveryAction: 'relaunch-task-for-real-verdict',
+          description: `Task force-completed by operator. Pane output is kept as untrusted diagnostic evidence — it is not an agent verdict and does not count as approval or acceptance evidence. The run is parked; a successor repair run is the route to a real verdict.`,
+          allowedRecoveryAction: 'successor-repair-run',
         });
         // Ignore the incident just raised: it records the override, it is not a
         // problem waiting on anyone. Counting it meant the condition could never
         // hold, so the overseer stayed 'escalating' with its activity frozen on
         // the overrun text until somebody dismissed a banner by hand.
-        if (!hasOpenIncidentsBesides(wf.overseer, `force-completed-${windowName}`) && wf.overseer.status === 'escalating') {
-          wf.overseer.status = 'watching';
-          wf.overseer.activity = `Force-completed ${windowName} — advancing`;
-        }
-        recordIntervention(wf.overseer, `force-complete-${windowName}`, 'user-force-complete', `task force-completed; pane scrollback kept as untrusted diagnostic evidence, not as approval`);
+        wf.overseer.status = 'idle';
+        wf.overseer.activity = `Force-completed ${windowName} — run parked, no agent verdict`;
+        recordIntervention(wf.overseer, `force-complete-${windowName}`, 'user-force-complete', `task force-completed; pane scrollback kept as untrusted diagnostic evidence, not as approval; run parked`);
       }
+
+      parkRun(wf, {
+        reasonCode: REASON_CODES.TASK_FORCE_COMPLETED_UNVERIFIED,
+        taskIndex: foundAgent.taskIndex,
+        taskName: (wf.taskPlan && wf.taskPlan.tasks && wf.taskPlan.tasks[foundAgent.taskIndex]
+          && (wf.taskPlan.tasks[foundAgent.taskIndex].name)) || undefined,
+        agentWindow: windowName,
+        detail: 'force-completed by operator after a wallclock overrun — no agent verdict was produced',
+      });
       state.saveWorkflow(wf);
 
-      // Trigger launch of the next pending task. Done via HTTP loopback to
-      // /api/workflow/advance because launchNextTask lives in workflow.js and
-      // overseer.js doesn't depend on it directly. Same pattern force-complete
-      // mirrors from skip_blocked (workflow.js:4300).
-      try {
-        const http = require('http');
-        const data = JSON.stringify({ action: 'launch' });
-        const req = http.request({
-          hostname: 'localhost',
-          port: config.port,
-          path: '/api/workflow/advance',
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
-        });
-        req.on('error', (e) => log(`force-complete: loopback advance failed: ${e.message}`));
-        req.write(data);
-        req.end();
-      } catch (e) {
-        log(`force-complete: could not trigger next-task launch: ${e.message}`);
-      }
+      // No loopback to /workflow/advance here any more. Both actions used to
+      // fire one so the next task launched — which turned "this task cannot be
+      // completed" into "carry on as though it had been". The run is parked
+      // above; nothing follows it in this run.
       return { ok: true };
     } catch (e) {
       return { ok: false, error: e.message };
@@ -1132,34 +1171,28 @@ function createOverseer(config, state, broadcast) {
           step: 'task_execution',
           agent: windowName,
           task: foundAgent.taskIndex,
-          description: 'Task aborted by operator with no work attributed. Its acceptance coverage stays unmet until a real replacement run passes.',
-          allowedRecoveryAction: 'relaunch-task-for-real-verdict',
+          description: 'Task aborted by operator with no work attributed. Its acceptance coverage stays unmet; the run is parked and a successor repair run is the route to a real verdict.',
+          allowedRecoveryAction: 'successor-repair-run',
         });
-        if (!hasOpenIncidentsBesides(wf.overseer, `skipped-${windowName}`) && wf.overseer.status === 'escalating') {
-          wf.overseer.status = 'watching';
-          wf.overseer.activity = `Skipped ${windowName} — advancing`;
-        }
-        recordIntervention(wf.overseer, `kill-skip-${windowName}`, 'user-kill-skip', `task aborted and marked skipped; acceptance coverage left unmet`);
+        wf.overseer.status = 'idle';
+        wf.overseer.activity = `Skipped ${windowName} — run parked, no work attributed`;
+        recordIntervention(wf.overseer, `kill-skip-${windowName}`, 'user-kill-skip', `task aborted and marked skipped; acceptance coverage left unmet; run parked`);
       }
+
+      parkRun(wf, {
+        reasonCode: REASON_CODES.TASK_SKIPPED_UNVERIFIED,
+        taskIndex: foundAgent.taskIndex,
+        taskName: (wf.taskPlan && wf.taskPlan.tasks && wf.taskPlan.tasks[foundAgent.taskIndex]
+          && (wf.taskPlan.tasks[foundAgent.taskIndex].name)) || undefined,
+        agentWindow: windowName,
+        detail: 'aborted by operator after a wallclock overrun — no work attributed',
+      });
       state.saveWorkflow(wf);
 
-      // Trigger next-task launch via loopback (same as forceCompleteTaskAgent).
-      try {
-        const http = require('http');
-        const data = JSON.stringify({ action: 'launch' });
-        const req = http.request({
-          hostname: 'localhost',
-          port: config.port,
-          path: '/api/workflow/advance',
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
-        });
-        req.on('error', (e) => log(`kill-skip: loopback advance failed: ${e.message}`));
-        req.write(data);
-        req.end();
-      } catch (e) {
-        log(`kill-skip: could not trigger next-task launch: ${e.message}`);
-      }
+      // No loopback to /workflow/advance here any more. Both actions used to
+      // fire one so the next task launched — which turned "this task cannot be
+      // completed" into "carry on as though it had been". The run is parked
+      // above; nothing follows it in this run.
       return { ok: true };
     } catch (e) {
       return { ok: false, error: e.message };

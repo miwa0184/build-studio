@@ -45,7 +45,7 @@ interface WorkflowAgent {
 interface NeedsAttention {
   reason: 'completed_not_finished' | 'review_cap_reached' | 'dead_step' | 'blocked' | 'human_gate'
     | 'auth_blocked' | 'finished_not_reported' | 'agent_waiting' | 'awaiting_decision' | 'gate_blocked'
-    | 'technical_stop' | 'blocked_task'
+    | 'technical_stop' | 'blocked_task' | 'acceptance_gap'
   /** Who this is for. A technical fault is never an owner decision — see
    *  needs-attention.js. Absent on responses from a pre-A1a server. */
   principal?: 'technical' | 'orchestrator' | 'founder'
@@ -92,6 +92,25 @@ interface WorkflowStep {
   strategy?: string
   completedTasks?: { id?: number; name: string; status: string }[]
   currentTask?: { id?: number; name: string; description: string; roles: string[] }
+}
+
+/** A run the engine parked. Terminal — see project-server/lib/technical-stop.js.
+ *  There is no action that resumes it; recovery is a successor repair run. */
+interface TechnicalStop {
+  outcome: 'TECHNICAL_STOP'
+  reasonCode: string
+  principal: 'technical'
+  runId: string | null
+  step: string | null
+  tasks: { index: number; name: string; reason: string }[]
+  evidence: string[]
+  recoveryHint: string
+  approved: false
+  founderRejection: false
+  autoAdvanceable: false
+  mergeEligible: false
+  acceptanceEligible: false
+  createdAt?: string
 }
 
 interface TaskPlan {
@@ -160,6 +179,8 @@ interface Workflow {
   fixTaskIndex?: number
   fixSource?: string
   overseer?: OverseerState
+  /** Set once the run is parked. Its presence means every transition is refused. */
+  technicalStop?: TechnicalStop | null
   /** ISO time the run was created (server-set). */
   createdAt?: string
 }
@@ -457,6 +478,16 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
 
   async function advanceWorkflow(action?: string, extra?: Record<string, unknown>) {
     setAdvanceError(null)
+    // A parked run has no transitions. The server refuses these anyway, but a
+    // stale render or a shortcut should not put one on the wire at all — and
+    // surfacing the reason here is more useful than a 409 the user did not ask
+    // for. The gate is before the POST deliberately.
+    if (wf?.technicalStop) {
+      setAdvanceError(
+        `This run is parked (${wf.technicalStop.reasonCode}). It is terminal — recovery is a separate repair run.`,
+      )
+      return
+    }
     setAdvancing(action ?? 'advance')
     const res = await api.post('/workflow/advance', { action, notes: notes.trim() || undefined, ...extra })
     setAdvancing(null)
@@ -1466,7 +1497,7 @@ function StepDetail({
             const taskLabel = activeKey === 'task_execution' && a.taskIndex !== undefined
               ? `Task ${a.taskIndex + 1}`
               : undefined
-            return <AgentFeedbackCard key={i} agent={a} taskLabel={taskLabel} onViewLog={onViewLog} onMarkDone={onMarkDone} onRelaunchTask={(idx) => onAdvance('relaunch_task', { taskIndex: idx })} />
+            return <AgentFeedbackCard key={i} agent={a} taskLabel={taskLabel} onViewLog={onViewLog} onMarkDone={onMarkDone} onRelaunchTask={wf.technicalStop ? undefined : (idx) => onAdvance('relaunch_task', { taskIndex: idx })} />
           })}
         </div>
       )}
@@ -1697,7 +1728,10 @@ function StepDetail({
         )
       })()}
 
-      {isCurrentStep && (step.status !== 'pending' || agents.length > 0) && !(step.status === 'error' && agents.length === 0) && (
+      {/* A parked run gets a status surface instead of controls. */}
+      {wf.technicalStop && <TechnicalStopPanel stop={wf.technicalStop} />}
+
+      {!wf.technicalStop && isCurrentStep && (step.status !== 'pending' || agents.length > 0) && !(step.status === 'error' && agents.length === 0) && (
         <StepActions
           activeKey={activeKey}
           wfType={wf.type}
@@ -1774,7 +1808,92 @@ function MonolithicProgress({ wf, signals, onViewLog }: { wf: Workflow; signals:
   )
 }
 
+/**
+ * A parked run: status only, no controls.
+ *
+ * Buttons are the honest signal of what a product believes is possible. The
+ * previous shape left Advance and Relaunch on a stopped run; both answered 409,
+ * so the only thing they communicated was that the UI and the engine disagreed
+ * about whether the run could continue. Nothing here is clickable, because
+ * nothing here can be done to this run — recovery is a separate repair run with
+ * its own run id and budget.
+ */
+function TechnicalStopPanel({ stop }: { stop: TechnicalStop }) {
+  const label: React.CSSProperties = {
+    fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 700, letterSpacing: '0.1em',
+    textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: 4,
+  }
+  const value: React.CSSProperties = { fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--text)' }
+
+  return (
+    <div style={{
+      marginBottom: 16, padding: '14px 16px', borderRadius: 6,
+      background: 'color-mix(in srgb, var(--red) 8%, transparent)',
+      border: '1px solid var(--red)',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+        <span style={{
+          padding: '1px 6px', borderRadius: 3, background: 'var(--red)', color: 'var(--surface)',
+          fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 700, letterSpacing: '0.06em',
+          textTransform: 'uppercase',
+        }}>
+          Technical
+        </span>
+        <span style={{ fontFamily: 'var(--mono)', fontSize: 13, fontWeight: 700, color: 'var(--red)' }}>
+          Run parked — {stop.reasonCode}
+        </span>
+      </div>
+
+      <div style={{ display: 'grid', gap: 10 }}>
+        <div>
+          <div style={label}>Stopped at</div>
+          <div style={value}>
+            {stop.step || 'unknown step'}
+            {stop.tasks.length > 0 && (
+              <> · {stop.tasks.map((t) => `#${t.index + 1} ${t.name}`).join(', ')}</>
+            )}
+          </div>
+        </div>
+
+        {stop.tasks.length > 0 && (
+          <div>
+            <div style={label}>Why</div>
+            <div style={{ ...value, color: 'var(--text-dim)' }}>
+              {stop.tasks.map((t, i) => <div key={i}>#{t.index + 1} {t.name}: {t.reason}</div>)}
+            </div>
+          </div>
+        )}
+
+        {stop.evidence.length > 0 && (
+          <div>
+            <div style={label}>Evidence</div>
+            <pre style={{
+              margin: 0, fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--text-dim)',
+              whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+            }}>
+              {stop.evidence.join('\n')}
+            </pre>
+          </div>
+        )}
+
+        <div>
+          <div style={label}>What happens next</div>
+          <div style={{ ...value, color: 'var(--text-dim)' }}>
+            This run is parked and cannot be resumed — no action here restarts it, and its
+            acceptance coverage cannot be rebuilt in place. Recovery is a separate repair run
+            with its own run id and budget. {stop.recoveryHint}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function TaskBoard({ wf, onSkipBlocked, onViewLog }: { wf: Workflow; onSkipBlocked: (action: string, extra?: Record<string, unknown>) => void; onViewLog: (window: string) => void }) {
+  // A parked run's tasks are a record, not a control panel. Relaunching one is
+  // in-place recovery of a terminal stop, which the engine refuses — so the
+  // button would only ever produce a 409.
+  const stopped = !!wf.technicalStop
   const tex = wf.taskExecution!
   const tasks = wf.taskPlan!.tasks
   const { taskStates } = tex
@@ -1914,7 +2033,12 @@ function TaskBoard({ wf, onSkipBlocked, onViewLog }: { wf: Workflow; onSkipBlock
                       )}
                     </>
                   )}
-                  {isError && (
+                  {isError && stopped && (
+                    <span style={{ fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--red)' }}>
+                      {ts.status === 'blocked' ? 'blocked — run parked' : 'error — run parked'}
+                    </span>
+                  )}
+                  {isError && !stopped && (
                     <>
                       <span style={{ fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--red)' }}>error</span>
                       <button
@@ -1925,7 +2049,7 @@ function TaskBoard({ wf, onSkipBlocked, onViewLog }: { wf: Workflow; onSkipBlock
                       </button>
                     </>
                   )}
-                  {isPending && i <= tex.currentTaskIndex && (
+                  {isPending && !stopped && i <= tex.currentTaskIndex && (
                     <button
                       onClick={() => onSkipBlocked('relaunch_task', { taskIndex: i })}
                       style={{ padding: '2px 8px', fontSize: 10, fontFamily: 'var(--mono)', background: 'rgba(59,130,246,0.1)', border: '1px solid rgba(59,130,246,0.3)', borderRadius: 4, color: 'var(--blue)', cursor: 'pointer' }}

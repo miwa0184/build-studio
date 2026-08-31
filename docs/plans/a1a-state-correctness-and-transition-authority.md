@@ -195,6 +195,38 @@ case that needed to fail *open to a person*. Worth stating plainly, because the
 instinct that produced them is the right instinct for the ten original defects
 and the wrong one for the operator's escape hatch.
 
+## The recovery model reset
+
+Three review rounds each found a different hole in the recovery routes, and the
+fourth reading is that they were all the same hole. The first design treated a
+TECHNICAL_STOP as a pause a person could lift: relaunch the task, skip it, or
+acknowledge the halt, and the same run carried on. Every one of those routes had
+to answer a question none of them could — *has the original cause actually
+gone?* It had not. `acceptanceCovered` went false when a task finished without a
+verdict, and nothing anywhere set it back to true, so a "recovered" run carried
+a permanent coverage gap while reporting itself healthy. Patching each route in
+turn kept producing a new variant of the same defect: an advertised recovery
+that answered 400, a recovery that reached one reason code out of six, a gate
+that spent the run's budget until it killed the run.
+
+So the model changed rather than the routes. **A stop is terminal for the run it
+stops.** One check, in one place, with the same answer for the timer, the
+dashboard and the operator. Recovery is a successor repair run with a new run id
+and a fresh budget (A1b) — which is also the only honest source of acceptance
+evidence for a task nobody verified, because a new run can actually produce it.
+
+What that removed, deliberately and completely rather than leaving dead
+endpoints for the next reader to wire back up: `clear_technical_stop`, the
+`skip_blocked` handler, the in-run recovery action set, the clearing helper, and
+the hub controls that implied any of it was possible. `relaunch_task` survives
+for transient `running`/`error`/`pending` states *before* a run is stopped —
+restarting a wedged agent is ordinary operation, and taking it away would have
+been its own regression.
+
+The one thing this did not change is the operator's real escape hatch: cancel.
+A parked run can still be cancelled, and its evidence is on the run and in the
+guard for whatever comes next.
+
 ## Known limits
 
 - The per-step refusal count clears when that step genuinely advances; only the
@@ -204,6 +236,15 @@ and the wrong one for the operator's escape hatch.
 - `wf.round` still exists and still drives per-loop routing and display. It is
   no longer the budget, but two numbers describing adjacent things is a
   simplification A1b should revisit.
+- A parked run cannot be resumed at all, by design. Until A1b ships the
+  successor repair run, the operator's only actions are to read the evidence or
+  cancel. That is a deliberate trade: a run that cannot be resumed is worse to
+  live with than one that can, and better than one that resumes onto a coverage
+  gap nobody can see.
+- `acceptanceCovered` is never set back to true anywhere. That is the invariant,
+  not an omission — coverage is regained by a successor run producing a real
+  verdict, and a route that flipped the field would let a run claim criteria
+  nothing verified.
 - A pre-existing intermittent failure in `qa-suite-run.test.js` ("a full run is
   streamed to the log and parsed") reproduces on the unchanged head under
   full-suite parallelism and is untouched by this work.

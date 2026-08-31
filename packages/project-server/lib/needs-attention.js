@@ -160,7 +160,7 @@ function deriveNeedsAttention(wf) {
         step: stepKey,
         title: gaps.length === 1 ? 'A task was never verified' : `${gaps.length} tasks were never verified`,
         detail: `${named.join('; ')}. No agent certified this work, so its acceptance criteria are covered by nothing — the run must not report them as met.`,
-        action: 'Relaunch the task for a real verdict, or accept the gap explicitly before signing the run off.',
+        action: 'A real verdict needs a successor repair run. Advancing from here accepts the gap as it stands.',
       };
     }
   }

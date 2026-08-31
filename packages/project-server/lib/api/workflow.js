@@ -22,7 +22,7 @@ const { createRunGuard } = require('../run-guard');
 const runBudgets = require('../run-budgets');
 const blockedTasks = require('../blocked-tasks');
 const { isAgentVerdict } = require('../feedback-provenance');
-const { isTechnicalStop } = require('../technical-stop');
+const { isTechnicalStop, applyToWorkflow, refusalPayload } = require('../technical-stop');
 const { assertInside } = require('../path-guard');
 
 // Common instruction fragments injected into all agent prompts.
@@ -498,15 +498,7 @@ function createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast) {
    * `blocked`, which the auto-advance tick already refuses to act on.
    */
   function applyTechnicalStop(wf, stop) {
-    wf.technicalStop = stop;
-    wf.currentStep = 'technical_stop';
-    wf.steps = wf.steps || {};
-    wf.steps.technical_stop = {
-      status: 'blocked',
-      reasonCode: stop.reasonCode,
-      error: `${stop.reasonCode}: ${stop.recoveryHint}`,
-      stop,
-    };
+    applyToWorkflow(wf, stop);
     try {
       runGuard.mutate(wf.id, (doc) => {
         doc.technicalStop = stop;
@@ -519,34 +511,6 @@ function createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast) {
     state.saveWorkflow(wf);
     broadcast('workflow-updated', {});
     return stop;
-  }
-
-  /**
-   * Lift a TECHNICAL_STOP because an operator has acted on its cause.
-   *
-   * Only the explicit recovery actions call this, and only after they have
-   * actually changed something — relaunching the blocked task, or skipping it.
-   * A stop that nothing can clear is not fail-closed, it is a dead run whose
-   * only exit is discarding the work; the stop's own recoveryHint tells the
-   * operator to relaunch, so that route has to exist.
-   *
-   * The stop is kept on `wf.clearedTechnicalStops` rather than deleted: it is
-   * evidence that the run was stopped and why, and a later reader (an
-   * acceptance receipt, a post-mortem) needs it more than the live state does.
-   */
-  function clearTechnicalStopAfterRecovery(wf, reason) {
-    if (!isTechnicalStop(wf.technicalStop)) return;
-    const cleared = { ...wf.technicalStop, clearedAt: new Date().toISOString(), clearedBy: 'operator', clearedReason: reason };
-    wf.clearedTechnicalStops = [...(wf.clearedTechnicalStops || []), cleared];
-    wf.technicalStop = null;
-    if (wf.steps && wf.steps.technical_stop) wf.steps.technical_stop.status = 'skipped';
-    try {
-      runGuard.mutate(wf.id, (doc) => {
-        doc.technicalStop = null;
-        doc.clearedTechnicalStops = [...(doc.clearedTechnicalStops || []), cleared];
-      });
-    } catch (_) {}
-    console.log(`[workflow] TECHNICAL_STOP ${cleared.reasonCode} cleared by operator: ${reason}`);
   }
 
   /**
@@ -4346,10 +4310,15 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     if (ACCEPTANCE_SENSITIVE_STEPS.has(wf.currentStep)) {
       const gaps = blockedTasks.findAcceptanceGaps(wf);
       if (gaps.length > 0) {
+        // Says what is true and nothing more. It used to promise "relaunch them
+        // for a real verdict" — a route that did not exist: an unverified task
+        // is not relaunchable, and the operator actions that create these gaps
+        // now park the run outright. Coverage comes back from a successor
+        // repair run, or the operator advances explicitly and owns the gap.
         const detail = `${gaps.length} task(s) finished without an agent verdict `
           + `(${gaps.map((g) => `#${g.index + 1} ${g.name}`).join(', ')}) — acceptance coverage is unmet, so `
-          + `${wf.currentStep} will not auto-advance. Relaunch them for a real verdict, or advance this step `
-          + 'explicitly to accept the gap.';
+          + `${wf.currentStep} will not auto-advance. A real verdict for those tasks needs a successor repair `
+          + 'run; advancing this step explicitly accepts the gap as it stands.';
         if (step.acceptanceHold !== detail) {
           step.acceptanceHold = detail;
           recordAcceptanceGaps(wf, gaps);
@@ -4635,28 +4604,22 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
   });
 
   /**
-   * Actions that can legitimately act on a stopped run.
+   * A parked run has no transitions — not even for a person.
    *
-   * A TECHNICAL_STOP is terminal for AUTONOMY — no timer and no verdict moves
-   * it — but a person must be able to do something about it, or the only exit
-   * is discarding the run. These are the routes the stop's own recoveryHint
-   * points at, and each one is an explicit operator action.
+   * This used to hold a set of "recovery actions" a person could still take:
+   * relaunch the task, skip it, acknowledge the halt. Every one of them was a
+   * way for a run that had failed closed to be walked back open, and each had
+   * to answer a question none of them could — whether the original cause had
+   * actually gone. It had not: `acceptanceCovered` went false and nothing set
+   * it true, so a "recovered" run carried a permanent gap while reporting
+   * itself healthy, and three review rounds each found a different route into
+   * that state.
    *
-   * `relaunch` is deliberately NOT here: it resets `wf.steps[currentStep]` to a
-   * bare pending object, which would erase the very record the stop wrote there
-   * for consumers that only read steps.
-   *
-   * `relaunch_task` and `skip_blocked` only reach a handler when the run stopped
-   * on task_execution, which is true for BLOCKED_TASKS and nothing else. The
-   * other five reason codes stop on `reviewing`, `fix_plan`, `fix_execution` or
-   * whichever step a gate refused, where neither handler exists — so a run that
-   * hit a spent round budget had NO action available at all, and the only exit
-   * was discarding the work. `clear_technical_stop` is the general one: an
-   * explicit, logged operator acknowledgement that puts the run back on its step
-   * so the normal actions apply again. It is not an auto-advance — nothing
-   * reaches it without a person asking — which is the property that matters.
+   * So the answer is the same for everyone now, which is what makes it
+   * checkable: the run is parked, and recovery is a successor repair run with
+   * its own run id and its own budget (A1b). Not implemented here — this
+   * mandate only makes the stop honest about being terminal.
    */
-  const TECHNICAL_STOP_RECOVERY_ACTIONS = new Set(['relaunch_task', 'skip_blocked', 'clear_technical_stop']);
 
   router.post('/workflow/advance', (req, res) => {
     const { action, notes } = req.body;
@@ -4670,20 +4633,19 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     // is not a guarantee — it holds only until someone adds a handler, or a
     // restored snapshot puts the run on a step that does have one. Refuse here,
     // before any handler can mutate anything.
-    if (isTechnicalStop(wf.technicalStop) && !TECHNICAL_STOP_RECOVERY_ACTIONS.has(action)) {
-      return res.status(409).json({
-        error: `This run stopped with ${wf.technicalStop.reasonCode} and has no transition out of it. ${wf.technicalStop.recoveryHint}`,
-        technicalStop: wf.technicalStop,
-        recoveryActions: [...TECHNICAL_STOP_RECOVERY_ACTIONS],
-        workflow: wf,
-      });
-    }
-
-    // A recovery action reaches its own handler, which lives under the step the
-    // run stopped on. Put it back there first; the stop is cleared by the
-    // handler once it has actually done something.
-    if (isTechnicalStop(wf.technicalStop) && TECHNICAL_STOP_RECOVERY_ACTIONS.has(action)) {
-      wf.currentStep = wf.technicalStop.step || 'task_execution';
+    if (isTechnicalStop(wf.technicalStop)) {
+      // Mirror into the guard if it is not there yet. A stop normally arrives
+      // via applyTechnicalStop, which mirrors it — but a restored snapshot or a
+      // run that was in flight when this landed carries the stop on the
+      // workflow object alone, and that object is the one a stale whole-object
+      // save can roll back. Writing it here means a restart sees the halt
+      // whichever way the run acquired it.
+      try {
+        if (!runGuard.load(wf.id).technicalStop) {
+          runGuard.mutate(wf.id, (doc) => { doc.technicalStop = wf.technicalStop; });
+        }
+      } catch (_) {}
+      return res.status(409).json({ ...refusalPayload(wf.technicalStop), workflow: wf });
     }
 
     // A blocked task with no stop recorded against it stops an explicit advance
@@ -4692,37 +4654,12 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     // not by a guard. A restored snapshot, a run already in flight when this
     // landed, or any future path that marks a task blocked without going through
     // taskExecutionOutcome would have walked straight to merge.
-    if (!TECHNICAL_STOP_RECOVERY_ACTIONS.has(action) && !isTechnicalStop(wf.technicalStop)) {
+    {
       const stop = blockedTasks.blocksTransition(wf);
       if (stop) {
         applyTechnicalStop(wf, stop);
-        return res.status(409).json({
-          error: `${stop.reasonCode}: ${stop.recoveryHint}`,
-          technicalStop: stop,
-          recoveryActions: [...TECHNICAL_STOP_RECOVERY_ACTIONS],
-          workflow: wf,
-        });
+        return res.status(409).json({ ...refusalPayload(stop), workflow: wf });
       }
-    }
-
-    // --- Clear a technical stop: the general recovery route ---
-    //
-    // Deliberately does nothing except lift the halt and put the run back where
-    // it stopped. It does not decide what happens next; the operator does, with
-    // the step's normal actions. The stop is kept as evidence.
-    if (action === 'clear_technical_stop') {
-      if (!isTechnicalStop(wf.technicalStop) && !(wf.steps && wf.steps.technical_stop)) {
-        return res.status(400).json({ error: 'this run is not stopped' });
-      }
-      const stopped = wf.technicalStop;
-      clearTechnicalStopAfterRecovery(wf, notes || 'acknowledged by operator');
-      state.saveWorkflow(wf);
-      broadcast('workflow-updated', {});
-      return res.json({
-        workflow: wf,
-        clearedTechnicalStop: stopped ? stopped.reasonCode : null,
-        note: 'The halt is lifted and recorded. Nothing was advanced — use the step\'s own actions from here.',
-      });
     }
 
     // --- Relaunch: reset current step and re-enter it ---
@@ -7606,11 +7543,14 @@ ${EFFICIENCY_INSTRUCTIONS}`,
         const ts = tex?.taskStates[String(tIdx)];
         if (!ts) return res.status(400).json({ error: `Task ${tIdx} not found` });
         const phase = ts.status;
-        // 'blocked' belongs here: it is the state the BLOCKED_TASKS stop tells
-        // the operator to relaunch out of, and the hub renders the Relaunch
-        // button on exactly those tasks. Rejecting it made the advertised
-        // recovery route — and the only button the UI offers — a 400.
-        if (!['running', 'error', 'pending', 'blocked'].includes(phase)) {
+        // Transient states only. `blocked`, `skipped`, `aborted` and
+        // `force_completed` are deliberately absent: each of them means the run
+        // is parked, and relaunching a task inside a parked run is the in-place
+        // recovery this model removed. A fresh attempt at that task belongs to a
+        // successor repair run, which can also rebuild the acceptance evidence
+        // the original attempt never produced. (The terminal guard above refuses
+        // these before they reach here; this is the second lock on the door.)
+        if (!['running', 'error', 'pending'].includes(phase)) {
           return res.status(400).json({ error: `Task ${tIdx} is not in a relaunchable phase (${phase})` });
         }
 
@@ -7631,40 +7571,18 @@ ${EFFICIENCY_INSTRUCTIONS}`,
         // under it — harmless today (launchNextTask overwrites it on
         // completion) but it reads as a stalled step to anything watching.
         if (wf.steps.task_execution) wf.steps.task_execution.status = 'running';
-        clearTechnicalStopAfterRecovery(wf, `task ${tIdx + 1} relaunched by operator`);
         launchTaskImpl(wf, tIdx);
         updateStepAgents(wf);
         state.saveWorkflow(wf);
         return res.json({ workflow: wf });
       }
 
-      // Skip a blocked/errored task (user-initiated rescue).
-      //
-      // This wrote `done`, which made an abandoned task indistinguishable from
-      // a completed one — the same laundering kill-and-skip used to do, and the
-      // one operator route that could carry a blocked task past the gate as if
-      // it had passed. It is `skipped` now: the run still moves on, because a
-      // person decided it should, but nothing downstream may count the task as
-      // verified and its acceptance coverage stays unmet.
-      if (action === 'skip_blocked' && body.taskIndex !== undefined) {
-        const tex = wf.taskExecution;
-        const tIdx = Number(body.taskIndex);
-        const ts = tex?.taskStates[String(tIdx)];
-        if (!ts || !['blocked', 'error'].includes(ts.status)) {
-          return res.status(400).json({ error: `Task ${tIdx} is not blocked or errored` });
-        }
-        const priorStatus = ts.status;
-        ts.status = 'skipped';
-        ts.acceptanceCovered = false;
-        ts.skipReason = ts.skipReason
-          || `skipped by operator from ${priorStatus === 'error' ? 'an errored' : 'a blocked'} state — no work attributed`;
-        ts.completedAt = ts.completedAt || new Date().toISOString();
-        clearTechnicalStopAfterRecovery(wf, `task ${tIdx + 1} skipped by operator`);
-        updateStepAgents(wf);
-        state.saveWorkflow(wf);
-        launchNextTask(wf);
-        return res.json({ workflow: wf });
-      }
+      // `skip_blocked` used to live here: it took a blocked task, marked it
+      // skipped, and carried the same run on. That is in-place recovery of a
+      // parked run — the pattern this model removed — and it was also the last
+      // route that could put a blocked task behind the run without anything
+      // ever re-verifying it. A blocked task now parks the run, and the next
+      // attempt is a successor repair run.
     }
 
     // API contract step — Architect defines API contracts before frontend/backend implement in parallel

@@ -99,15 +99,30 @@ wrong. Design record: `docs/plans/a1a-state-correctness-and-transition-authority
 
 ### Fixed
 
-- **A stopped run can be recovered instead of only cancelled.** A TECHNICAL_STOP
-  stays terminal for anything automatic, but `Relaunch task` and `Skip task` now
-  work from it — the routes its own recovery hint points at, including on a task
-  in the `blocked` state those routes exist for. For halts that are not about a
-  task (a spent round budget, a fix plan over its ceiling), an explicit
-  `clear_technical_stop` acknowledges the halt and puts the run back on its step
-  so the normal actions apply; nothing reaches it without a person asking. Every
-  cleared stop is kept on the run as evidence. `Relaunch step` is refused on a
-  stopped run rather than resetting the step and erasing the stop record.
+- **A technically stopped run is parked, and stays parked.** A TECHNICAL_STOP is
+  terminal for the run it stops — for the timer, for the dashboard, and for you.
+  Every action is refused with a machine-readable answer naming the reason code,
+  where it stopped, and the evidence. There is no button that resumes it, and no
+  API route either: relaunching the task, skipping it and acknowledging the halt
+  have all been removed rather than left as dead endpoints.
+
+  Recovery is a *successor repair run* — a new run with its own run id and its
+  own budget. That is also the only honest way to rebuild acceptance coverage
+  for a task nobody verified, which is what the in-place routes could never do:
+  they put the run back on its feet while its coverage gap stayed open and
+  invisible. The successor run itself is A1b; this release makes the stop honest
+  about being terminal.
+
+  The Workflow tab shows a parked run as a status panel — reason code, which
+  task and step, the evidence, and what happens next — with no controls on it.
+
+- **Force-complete and kill-and-skip now park the run.** Both ended the stuck
+  agent and then launched the next task, which turned "this task cannot be
+  completed" into "carry on as though it had been". Everything downstream then
+  rested on work nobody checked. They still terminate the agent, keep its
+  terminal output as untrusted diagnostic evidence, and record an incident — but
+  the run stops, with `TASK_FORCE_COMPLETED_UNVERIFIED` or
+  `TASK_SKIPPED_UNVERIFIED`.
 
 - **A blocked task also stops an explicit advance, not just the timer.** The
   guard used to sit only in the auto-advance tick, so a restored snapshot — or a

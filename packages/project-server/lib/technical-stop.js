@@ -27,6 +27,21 @@
  * `principal` is always 'technical': a technical fault is never a founder
  * question. See incidents.js for the same vocabulary applied to non-terminal
  * conditions.
+ *
+ * TERMINAL FOR THE RUN IT STOPS. This is the property everything else hangs
+ * off, and it was learned the hard way: the first design treated a stop as a
+ * pause that an operator could lift, and three review rounds each found a
+ * different hole in that. They were all the same hole. Every in-run recovery
+ * route had to answer "has the original cause actually gone?", and none of them
+ * could — `acceptanceCovered` went false and nothing set it true, so a run that
+ * had been "recovered" carried a permanent, invisible gap while reporting
+ * itself healthy.
+ *
+ * A stop now ends the run. Recovery is a SUCCESSOR repair run, with its own run
+ * id and its own budget (A1b) — which is also the only honest place to rebuild
+ * acceptance evidence, because a fresh run can actually produce it. That makes
+ * terminality one check in one place instead of six, and it deletes the class
+ * of question the recovery routes kept getting wrong.
  */
 
 const SCHEMA_VERSION = 1;
@@ -52,6 +67,10 @@ const REASON_CODES = {
   TASK_PLAN_CEILING: 'TASK_PLAN_CEILING',
   /** Auto-advance was refused by a gate more times than the run's budget allows. */
   AUTO_ADVANCE_REFUSAL_BUDGET_EXHAUSTED: 'AUTO_ADVANCE_REFUSAL_BUDGET_EXHAUSTED',
+  /** An operator force-completed a task; no agent ever certified it. */
+  TASK_FORCE_COMPLETED_UNVERIFIED: 'TASK_FORCE_COMPLETED_UNVERIFIED',
+  /** An operator aborted a task; no work is attributed to it. */
+  TASK_SKIPPED_UNVERIFIED: 'TASK_SKIPPED_UNVERIFIED',
 };
 
 const VALID_REASON_CODES = new Set(Object.values(REASON_CODES));
@@ -114,6 +133,51 @@ function isAcceptanceEligible(x) {
   return !isTechnicalStop(x);
 }
 
+/**
+ * Put a stop onto a workflow object. Pure — no persistence, no guard.
+ *
+ * Shared so the two callers cannot drift: the workflow router (which also
+ * mirrors into the run guard) and the overseer (whose operator actions park the
+ * run). A second hand-rolled copy is how `currentStep` and `steps.technical_stop`
+ * would end up disagreeing about whether a run is stopped.
+ */
+function applyToWorkflow(wf, stop) {
+  wf.technicalStop = stop;
+  wf.currentStep = 'technical_stop';
+  wf.steps = wf.steps || {};
+  wf.steps.technical_stop = {
+    status: 'blocked',
+    reasonCode: stop.reasonCode,
+    error: `${stop.reasonCode}: ${stop.recoveryHint}`,
+    stop,
+  };
+  return wf;
+}
+
+/**
+ * The wire shape for refusing an action on a parked run.
+ *
+ * Deliberately carries no list of in-run recovery actions: the previous
+ * response advertised three, and advertising any is the defect. `recovery`
+ * names the only real route.
+ */
+function refusalPayload(stop) {
+  return {
+    outcome: TECHNICAL_STOP,
+    terminal: true,
+    reasonCode: stop.reasonCode,
+    principal: stop.principal,
+    runId: stop.runId,
+    step: stop.step,
+    tasks: stop.tasks || [],
+    evidence: stop.evidence || [],
+    recovery: 'successor_repair_run',
+    error: `This run is parked: ${stop.reasonCode}. It is terminal — no action resumes it. `
+      + `${stop.recoveryHint} Recovery is a separate repair run with its own run id and budget.`,
+    technicalStop: stop,
+  };
+}
+
 module.exports = {
   SCHEMA_VERSION,
   TECHNICAL_STOP,
@@ -124,4 +188,6 @@ module.exports = {
   canAutoAdvance,
   isMergeEligible,
   isAcceptanceEligible,
+  applyToWorkflow,
+  refusalPayload,
 };
