@@ -45,6 +45,12 @@ interface WorkflowAgent {
 interface NeedsAttention {
   reason: 'completed_not_finished' | 'review_cap_reached' | 'dead_step' | 'blocked' | 'human_gate'
     | 'auth_blocked' | 'finished_not_reported' | 'agent_waiting' | 'awaiting_decision' | 'gate_blocked'
+    | 'technical_stop' | 'blocked_task'
+  /** Who this is for. A technical fault is never an owner decision — see
+   *  needs-attention.js. Absent on responses from a pre-A1a server. */
+  principal?: 'technical' | 'orchestrator' | 'founder'
+  /** Machine-stable code on a TECHNICAL_STOP (see technical-stop.js). */
+  reasonCode?: string
   step: string | null
   title: string
   detail: string
@@ -211,8 +217,6 @@ const WF_STEPS: Record<string, { key: string; name: string; loopHint?: string }[
   ],
 }
 
-const AUTO_ADVANCE_MAX_ROUNDS = 3
-
 interface WorkflowViewProps {
   allowedTypes?: string[]
   onSwitchFunction?: (fnId: string) => void
@@ -288,14 +292,9 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
       api.post('/workflow/auto-advance', { enabled: true, strict: autoAdvanceStrict, skipDemoReview: skipDemoReviewLocal }).catch(() => {})
     }
   }, [onAutoAdvanceChange, api, autoAdvanceStrict, skipDemoReviewLocal])
-  const [autoAdvanceRound, setAutoAdvanceRound] = useState(0)
   const [maxReviewRounds, setMaxReviewRounds] = useState(4)
   const [advanceError, setAdvanceError] = useState<string | null>(null)
   const [advancing, setAdvancing] = useState<string | null>(null)
-  const autoAdvancingRef = useRef(false)
-  // Tracks the workflow id we've already pushed the auto-advance preference to,
-  // so the self-heal below posts at most once per run.
-  const autoAdvanceSyncRef = useRef<string | null>(null)
   const [tokenStats, setTokenStats] = useState<{ projectTokens: number; projectCostUSD: number; prds: { prdId: string; tokens: number; costUSD: number }[] } | null>(null)
   // Providers hit by the project's effective CLI slots — drives the compact
   // usage meter above Start Workflow.
@@ -369,160 +368,24 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
     return () => clearInterval(interval)
   }, [loadTokenStats])
 
-  // Auto-advance logic — runs on each workflow state update
-  useEffect(() => {
-    if (!autoAdvance || !wf || wf.currentStep === 'completed' || autoAdvancingRef.current) return
+  // Auto-advance is the SERVER's job, and only the server's.
+  //
+  // There used to be a second auto-advance policy here: an effect that
+  // re-derived the next transition from whatever state it had last polled and
+  // POSTed it itself. Two autonomous drivers against one workflow disagreed by
+  // construction — this one deliberately left round-1 reviews manual and the
+  // server's did not; this one's safety budget lived in React state and the
+  // server's in process memory, so a reload restored one and a restart the
+  // other. Worse, the effect ran on MOUNT: on 2026-07-28 the server had halted
+  // a run at a dead code_review step for seven hours and simply opening the app
+  // advanced it to merge_to_main with the round-2 review never run.
+  //
+  // What the hub does now: render state, render incidents, send an EXPLICIT
+  // user action (advanceWorkflow, below), and toggle the server's auto-advance
+  // policy. It does not decide a transition, hold a budget, or re-enable
+  // autonomy as a side effect of being rendered. The server's tick — with its
+  // budgets in the run guard — is the only thing that advances a run on its own.
 
-    // Self-heal the server-side flag. The auto-advance checkbox persists
-    // client-side across runs, but a freshly-started workflow defaults to no
-    // server flag — and if the box was already checked when the run began (no
-    // toggle event fired), nothing ever POSTed it down. Without wf.autoAdvance
-    // the server-side tick never runs, so round-1 review steps (code_review,
-    // qa_validation) stall — the client-side tick intentionally leaves those
-    // manual on round 1, and while the project is backgrounded there's nothing
-    // else to advance them. Push the preference down once per run.
-    if (!wf.autoAdvance && autoAdvanceSyncRef.current !== wf.id) {
-      autoAdvanceSyncRef.current = wf.id
-      api.post('/workflow/auto-advance', { enabled: true, strict: autoAdvanceStrict, skipDemoReview: skipDemoReviewLocal }).catch(() => {})
-    }
-
-    if (autoAdvanceRound >= AUTO_ADVANCE_MAX_ROUNDS) {
-      setAutoAdvance(false)
-      return
-    }
-
-    const step = wf.steps[wf.currentStep]
-    if (!step) return
-
-    const agents = step.agents || []
-    const allDone = agents.length > 0 && agents.every(a => a.status === 'done' || a.status === 'error')
-    const isPending = step.status === 'pending' && agents.length === 0
-
-    // Review steps: manual on round 1, auto-launch + auto-advance on round 2+
-    // Round 2+ = fix loop iteration — reviews auto-launch and auto-advance if no blocking issues
-    // (if blocking issues are found, the verdict logic below sends to fix, which is correct)
-    const round = wf.round || 1
-    const reviewSteps = ['code_review', 'qa_validation', 'ac_verification', 'security_audit']
-    // owner_signoff fires the single onboarding commit; team_review for onboarding
-    // also requires owner judgment (artifacts are backfills, not fresh decisions).
-    // owner_consultations: kickoff manual gate between pm_scoping and team_review.
-    // demo_review is manual UNLESS Skip Demo Review is checked with Auto-advance.
-    const skipDemo = !!(wf.autoAdvanceSkipDemoReview ?? skipDemoReviewLocal)
-    const alwaysManual = ['device_testing', 'owner_signoff', 'owner_consultations']
-    if (!skipDemo) alwaysManual.push('demo_review')
-    if (alwaysManual.includes(wf.currentStep)) return
-    if (wf.type === 'onboarding' && wf.currentStep === 'team_review') return
-    if (round <= 1 && reviewSteps.includes(wf.currentStep)) return
-
-    // Don't auto-advance blocked steps (e.g. validation failure in planning)
-    if (step.status === 'blocked') return
-
-    // A step where EVERY agent errored without producing feedback has nothing to
-    // advance on. `allDone` above counts 'error' as done — deliberately, so a
-    // partly-failed step can still advance on the agents that did report — but a
-    // step where NOTHING reported is a dead step, and approving it forward walks
-    // the workflow to a green "completed" with zero output.
-    //
-    // The server-side tick has this guard (workflow.js, "halted instead of
-    // advancing past a dead step") and stashes step.autoAdvanceError. This copy
-    // did not, so the server would halt and then this loop would walk straight
-    // past it on the next mount — which is exactly what happened to fazon
-    // faz-197 on 2026-07-28: a Codex reviewer died 3s in on an MCP auth error,
-    // the server halted for seven hours, and simply opening the app advanced
-    // code_review → merge_to_main with the round-2 review never run.
-    const allErrored = agents.length > 0 && agents.every(a => a.status === 'error')
-    if (allErrored && agents.every(a => !a.feedback)) return
-
-    let action: string | null = null
-
-    // Skip Demo Review: same action the human Skip button fires
-    if (wf.currentStep === 'demo_review' && skipDemo) {
-      action = 'skip'
-    } else if (isPending) {
-      // Auto-launch pending steps (including merge steps).
-      // owner_signoff is a manual gate — never auto-approve (it fires a git commit).
-      // owner_consultations is a manual gate — owner must explicitly approve.
-      const manualSteps = ['merge_to_main', 'capture_learnings', 'owner_signoff', 'owner_consultations']
-      action = manualSteps.includes(wf.currentStep) ? 'approve' : 'launch'
-    } else if (allDone) {
-      // Determine action based on agent feedback — reuse detectVerdict for consistency
-      // qa_tests is TDD — failing tests are expected, never treat as blocking
-      const hasBlocking = wf.currentStep === 'qa_tests' ? false : agents.some(a => {
-        const v = detectVerdict(a)
-        return v === 'blocking' || v === 'changes'
-      })
-
-      const isReviewStep = ['code_review', 'qa_validation', 'ac_verification', 'security_audit'].includes(wf.currentStep)
-      const isReviewFlowStep = ['reviewing', 'team_review'].includes(wf.currentStep)
-
-      // Strict auto-advance: ANY finding (medium/low included, or a non-approval)
-      // bounces the review round back to PM — until clean or the round cap, so
-      // low-severity nitpicks can't loop forever. Mirrors the server-side tick.
-      const strictHasFindings = autoAdvanceStrict && wf.type === 'review'
-        && wf.currentStep === 'reviewing' && !hasBlocking
-        && agents.some(a => {
-          const fb = (a as { feedback?: string }).feedback
-          if (!fb) return false
-          if (/\*\*Approved:\*\*\s*no\b/i.test(fb)) return true
-          return [/\*\*Blocking:\*\*\s*(\d+)/i, /\*\*Medium:\*\*\s*(\d+)/i, /\*\*Low:\*\*\s*(\d+)/i]
-            .some(re => { const m = fb.match(re); return m ? parseInt(m[1]) > 0 : false })
-        })
-
-      if (hasBlocking && isReviewStep) {
-        action = 'send_to_devs'
-        setAutoAdvanceRound(r => r + 1)
-      } else if (hasBlocking && isReviewFlowStep) {
-        // team_review (kickoff/onboarding) accepts `approve` to advance to
-        // pm_revision; reviewing (review workflow) accepts `send_to_pm`.
-        action = wf.currentStep === 'team_review' ? 'approve' : 'send_to_pm'
-        setAutoAdvanceRound(r => r + 1)
-      } else if (strictHasFindings && round < maxReviewRounds) {
-        // Strict re-review bounce. Do NOT count this toward AUTO_ADVANCE_MAX_ROUNDS:
-        // a strict loop is meant to iterate until reviews are clean, and it is
-        // already bounded server-side by max_review_rounds (the `round <`
-        // condition here). Counting it would trip the client safety cap and
-        // silently disable auto-advance mid-loop (leaving pm_fix stranded).
-        action = 'send_to_pm'
-      } else {
-        action = 'approve'
-      }
-    }
-
-    if (action) {
-      autoAdvancingRef.current = true
-      console.log(`[auto-advance] step=${wf.currentStep} status=${step.status} agents=${agents.length} allDone=${allDone} isPending=${isPending} action=${action}`)
-      api.post('/workflow/advance', { action }).then((result: any) => {
-        console.log(`[auto-advance] result: needsAdvance=${result?.needsAdvance} error=${result?.error}`)
-        autoAdvancingRef.current = false
-        if (result?.error) {
-          // Gate rejected the action (e.g. qa_tests with no committed tests, or a
-          // qa_validation.strict failure) — surface it and stop looping instead of
-          // retrying silently. Re-enable Auto-advance to try again after fixing the cause.
-          setAdvanceError(result.error)
-          setAutoAdvance(false)
-          return
-        }
-        if (result?.needsAdvance) {
-          // Fix execution: approve returns needsAdvance — immediately launch next task
-          setTimeout(() => {
-            console.log(`[auto-advance] chaining launch after needsAdvance`)
-            autoAdvancingRef.current = true
-            api.post('/workflow/advance', { action: 'launch' }).then(() => {
-              autoAdvancingRef.current = false
-              load()
-            }).catch(() => {
-              autoAdvancingRef.current = false
-            })
-          }, 1500)
-        } else {
-          load()
-        }
-      }).catch((e: any) => {
-        console.error(`[auto-advance] error:`, e)
-        autoAdvancingRef.current = false
-      })
-    }
-  }, [wf, autoAdvance, autoAdvanceStrict, skipDemoReviewLocal, maxReviewRounds, autoAdvanceRound, api, load])
 
   // Poll workflow log if viewing one
   useEffect(() => {
@@ -561,12 +424,12 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
       setStartCanOverride(!!res.canOverride)
       return
     }
-    // Carry the persisted auto-advance preference into the fresh workflow now —
-    // the server flag defaults off, and without it the server-side tick won't
-    // advance round-1 review steps. The effect self-heals too; this closes the
-    // gap before its first render.
+    // Carry the persisted auto-advance preference into the fresh workflow the
+    // user just started. The server flag defaults off, and this is the same
+    // explicit toggle the checkbox sends — the user asked for auto-advance and
+    // then asked to start a run. It is not the client deciding a transition:
+    // the server still owns every decision about what to advance and when.
     if (autoAdvance) {
-      if (res?.workflow?.id) autoAdvanceSyncRef.current = res.workflow.id
       api.post('/workflow/auto-advance', {
         enabled: true,
         strict: autoAdvanceStrict,
@@ -888,10 +751,10 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
                 <input
                   type="checkbox"
                   checked={autoAdvance}
-                  onChange={e => {
-                    setAutoAdvance(e.target.checked)
-                    if (e.target.checked) setAutoAdvanceRound(0)
-                  }}
+                  // Toggling the policy no longer zeroes a counter: the budget
+                  // is the run's, lives in the server's run guard, and is not
+                  // renewed by a checkbox.
+                  onChange={e => setAutoAdvance(e.target.checked)}
                   style={{ accentColor: 'var(--accent)' }}
                 />
                 Auto-advance
@@ -940,9 +803,12 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
                 </label>
               )}
               <span style={{ flex: 1 }} />
-              {autoAdvance && (
+              {autoAdvance && wf?.round != null && (
+                // The run's round, read from the server. The number here used to
+                // be a client-side counter of transitions this browser tab had
+                // posted, which meant something different in every tab.
                 <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--muted)' }}>
-                  {autoAdvanceRound}/{AUTO_ADVANCE_MAX_ROUNDS}
+                  round {wf.round}/{maxReviewRounds}
                 </span>
               )}
             </div>
@@ -1217,7 +1083,25 @@ export function WorkflowView({ allowedTypes, onSwitchFunction, autoAdvance: auto
           }}>
             <span style={{ flexShrink: 0 }}>{['human_gate', 'auth_blocked', 'finished_not_reported', 'agent_waiting', 'awaiting_decision', 'gate_blocked'].includes(needsAttention.reason) ? '⏸' : '⚠'}</span>
             <span style={{ flex: 1 }}>
+              {/* A technical halt is labelled as one. Without this the banner
+                  reads identically to a gate waiting on the owner, which sends
+                  the wrong person at the problem — a run stopped by a blocked
+                  task is not a decision anybody is being asked to make. */}
+              {needsAttention.principal === 'technical' && (
+                <span style={{
+                  display: 'inline-block', marginRight: 6, padding: '1px 5px', borderRadius: 3,
+                  background: 'var(--red)', color: 'var(--surface)', fontSize: 9, fontWeight: 700,
+                  letterSpacing: '0.06em', textTransform: 'uppercase', verticalAlign: 'middle',
+                }}>
+                  Technical
+                </span>
+              )}
               <b>{needsAttention.title}</b>
+              {needsAttention.reasonCode && (
+                <span style={{ color: 'var(--muted)', marginLeft: 6, fontSize: 10 }}>
+                  {needsAttention.reasonCode}
+                </span>
+              )}
               <br />
               {needsAttention.detail}
               <br />
