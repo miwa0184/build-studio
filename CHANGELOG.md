@@ -21,6 +21,83 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-09-01 — Terminal technical failures get bounded successor repair runs
+
+A technically stopped run remains permanently terminal, but Build Studio can
+now create a separate, server-owned repair successor without turning the fault
+into a founder decision. Identity, cumulative recovery spend and repeated-cause
+limits live in an append-only lineage ledger in the admission registry. Design
+record and red-first receipt:
+`docs/plans/a1b2-successor-lineage-budgets.md`.
+
+### Added
+
+- **Atomic successor identity and lineage budgets.** A successor gets a new run
+  id, the same lineage id, an exact predecessor id and a monotonic ordinal. One
+  locked registry transaction claims the predecessor's only child, registers
+  the successor and charges cumulative spend, so replay and concurrent callers
+  converge on one result.
+- **Finite recovery defaults.** `max_successor_runs` defaults to `2`,
+  `max_lineage_recovery_units` derives to `58` under the shipped per-run caps,
+  and `max_lineage_no_progress_repeats` defaults to `1`. Limits are validated
+  and captured once for a root lineage; a config reload or new guard cannot
+  raise an existing lineage's allowance.
+- **A real successor-repair workflow.** A durable technical stop schedules a
+  bounded technical builder automatically, including after a server restart.
+  Its assignment contains only the predecessor's technical cause and expressly
+  excludes product requirements, acceptance policy and founder decisions.
+- **Deterministic candidate-progress evidence.** The server records the exact
+  Git head before repair and accepts continuation only at a different forward
+  descendant. This proves a concrete committed candidate exists, not that it is
+  correct: the successor re-runs the predecessor's original step for semantic
+  verification. Free-form success prose, dirty edits and rewritten history do
+  not count.
+
+### Changed
+
+- **Per-run recovery counters no longer renew the whole repair chain.** Review
+  rounds, fix rounds, all task-fix cycles, auto-advance refusals and one terminal
+  event are charged into cumulative lineage recovery units when a successor is
+  created. Holds and observation time remain zero-cost because the engine does
+  not truthfully meter wallclock, model tokens or money for every agent CLI.
+- **Repeated identical failures stop before side effects.** A deterministic
+  fingerprint over reason, step, tasks and evidence survives run ids and
+  timestamps. At the configured cap, the server returns a typed terminal
+  refusal before a guard, workflow, branch, worktree or agent can be created;
+  the hub explains that no founder question is being asked.
+- **A successful repair continues only under the successor identity.** The
+  predecessor guard and registry evidence stay terminal. Operational context
+  is copied forward, transient state for the stopped step is reset, and the
+  remaining verification pipeline runs again under the new id.
+
+### Upgrade steps
+
+**In Build Studio** — rebuild and reinstall the bundle (hub + project-server
+both changed): `cd packages/hub && npx next build`, then
+`cd packages/desktop && node inject-resources.js`, then restart the Electron
+app and any running project-servers.
+
+**In each managed project** — nothing to edit. New root admissions capture the
+lineage ledger immediately. An A1b.1 root without a ledger is captured atomically
+on its first eligible successor, using the then-current validated limits. The
+existing append-only `.build-studio/admission/` and `.build-studio/run-guard/`
+paths remain authoritative; do not delete them.
+
+### Known limitations
+
+- The Git-head delta is deliberately a candidate signal, not semantic proof of
+  progress. The re-entered workflow step owns that proof.
+- Build Studio still has no complete cross-CLI authority for wallclock, token or
+  monetary cost, so A1b.2 does not claim those budgets.
+
+### Fixed during validation
+
+- **A completed server-run QA suite now resolves only after its log artifact is
+  flushed.** The child process could previously close while the write stream
+  still held queued output, briefly returning complete counters beside an empty
+  `logPath`. The required three-pass validation exposed the race; the promise
+  now waits for the stream's `finish` callback.
+
 ## 2026-09-01 — Runs are admitted at the door, and a run's history cannot be deleted into a fresh start
 
 Every run start is now admitted server-side against the project's actual git

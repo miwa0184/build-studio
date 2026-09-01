@@ -64,8 +64,15 @@ const { execFileSync } = require('child_process');
 const {
   createAdmissionRegistry,
   NonceReplayError,
+  AdmissionRegistryBusyError,
+  LineageRegistryRefusalError,
 } = require('./admission-registry');
 const { createRunGuard } = require('./run-guard');
+const {
+  resolveLineageBudgets,
+  successorRecoveryEligibility,
+  recoveryCharge,
+} = require('./lineage-budgets');
 
 const RUNREQUEST_VERSION = 1;
 /** The documented ceiling on a RunRequest's validity window. */
@@ -370,7 +377,14 @@ function createAdmission(config) {
     // registry entry); the guard file above is an inert orphan and stays —
     // nothing in this system deletes guard files.
     try {
-      registry.admit({ nonce: request.nonce, runId, verdict, lineage, claims });
+      registry.admit({
+        nonce: request.nonce,
+        runId,
+        verdict,
+        lineage,
+        claims,
+        lineageBudget: resolveLineageBudgets(config),
+      });
     } catch (e) {
       if (e instanceof NonceReplayError) {
         refuse('ADMISSION_NONCE_REPLAYED', 'this nonce has already been consumed — a runRequest is single-use');
@@ -379,6 +393,145 @@ function createAdmission(config) {
     }
 
     return { runId, verdict };
+  }
+
+  /**
+   * Register one bounded successor for a terminal technical predecessor.
+   *
+   * Unlike a root RunRequest, every fact comes from server-owned stores: the
+   * predecessor's registry identity and guard stop. The registry transaction
+   * is the commit point for the one-child claim, lineage charge and successor
+   * identity. The guard is materialised afterwards; until it exists contextFor
+   * fails closed, so a crash can leave an inert pending run but never a
+   * runnable orphan. Replaying the predecessor resumes that materialisation.
+   */
+  function createSuccessor(predecessorRunId, { now = new Date() } = {}) {
+    let predecessor;
+    try {
+      predecessor = registry.getRun(predecessorRunId);
+    } catch (e) {
+      refuse('ADMISSION_VALIDATOR_FAILURE', `admission registry unreadable: ${e.message}`);
+    }
+    if (!predecessor) refuse('RUN_NOT_ADMITTED', `predecessor ${predecessorRunId} was never admitted`);
+
+    let predecessorGuard;
+    try {
+      predecessorGuard = runGuard.load(predecessorRunId);
+    } catch (e) {
+      if (e && e.code === 'RUN_GUARD_MISSING') refuse('RUN_GUARD_MISSING', e.message, { runId: String(predecessorRunId) });
+      refuse('ADMISSION_VALIDATOR_FAILURE', `run guard for ${predecessorRunId} cannot be verified: ${e.message}`);
+    }
+    const identity = predecessor.lineage;
+    const guardIdentity = predecessorGuard.identity;
+    if (!identity || !guardIdentity
+      || identity.lineageId !== guardIdentity.lineageId
+      || Number(identity.successorOrdinal || 0) !== Number(guardIdentity.successorOrdinal || 0)) {
+      refuse('LINEAGE_IDENTITY_MISMATCH', `registry and guard identity disagree for predecessor ${predecessorRunId}`);
+    }
+
+    const stop = predecessorGuard.technicalStop;
+    const eligibility = successorRecoveryEligibility(stop);
+    if (!eligibility.eligible) {
+      refuse('SUCCESSOR_NOT_ELIGIBLE', `run ${predecessorRunId} cannot create a successor: ${eligibility.reason}`);
+    }
+    if (String(stop.runId) !== String(predecessorRunId)) {
+      refuse('LINEAGE_IDENTITY_MISMATCH', `technical stop belongs to ${stop.runId}, not predecessor ${predecessorRunId}`);
+    }
+
+    const timestamp = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const successorRunId = `repair-${timestamp}-${crypto.randomBytes(3).toString('hex')}`;
+    const successorIdentity = {
+      runId: successorRunId,
+      lineageId: identity.lineageId,
+      predecessorRunId: String(predecessorRunId),
+      successorOrdinal: Number(identity.successorOrdinal || 0) + 1,
+      registeredAt: now.toISOString(),
+      admissionRequestDigest: identity.admissionRequestDigest || null,
+      admittedHead: identity.admittedHead || predecessor.verdict && predecessor.verdict.head || null,
+      admittedRepo: identity.admittedRepo || predecessor.verdict && predecessor.verdict.repo || null,
+    };
+    const verdict = {
+      kind: 'GateVerdict',
+      version: 1,
+      decision: 'ADMITTED',
+      runId: successorRunId,
+      repo: successorIdentity.admittedRepo,
+      head: successorIdentity.admittedHead,
+      taskPacket: predecessor.verdict && predecessor.verdict.taskPacket || null,
+      requestDigest: identity.admissionRequestDigest || predecessor.verdict && predecessor.verdict.requestDigest || null,
+      admittedAt: now.toISOString(),
+      successor: true,
+      predecessorRunId: String(predecessorRunId),
+      lineageId: identity.lineageId,
+    };
+    const repairSpec = {
+      version: 1,
+      predecessorRunId: String(predecessorRunId),
+      lineageId: identity.lineageId,
+      successorOrdinal: successorIdentity.successorOrdinal,
+      reasonCode: stop.reasonCode,
+      step: stop.step,
+      tasks: Array.isArray(stop.tasks) ? stop.tasks : [],
+      evidence: Array.isArray(stop.evidence) ? stop.evidence : [],
+      fingerprint: eligibility.fingerprint,
+      assignment: 'Repair only the recorded technical cause. Do not change product requirements, acceptance policy, or founder decisions.',
+    };
+
+    let committed;
+    try {
+      committed = registry.createSuccessor({
+        predecessorRunId: String(predecessorRunId),
+        successorRunId,
+        verdict,
+        lineage: successorIdentity,
+        terminalStop: stop,
+        terminalFingerprint: eligibility.fingerprint,
+        repairSpec,
+        charge: recoveryCharge(predecessorGuard),
+        legacyLineageBudget: resolveLineageBudgets(config),
+      });
+    } catch (e) {
+      if (e instanceof AdmissionRegistryBusyError) {
+        refuse(e.code, e.message, { retryable: true, predecessorRunId: String(predecessorRunId) });
+      }
+      if (e instanceof LineageRegistryRefusalError || e && /^LINEAGE_|^RUN_/.test(e.code || '')) {
+        refuse(e.code, e.message, e.detail || {});
+      }
+      refuse('ADMISSION_VALIDATOR_FAILURE', `successor registry transaction failed: ${e.message}`);
+    }
+
+    const committedRunId = committed.runId;
+    const committedEntry = committed.run;
+    const committedIdentity = committedEntry.lineage;
+    try {
+      if (!fs.existsSync(runGuard.fileFor(committedRunId))) {
+        runGuard.register(committedRunId, { identity: committedIdentity });
+      } else {
+        const materialized = runGuard.load(committedRunId);
+        if (!materialized.identity
+          || materialized.identity.lineageId !== committedIdentity.lineageId
+          || materialized.identity.predecessorRunId !== committedIdentity.predecessorRunId
+          || materialized.identity.successorOrdinal !== committedIdentity.successorOrdinal) {
+          refuse('LINEAGE_IDENTITY_MISMATCH', `materialized guard identity disagrees for successor ${committedRunId}`);
+        }
+      }
+    } catch (e) {
+      if (e instanceof AdmissionRefusedError) throw e;
+      refuse(
+        'SUCCESSOR_MATERIALIZATION_PENDING',
+        `successor ${committedRunId} is committed but remains unlaunchable until its guard can be materialized: ${e.message}`,
+        { runId: committedRunId, predecessorRunId: String(predecessorRunId) },
+      );
+    }
+
+    return {
+      runId: committedRunId,
+      verdict: committedEntry.verdict,
+      lineage: committedIdentity,
+      lineageBudget: committed.lineage,
+      repairSpec: committedEntry.repairSpec,
+      replayed: committed.replayed === true,
+    };
   }
 
   /**
@@ -414,6 +567,7 @@ function createAdmission(config) {
       lineage: entry.lineage,
       registeredAt: entry.registeredAt,
       guardRevision: guardDoc.revision,
+      lineageBudget: registry.read().lineages[entry.lineage.lineageId] || null,
     });
     CONTEXTS.add(ctx);
     return ctx;
@@ -507,6 +661,7 @@ function createAdmission(config) {
   return {
     verifyRunRequest,
     admit,
+    createSuccessor,
     contextFor,
     assertRunAdmitted,
     describeContext,

@@ -23,7 +23,14 @@ const { attachStateAuthority } = require('../state');
 const runBudgets = require('../run-budgets');
 const blockedTasks = require('../blocked-tasks');
 const { isAgentVerdict } = require('../feedback-provenance');
-const { isTechnicalStop, refusalPayload, TerminalRunError, TechnicalStopPersistError } = require('../technical-stop');
+const {
+  isTechnicalStop,
+  refusalPayload,
+  TerminalRunError,
+  TechnicalStopPersistError,
+  createTechnicalStop,
+  REASON_CODES,
+} = require('../technical-stop');
 const { assertInside } = require('../path-guard');
 
 // Common instruction fragments injected into all agent prompts.
@@ -3338,6 +3345,321 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     return (stop > 0 ? after.slice(0, stop) : after.slice(0, 500)).trim();
   }
 
+  // ── A1b.2 successor repair runs ──────────────────────────────────────────
+
+  function cloneJson(value) {
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  function measuredProjectHead() {
+    const { execFileSync } = require('child_process');
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: projectRoot,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    if (!/^[0-9a-f]{40,64}$/.test(head)) throw new Error(`git returned an invalid repair baseline head: ${JSON.stringify(head)}`);
+    return head;
+  }
+
+  function measuredForwardHead(baseHead) {
+    const { execFileSync } = require('child_process');
+    const currentHead = measuredProjectHead();
+    if (currentHead === baseHead) return { advanced: false, baseHead, currentHead, reason: 'HEAD did not change' };
+    try {
+      execFileSync('git', ['merge-base', '--is-ancestor', baseHead, currentHead], {
+        cwd: projectRoot,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (_) {
+      return { advanced: false, baseHead, currentHead, reason: 'HEAD changed but is not a forward descendant of the repair baseline' };
+    }
+    return { advanced: true, baseHead, currentHead };
+  }
+
+  /** The predecessor state a successful repair may continue under a NEW id. */
+  function continuationFrom(predecessor) {
+    const continuation = cloneJson(predecessor);
+    delete continuation.technicalStop;
+    delete continuation.guardUnverifiable;
+    delete continuation.lineageRefusal;
+    if (continuation.steps) delete continuation.steps.technical_stop;
+    return continuation;
+  }
+
+  function repairAgentFor(wf) {
+    const role = (config.roles && config.roles.execution && config.roles.execution[0])
+      || (config.roles && config.roles.standalone && config.roles.standalone[0])
+      || { role: 'Technical Repair', skill: 'fullstack_dev', command: 'fullstack_dev' };
+    const evidence = wf.successorRepair.predecessorEvidence;
+    return {
+      role: role.role,
+      window: `repair-${wf.lineage.successorOrdinal}`,
+      status: 'pending',
+      reportFeedback: true,
+      instruction: `You are the bounded technical repair agent for a successor run.
+
+## AUTHORITY BOUNDARY
+
+Repair only the recorded technical cause below. Do not change product requirements, acceptance criteria, owner/founder decisions, or unrelated architecture. The predecessor is terminal and must never be resumed or rewritten.
+
+- Predecessor run: ${evidence.predecessorRunId}
+- Lineage: ${wf.lineage.lineageId}
+- Successor ordinal: ${wf.lineage.successorOrdinal}
+- Reason: ${evidence.reasonCode}
+- Stopped step: ${evidence.step}
+- Cause fingerprint: ${evidence.fingerprint}
+- Server-measured repair baseline: ${wf.successorRepair.progressSignal.baseHead}
+- Tasks: ${JSON.stringify(evidence.tasks || [])}
+- Evidence: ${JSON.stringify(evidence.evidence || [])}
+
+Diagnose the cause, make only the necessary technical repair on the current branch, and run the narrowest trustworthy verification. Commit the repair as a forward descendant of the server-measured baseline. An uncommitted edit, rewritten history, or this report alone is not a progress signal. Do not open or merge a PR.
+
+Your feedback MUST begin with exactly:
+
+**Repair complete:** yes | no
+**Evidence:** <the command/receipt that proves the answer>
+
+Use \`yes\` only when the recorded technical cause is repaired and the cited verification passed. Use \`no\` when the same cause remains; the lineage budget, not a founder question, decides whether another successor may exist.`,
+    };
+  }
+
+  function launchSuccessorRepair(wf) {
+    const step = wf.steps.successor_repair;
+    if (step.status === 'running' && Array.isArray(step.agents) && step.agents.length > 0) return wf;
+    step.status = 'running';
+    step.agents = launchWorkflowAgents(wf, [repairAgentFor(wf)], {
+      useWorktrees: false,
+      cwd: projectRoot,
+      stepKey: 'successor_repair',
+    });
+    state.saveWorkflow(wf);
+    startAutoAdvanceTimer();
+    return wf;
+  }
+
+  function buildSuccessorWorkflow(predecessor, created, repairBaseHead) {
+    const now = new Date().toISOString();
+    const evidence = {
+      predecessorRunId: created.repairSpec.predecessorRunId,
+      reasonCode: created.repairSpec.reasonCode,
+      step: created.repairSpec.step,
+      tasks: created.repairSpec.tasks,
+      evidence: created.repairSpec.evidence,
+      fingerprint: created.repairSpec.fingerprint,
+    };
+    return {
+      id: created.runId,
+      admission: {
+        runId: created.runId,
+        requestDigest: created.verdict.requestDigest,
+        admittedAt: created.verdict.admittedAt,
+        admittedHead: created.verdict.head,
+        successor: true,
+      },
+      lineage: created.lineage,
+      lineageBudget: created.lineageBudget,
+      type: 'repair',
+      input: predecessor.input,
+      prdPath: predecessor.prdPath || null,
+      itemId: predecessor.itemId || null,
+      branch: predecessor.branch || null,
+      defaultBranch: predecessor.defaultBranch || 'main',
+      reviewBranch: predecessor.reviewBranch || predecessor.branch || null,
+      currentStep: 'successor_repair',
+      steps: { successor_repair: { status: 'pending', agents: [] } },
+      round: 1,
+      feedback: [],
+      sessionName: `wf-repair-${created.runId.slice(-12)}`,
+      autoAdvance: true,
+      successorRepair: {
+        predecessorEvidence: evidence,
+        assignment: created.repairSpec.assignment,
+        // A changed forward git head is deterministic and reproducible. It is
+        // only evidence that a concrete repair candidate exists, never proof
+        // that the cause is semantically fixed; the original step must verify
+        // that after continuation.
+        progressSignal: {
+          kind: 'git_head_forward_delta',
+          baseHead: repairBaseHead,
+          currentHead: null,
+          candidateOnly: true,
+        },
+        continuationWorkflow: continuationFrom(predecessor),
+      },
+      createdAt: now,
+      updatedAt: now,
+    };
+  }
+
+  /**
+   * Registry commit → guard materialisation (inside admission) → workflow →
+   * agent. Budget and identity refusal therefore precede every operational
+   * side effect. A replay resumes from the committed successor.
+   */
+  function materializeSuccessor(predecessor) {
+    // Capture the deterministic repair baseline before the lineage commit and
+    // before any workflow/agent side effect. If git authority is unavailable,
+    // no successor budget is spent.
+    const repairBaseHead = measuredProjectHead();
+    const created = admission.createSuccessor(predecessor.id);
+    const active = state.loadWorkflow();
+    if (active && active.id === created.runId) {
+      if (active.type === 'repair' && active.currentStep === 'successor_repair') launchSuccessorRepair(active);
+      return { created, workflow: state.loadWorkflow() };
+    }
+    const successor = buildSuccessorWorkflow(predecessor, created, repairBaseHead);
+    state.saveWorkflow(successor);
+    launchSuccessorRepair(successor);
+    return { created, workflow: successor };
+  }
+
+  function lineageRefusalPayload(error) {
+    return {
+      code: error.code || 'SUCCESSOR_REFUSED',
+      terminal: true,
+      principal: 'technical',
+      founderQuestion: false,
+      error: error.message,
+      detail: error.detail || {},
+    };
+  }
+
+  function isTerminalLineageRefusal(error) {
+    return !!error && (
+      /^LINEAGE_(SUCCESSOR|RECOVERY|NO_PROGRESS)_BUDGET_EXHAUSTED$/.test(error.code || '')
+      || error.code === 'SUCCESSOR_NOT_ELIGIBLE'
+    );
+  }
+
+  function transientSuccessorRefusalPayload(error) {
+    return {
+      code: error.code || 'SUCCESSOR_TEMPORARILY_UNAVAILABLE',
+      terminal: false,
+      principal: 'technical',
+      founderQuestion: false,
+      retryable: error.code === 'ADMISSION_REGISTRY_BUSY',
+      error: error.message,
+      detail: error.detail || {},
+    };
+  }
+
+  /** Persist the refusal on the parked run without changing its terminal stop. */
+  function parkOnLineageRefusal(wf, error) {
+    wf.lineageRefusal = lineageRefusalPayload(error);
+    try { state.saveWorkflow(wf); } catch (saveError) {
+      console.error(`[successor] could not persist lineage refusal for ${wf.id}: ${saveError.message}`);
+    }
+  }
+
+  // A durable technical stop may schedule one successor without a founder or
+  // browser being present. createSuccessor is idempotent, so a simultaneous
+  // explicit request converges on the same committed child.
+  const successorSchedules = new Set();
+  const successorBusyRetries = new Map();
+  function scheduleSuccessor(wf) {
+    const runId = String(wf.id);
+    // Legacy/test-double runs have no server identity and cannot become a
+    // lineage. Their stop remains terminal; do not spin an impossible retry.
+    try { if (!admission.registry.isRegistered(runId)) return; } catch (_) { /* fail closed in the scheduled attempt */ }
+    if (successorSchedules.has(runId)) return;
+    successorSchedules.add(runId);
+    setImmediate(() => {
+      let retryDelay = null;
+      try {
+        const active = state.loadWorkflow();
+        if (!active || String(active.id) !== runId || !isTechnicalStop(active.technicalStop)) return;
+        materializeSuccessor(active);
+        successorBusyRetries.delete(runId);
+      } catch (e) {
+        if (e.code === 'ADMISSION_REGISTRY_BUSY') {
+          const attempt = Number(successorBusyRetries.get(runId) || 0) + 1;
+          successorBusyRetries.set(runId, attempt);
+          if (attempt <= 3) retryDelay = attempt * 25;
+          console.warn(`[successor] registry busy for ${runId}; ${retryDelay ? `retry ${attempt}/3 in ${retryDelay}ms` : 'bounded retries exhausted'}`);
+        } else {
+          successorBusyRetries.delete(runId);
+          const active = state.loadWorkflow();
+          if (isTerminalLineageRefusal(e)
+            && active && String(active.id) === runId && isTechnicalStop(active.technicalStop)) {
+            parkOnLineageRefusal(active, e);
+          }
+          console.warn(`[successor] autonomous creation refused for ${runId}: ${e.code || 'ERROR'} ${e.message}`);
+        }
+      } finally {
+        successorSchedules.delete(runId);
+        if (retryDelay) {
+          const retry = setTimeout(() => {
+            try {
+              const active = state.loadWorkflow();
+              if (active && String(active.id) === runId && isTechnicalStop(active.technicalStop)) scheduleSuccessor(active);
+            } catch (error) {
+              console.warn(`[successor] busy retry could not inspect ${runId}: ${error.message}`);
+            }
+          }, retryDelay);
+          if (retry.unref) retry.unref();
+        }
+      }
+    });
+  }
+  state.registerTechnicalStopHook(scheduleSuccessor);
+
+  // A process may die after the stop becomes durable but before its setImmediate
+  // callback runs. Reconcile that one active stopped run on startup; the same
+  // idempotent registry transaction handles pre-upgrade A1b.1 stops too.
+  setImmediate(() => {
+    try {
+      const active = state.loadWorkflow();
+      if (active && isTechnicalStop(active.technicalStop)) {
+        scheduleSuccessor(active);
+      } else if (active && active.type === 'repair' && active.currentStep === 'successor_repair'
+        && active.steps && active.steps.successor_repair
+        && active.steps.successor_repair.status === 'pending') {
+        // Crash window: registry + guard + workflow committed, agent launch not
+        // yet recorded. Resuming this pending repair is idempotent and avoids a
+        // browser/manual action becoming part of recovery correctness.
+        launchSuccessorRepair(active);
+      }
+    } catch (error) {
+      console.warn(`[successor] startup reconciliation could not inspect active workflow: ${error.message}`);
+    }
+  });
+
+  router.post('/workflow/successor', (req, res) => {
+    const predecessor = state.loadWorkflow();
+    if (!predecessor) return res.status(404).json({ code: 'NO_ACTIVE_WORKFLOW', error: 'no active workflow' });
+    // Handler backstop: the central seam must have verified the predecessor's
+    // stored admission before this route reads or writes successor authority.
+    if (!req.admission || req.admission.runId !== predecessor.id) {
+      return res.status(403).json({
+        code: 'ADMISSION_BACKSTOP',
+        admission: 'refused',
+        error: 'successor creation requires the predecessor\'s verified stored admission',
+      });
+    }
+    if (!isTechnicalStop(predecessor.technicalStop)) {
+      return res.status(409).json({ code: 'SUCCESSOR_NOT_ELIGIBLE', error: 'the active run is not durably technically stopped' });
+    }
+    try {
+      const { created, workflow } = materializeSuccessor(predecessor);
+      return res.status(created.replayed ? 200 : 201).json({
+        successor: created.lineage,
+        lineageBudget: created.lineageBudget,
+        replayed: created.replayed,
+        workflow,
+      });
+    } catch (e) {
+      if (e && (e.name === 'AdmissionRefusedError' || /^LINEAGE_|^SUCCESSOR_|^RUN_/.test(e.code || ''))) {
+        if (isTerminalLineageRefusal(e)) {
+          parkOnLineageRefusal(predecessor, e);
+          return res.status(409).json(lineageRefusalPayload(e));
+        }
+        return res.status(e.code === 'ADMISSION_REGISTRY_BUSY' ? 503 : 409).json(transientSuccessorRefusalPayload(e));
+      }
+      throw e;
+    }
+  });
+
   router.post('/workflow/start', (req, res) => {
     // Defence in depth for direct router mounts: the central seam normally
     // creates this context, but this handler must still refuse before its
@@ -4430,6 +4752,22 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     // Manual actions (approve/override/skip) stay available.
     const allErrored = agents.length > 0 && agents.every(a => a.status === 'error');
     if (allErrored && agents.every(a => !a.feedback)) {
+      if (wf.type === 'repair') {
+        const cause = wf.successorRepair.predecessorEvidence.fingerprint;
+        const stop = createTechnicalStop({
+          reasonCode: REASON_CODES.SUCCESSOR_REPAIR_FAILED,
+          runId: wf.id,
+          step: 'successor_repair',
+          evidence: [
+            `cause_fingerprint=${cause}`,
+            ...agents.map((agent) => `${agent.role}: ${agent.error || 'launch failed without feedback'}`),
+          ],
+          recoveryHint: 'The repair agent could not run. The lineage ledger may allow one bounded successor; no founder question is generated.',
+          causeFingerprint: cause,
+        });
+        applyTechnicalStop(wf, stop);
+        return;
+      }
       if (!step.autoAdvanceError) {
         step.autoAdvanceError = `all ${agents.length} agent(s) errored with no output — halted instead of advancing past a dead step; fix the cause (see agent errors) and relaunch`;
         state.saveWorkflow(wf);
@@ -4699,9 +5037,125 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
    *
    * So the answer is the same for everyone now, which is what makes it
    * checkable: the run is parked, and recovery is a successor repair run with
-   * its own run id and its own budget (A1b). Not implemented here — this
-   * mandate only makes the stop honest about being terminal.
+   * its own run id and its own lineage-wide budget. A successful repair only
+   * continues under the successor identity and must re-run the original step.
    */
+
+  function continueSuccessorAfterRepair(wf, feedback) {
+    const predecessorEvidence = wf.successorRepair.predecessorEvidence;
+    const continued = cloneJson(wf.successorRepair.continuationWorkflow);
+    const stoppedStep = predecessorEvidence.step;
+
+    // Identity and authority are the successor's. Only operational context is
+    // inherited; the predecessor itself remains terminal in its guard/registry.
+    continued.id = wf.id;
+    continued.admission = wf.admission;
+    continued.lineage = wf.lineage;
+    continued.lineageBudget = wf.lineageBudget;
+    continued.currentStep = stoppedStep;
+    // This is a new run, so display/routing round labels restart. The resources
+    // the predecessor spent are not lost: they were already charged into the
+    // immutable lineage ledger before this successor existed.
+    continued.round = 1;
+    continued.autoAdvance = true;
+    continued.sessionName = wf.sessionName;
+    continued.feedback = [...(continued.feedback || []), ...(wf.feedback || [])];
+    continued.successorRepairResult = {
+      repaired: true,
+      predecessorRunId: predecessorEvidence.predecessorRunId,
+      fingerprint: predecessorEvidence.fingerprint,
+      progressSignal: wf.successorRepair.progressSignal,
+      evidence: feedback,
+      completedAt: new Date().toISOString(),
+    };
+    delete continued.technicalStop;
+    delete continued.lineageRefusal;
+    delete continued.guardUnverifiable;
+    continued.steps = continued.steps || {};
+    delete continued.steps.technical_stop;
+
+    const priorStep = continued.steps[stoppedStep] || {};
+    continued.steps[stoppedStep] = {
+      status: 'pending',
+      agents: [],
+      ...(priorStep.completedTasks ? { completedTasks: priorStep.completedTasks } : {}),
+    };
+    if (stoppedStep === 'fix_execution') {
+      // The fix step's cursor is per-run scratch state. Retaining an exhausted
+      // predecessor index would skip the re-run and immediately hit its old
+      // round path under a new identity.
+      continued.fixTaskIndex = 0;
+      continued.steps[stoppedStep].completedTasks = [];
+    }
+    if (stoppedStep === 'task_execution' && continued.taskExecution) {
+      const named = new Set((predecessorEvidence.tasks || [])
+        .map((task) => Number(task.index)).filter(Number.isInteger));
+      for (const [key, taskState] of Object.entries(continued.taskExecution.taskStates || {})) {
+        const index = Number(key);
+        if (named.size > 0 ? !named.has(index) : taskState.status !== 'blocked') continue;
+        taskState.status = 'pending';
+        taskState.agents = [];
+        taskState.startedAt = null;
+        taskState.completedAt = null;
+        taskState.acceptanceCovered = false;
+        delete taskState.blockedReason;
+      }
+    }
+    state.saveWorkflow(continued);
+    return continued;
+  }
+
+  function handleSuccessorRepairAdvance(wf, action, res) {
+    if (action === 'launch') {
+      launchSuccessorRepair(wf);
+      return res.json({ workflow: wf });
+    }
+    if (action !== 'approve') {
+      return res.status(400).json({ error: `successor_repair accepts launch or approve, got ${JSON.stringify(action)}` });
+    }
+    const agents = wf.steps.successor_repair.agents || [];
+    const reports = agents.filter(isAgentVerdict).map((agent) => agent.feedback).filter(Boolean);
+    const feedback = reports.join('\n\n');
+    const repaired = /\*\*Repair complete:\*\*\s*yes\b/i.test(feedback);
+    const evidence = /\*\*Evidence:\*\*\s*\S+/i.test(feedback);
+    let progress = null;
+    if (repaired && evidence) {
+      try {
+        progress = measuredForwardHead(wf.successorRepair.progressSignal.baseHead);
+      } catch (error) {
+        progress = {
+          advanced: false,
+          baseHead: wf.successorRepair.progressSignal.baseHead,
+          currentHead: null,
+          reason: `git progress signal could not be verified: ${error.message}`,
+        };
+      }
+    }
+    if (!repaired || !evidence || !progress || !progress.advanced) {
+      const cause = wf.successorRepair.predecessorEvidence.fingerprint;
+      const stop = createTechnicalStop({
+        reasonCode: REASON_CODES.SUCCESSOR_REPAIR_FAILED,
+        runId: wf.id,
+        step: 'successor_repair',
+        evidence: [
+          `cause_fingerprint=${cause}`,
+          !repaired
+            ? 'repair report says the cause remains'
+            : !evidence
+              ? 'repair report omitted structured evidence'
+              : `deterministic_progress_signal=absent (${progress.reason})`,
+        ],
+        recoveryHint: 'The bounded repair did not clear the recorded cause. The lineage ledger decides whether another successor is allowed; no founder decision is requested.',
+        causeFingerprint: cause,
+      });
+      applyTechnicalStop(wf, stop);
+      return res.json({ workflow: wf, repairFailed: true, technicalStop: stop });
+    }
+    wf.successorRepair.progressSignal.currentHead = progress.currentHead;
+    wf.successorRepair.progressSignal.measuredAt = new Date().toISOString();
+    const continued = continueSuccessorAfterRepair(wf, feedback);
+    return res.json({ workflow: continued, continued: true, needsAdvance: true });
+  }
 
   router.post('/workflow/advance', (req, res) => {
     const { action, notes } = req.body;
@@ -4822,6 +5276,9 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     const effectiveAction = req.body.action;
 
     try {
+      if (wf.type === 'repair') {
+        return handleSuccessorRepairAdvance(wf, effectiveAction, res);
+      }
       // --- Kickoff workflow transitions ---
       if (wf.type === 'kickoff') {
         return handleKickoffAdvance(wf, effectiveAction, notes, res);

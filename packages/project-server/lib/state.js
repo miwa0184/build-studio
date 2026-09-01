@@ -111,6 +111,12 @@ function attachStateAuthority(state, config) {
 
   /** Stops that could not reach the guard yet, keyed by run id. */
   const pendingStops = new Map();
+  let technicalStopHook = null;
+
+  /** Register the server-owned successor scheduler; never part of persistence. */
+  state.registerTechnicalStopHook = function registerTechnicalStopHook(fn) {
+    technicalStopHook = typeof fn === 'function' ? fn : null;
+  };
 
   /**
    * The terminal truth for a run: the guard's stop, else a pending one.
@@ -205,6 +211,13 @@ function attachStateAuthority(state, config) {
       if (!guardErr) throw e;
     }
     if (guardErr) throw new TechnicalStopPersistError(stop, guardErr);
+    if (technicalStopHook) {
+      try { technicalStopHook(wf, stop); } catch (e) {
+        // Scheduling is a follow-on action. The stop is already durable and
+        // must remain truthful even if the scheduler itself is broken.
+        console.error(`[state] technical-stop hook failed for run ${wf.id}: ${e.message}`);
+      }
+    }
     return stop;
   };
 

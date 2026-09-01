@@ -339,9 +339,8 @@ function startSuiteRun({ cwd, args, logPath, timeoutMs, env, onProgress }) {
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (killTimer) clearTimeout(killTimer);
       if (child.pid) activeRuns.delete(child.pid);
-      out.end();
       const counts = parseTestCounts(tail);
-      resolve({
+      const result = {
         status: timedOut ? 'timeout' : 'completed',
         exitCode: code,
         signal: signal || null,
@@ -349,7 +348,13 @@ function startSuiteRun({ cwd, args, logPath, timeoutMs, env, onProgress }) {
         logPath,
         counts: { ...counts, casesPassed, casesFailed },
         failureExcerpt: failureExcerpt(tail),
-      });
+      };
+      // `close` says the child and its stdio have ended; it does not say our
+      // file stream has flushed every queued chunk. The returned logPath is a
+      // promised artifact, so do not resolve until `finish` makes it readable
+      // in full. Without this boundary a fast stub — and occasionally a real
+      // short failing suite — returned an empty log beside complete counters.
+      out.end(() => resolve(result));
     });
   });
 

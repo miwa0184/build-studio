@@ -299,7 +299,10 @@ Key fields in `.build-studio/config.yaml` (not exhaustive — presets set sensib
 | `cli.developer_model` | No | `null` | OpenCode model used when a run's Developer CLI is `opencode` |
 | `cli.reviewer_model` | No | `null` | OpenCode model used when a run's Reviewer CLI is `opencode` (execution runs) |
 | `step_models` | No | `{}` | Per-step model overrides |
-| `max_review_rounds` | No | `4` | Hard cap on review iterations |
+| `max_review_rounds` | No | `5` | Hard cap on review iterations |
+| `max_successor_runs` | No | `2` | Maximum bounded technical-repair successors in one run lineage |
+| `max_lineage_recovery_units` | No | derived (`58` with shipped caps) | Cumulative lineage charge: each successor event plus measured review, fix, task-fix, and auto-advance-refusal spend |
+| `max_lineage_no_progress_repeats` | No | `1` | Maximum repeated identical technical-cause fingerprints across the lineage |
 | `review_mode` | No | `parallel` | `parallel`, `orchestrator`, or `sequential` |
 | `worktree_env_files` | No | `[]` | Files to copy into worktrees (e.g., `backend/.env`) |
 | `builder_strategy` | No | — | `goal` arms Claude Code's native `/goal` harness on the builder session |

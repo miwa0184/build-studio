@@ -59,6 +59,7 @@ const WORKFLOW_MUTATIONS = new Set([
   '/api/workflow/model-override',
   '/api/workflow/restore',
   '/api/workflow/recover',
+  '/api/workflow/successor',
   '/api/overseer/force-complete-task',
   '/api/overseer/kill-skip-task',
 ]);

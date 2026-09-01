@@ -3,6 +3,7 @@ const path = require('path');
 const yaml = require('js-yaml');
 const { resolvePreset, PRESETS } = require('./presets');
 const { VALID_CLIS, HUB_CONFIG_PATH, loadHubConfig, resolveEffectiveCliConfig, normalizeStepGroups } = require('@build-studio/shared/cli');
+const { resolveLineageBudgets } = require('./lineage-budgets');
 
 // Per-project agent-CLI defaults. `default` applies to every role NOT covered
 // by the per-run developerCli/reviewerCli knobs (kickoff, onboarding, review
@@ -50,6 +51,12 @@ const DEFAULTS = {
   //   at all: it was checked for being EMPTY and any other length was accepted.
   //   Resolved in run-budgets.js, where the run's other budgets live.
   max_fix_plan_tasks: null,
+  // A1b.2 — captured into a root run's immutable lineage ledger. Later config
+  // edits affect future roots only; they never raise an existing lineage cap.
+  max_successor_runs: 2,
+  // null derives from the measurable per-run caps (58 with shipped defaults).
+  max_lineage_recovery_units: null,
+  max_lineage_no_progress_repeats: 1,
   review_mode: 'parallel',
   // builder_strategy: how the monolithic task_execution builder is driven.
   //   'role' — classic role-prompted session (default).
@@ -274,6 +281,11 @@ function loadConfig(projectRoot) {
   }
   if (!config.port || typeof config.port !== 'number' || config.port < 1024 || config.port > 65535) {
     errors.push('Missing or invalid field: port (number 1024-65535)');
+  }
+  try {
+    resolveLineageBudgets(config);
+  } catch (e) {
+    errors.push(`Invalid lineage budget config: ${e.message}`);
   }
   if (!VALID_CLIS.includes(config.cli.default)) {
     console.warn(`[config] Warning: cli.default "${config.cli.default}" is not one of ${VALID_CLIS.join('/')} — falling back to 'claude'.`);

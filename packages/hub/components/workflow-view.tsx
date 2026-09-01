@@ -114,6 +114,15 @@ interface TechnicalStop {
   createdAt?: string
 }
 
+interface LineageRefusal {
+  code: string
+  terminal: true
+  principal: 'technical'
+  founderQuestion: false
+  error: string
+  detail?: Record<string, unknown>
+}
+
 interface TaskPlan {
   tasks: { id: number; name: string; description: string; roles: string[]; dependencies: number[]; acs_covered: string[]; estimated_size: string }[]
 }
@@ -158,7 +167,7 @@ interface OverseerState {
 
 interface Workflow {
   id: string
-  type: 'review' | 'execution' | 'kickoff' | 'onboarding' | 'bugfix'
+  type: 'review' | 'execution' | 'kickoff' | 'onboarding' | 'bugfix' | 'repair'
   input: string
   currentStep: string
   round: number
@@ -182,11 +191,16 @@ interface Workflow {
   overseer?: OverseerState
   /** Set once the run is parked. Its presence means every transition is refused. */
   technicalStop?: TechnicalStop | null
+  /** A successor was considered and refused by the authoritative lineage cap. */
+  lineageRefusal?: LineageRefusal | null
   /** ISO time the run was created (server-set). */
   createdAt?: string
 }
 
 const WF_STEPS: Record<string, { key: string; name: string; loopHint?: string }[]> = {
+  repair: [
+    { key: 'successor_repair', name: 'Technical Repair' },
+  ],
   review: [
     { key: 'pm_draft', name: 'PM Draft' },
     { key: 'reviewing', name: 'Review' },
@@ -1739,7 +1753,7 @@ function StepDetail({
       })()}
 
       {/* A parked run gets a status surface instead of controls. */}
-      {wf.technicalStop && <TechnicalStopPanel stop={wf.technicalStop} />}
+      {wf.technicalStop && <TechnicalStopPanel stop={wf.technicalStop} lineageRefusal={wf.lineageRefusal} />}
 
       {!wf.technicalStop && isCurrentStep && (step.status !== 'pending' || agents.length > 0) && !(step.status === 'error' && agents.length === 0) && (
         <StepActions
@@ -1828,7 +1842,7 @@ function MonolithicProgress({ wf, signals, onViewLog }: { wf: Workflow; signals:
  * nothing here can be done to this run — recovery is a separate repair run with
  * its own run id and budget.
  */
-function TechnicalStopPanel({ stop }: { stop: TechnicalStop }) {
+function TechnicalStopPanel({ stop, lineageRefusal }: { stop: TechnicalStop; lineageRefusal?: LineageRefusal | null }) {
   const label: React.CSSProperties = {
     fontFamily: 'var(--mono)', fontSize: 9, fontWeight: 700, letterSpacing: '0.1em',
     textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: 4,
@@ -1889,9 +1903,19 @@ function TechnicalStopPanel({ stop }: { stop: TechnicalStop }) {
         <div>
           <div style={label}>What happens next</div>
           <div style={{ ...value, color: 'var(--text-dim)' }}>
-            This run is parked and cannot be resumed — no action here restarts it, and its
-            acceptance coverage cannot be rebuilt in place. Recovery is a separate repair run
-            with its own run id and budget. {stop.recoveryHint}
+            {lineageRefusal ? (
+              <>
+                This run is parked and cannot be resumed. The separate repair run was refused
+                by the lineage authority ({lineageRefusal.code}); replay or restart will not
+                renew the budget, and no founder decision is requested. {lineageRefusal.error}
+              </>
+            ) : (
+              <>
+                This run is parked and cannot be resumed — no action here restarts it, and its
+                acceptance coverage cannot be rebuilt in place. Recovery is a separate repair run
+                with its own run id and budget. {stop.recoveryHint}
+              </>
+            )}
           </div>
         </div>
       </div>

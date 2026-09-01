@@ -44,7 +44,9 @@
  * of question the recovery routes kept getting wrong.
  */
 
-const SCHEMA_VERSION = 1;
+const crypto = require('crypto');
+
+const SCHEMA_VERSION = 2;
 
 const TECHNICAL_STOP = 'TECHNICAL_STOP';
 
@@ -71,6 +73,8 @@ const REASON_CODES = {
   TASK_FORCE_COMPLETED_UNVERIFIED: 'TASK_FORCE_COMPLETED_UNVERIFIED',
   /** An operator aborted a task; no work is attributed to it. */
   TASK_SKIPPED_UNVERIFIED: 'TASK_SKIPPED_UNVERIFIED',
+  /** A successor's bounded repair attempt reported that the same cause remains. */
+  SUCCESSOR_REPAIR_FAILED: 'SUCCESSOR_REPAIR_FAILED',
 };
 
 const VALID_REASON_CODES = new Set(Object.values(REASON_CODES));
@@ -84,13 +88,43 @@ const VALID_REASON_CODES = new Set(Object.values(REASON_CODES));
  * @param {string[]} [input.evidence]      machine-checkable facts behind the stop
  * @param {string}   [input.recoveryHint]  what a human can do about it
  */
-function createTechnicalStop({ reasonCode, runId, step, tasks, evidence, recoveryHint } = {}) {
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/**
+ * A reproducible signal for "the same recorded technical cause".
+ *
+ * This intentionally does not claim semantic code progress. It hashes only
+ * the machine-stable cause: reason, step, tasks and evidence. Run ids and
+ * timestamps are excluded so the same failure in a successor compares equal.
+ * A successor repair failure may carry its predecessor's fingerprint directly
+ * (`causeFingerprint`) because that outcome means exactly "this cause remains".
+ */
+function technicalStopFingerprint(stop) {
+  if (stop && typeof stop.causeFingerprint === 'string' && /^[0-9a-f]{64}$/.test(stop.causeFingerprint)) {
+    return stop.causeFingerprint;
+  }
+  const canonical = {
+    reasonCode: stop && stop.reasonCode || null,
+    step: stop && stop.step || null,
+    tasks: Array.isArray(stop && stop.tasks) ? stop.tasks : [],
+    evidence: Array.isArray(stop && stop.evidence) ? stop.evidence : [],
+  };
+  return crypto.createHash('sha256').update(stableJson(canonical)).digest('hex');
+}
+
+function createTechnicalStop({ reasonCode, runId, step, tasks, evidence, recoveryHint, causeFingerprint } = {}) {
   if (!VALID_REASON_CODES.has(reasonCode)) {
     throw new Error(
       `createTechnicalStop: unknown reasonCode ${JSON.stringify(reasonCode)} — expected one of ${[...VALID_REASON_CODES].join(', ')}`,
     );
   }
-  return {
+  const stop = {
     schemaVersion: SCHEMA_VERSION,
     outcome: TECHNICAL_STOP,
     reasonCode,
@@ -111,8 +145,14 @@ function createTechnicalStop({ reasonCode, runId, step, tasks, evidence, recover
     autoAdvanceable: false,
     mergeEligible: false,
     acceptanceEligible: false,
+    // The contract A1b.2 reads. The reason whitelist remains a second check;
+    // this field alone can never turn an owner/product outcome into recovery.
+    recovery: { mode: 'successor_repair', eligible: true },
+    ...(causeFingerprint ? { causeFingerprint } : {}),
     createdAt: new Date().toISOString(),
   };
+  stop.fingerprint = technicalStopFingerprint(stop);
+  return stop;
 }
 
 function isTechnicalStop(x) {
@@ -228,6 +268,7 @@ module.exports = {
   canAutoAdvance,
   isMergeEligible,
   isAcceptanceEligible,
+  technicalStopFingerprint,
   applyToWorkflow,
   refusalPayload,
 };

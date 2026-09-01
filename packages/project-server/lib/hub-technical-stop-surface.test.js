@@ -87,6 +87,15 @@ test('R7 — the parked panel renders no recovery or advance control', () => {
   }
 });
 
+test('A1b.2 — an exhausted lineage is shown as terminal technical policy, never a founder question', () => {
+  const panel = functionBody(src, 'TechnicalStopPanel');
+  assert.match(src, /lineageRefusal\??:/, 'the Workflow type must carry the authoritative lineage refusal');
+  assert.match(panel, /lineage authority/, 'the parked surface must name the authority that refused another successor');
+  assert.match(panel, /no founder decision is requested/i, 'a technical cap must not be converted into an owner decision');
+  assert.match(panel, /replay or restart will not\s+renew the budget/i, 'the UI must not imply a renewable cap');
+  assert.ok(!/<button/.test(panel), 'a lineage refusal remains a status surface, not a bypass control');
+});
+
 test('R7 — step actions and the task board are suppressed while the run is parked', () => {
   // StepActions renders Advance and ↻ Relaunch; TaskBoard renders per-task
   // Relaunch. Both must be gated off for a stopped run rather than rendering
