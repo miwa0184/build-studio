@@ -59,6 +59,25 @@ class RunGuardConflictError extends Error {
   }
 }
 
+class RunGuardBusyError extends Error {
+  constructor(message, { runId, lock } = {}) {
+    super(message);
+    this.name = 'RunGuardBusyError';
+    this.code = 'RUN_GUARD_BUSY';
+    this.runId = runId;
+    this.lock = lock;
+  }
+}
+
+class RunGuardTerminalError extends Error {
+  constructor(message, { runId } = {}) {
+    super(message);
+    this.name = 'RunGuardTerminalError';
+    this.code = 'RUN_GUARD_TERMINAL';
+    this.runId = runId;
+  }
+}
+
 /**
  * A guard file that EXISTS but cannot be trusted: unparseable, unreadable,
  * wrong schema, or claiming to belong to a different run.
@@ -158,6 +177,110 @@ function createRunGuard({ statePath, isRegistered } = {}) {
     return path.join(dir, `${safeRunId(runId)}.json`);
   }
 
+  function lockFor(runId) {
+    return path.join(dir, `${safeRunId(runId)}.lock`);
+  }
+
+  /**
+   * Cross-process exclusion for one run's complete read/mutate/write cycle.
+   *
+   * A revision check by itself has a TOCTOU window: two processes can both
+   * verify revision N before either rename, acknowledge both writes, and leave
+   * only one N+1 document. mkdir is the compare-and-set. Normal writers wait
+   * briefly for the tiny critical section; a crashed local owner is reclaimed
+   * only after it is old and its pid is provably gone.
+   */
+  function acquireLock(runId) {
+    fs.mkdirSync(dir, { recursive: true });
+    const lock = lockFor(runId);
+    const deadline = Date.now() + 5000;
+    const claim = () => {
+      let created = false;
+      try {
+        fs.mkdirSync(lock);
+        created = true;
+        fs.writeFileSync(path.join(lock, 'owner.json'), JSON.stringify({
+          pid: process.pid,
+          runId: String(runId),
+          createdAt: new Date().toISOString(),
+        }));
+        return true;
+      } catch (error) {
+        if (created) { try { fs.rmSync(lock, { recursive: true, force: true }); } catch (_) {} }
+        if (error && error.code === 'EEXIST') return false;
+        throw error;
+      }
+    };
+
+    while (!claim()) {
+      let stale = false;
+      try {
+        const stat = fs.statSync(lock);
+        const owner = JSON.parse(fs.readFileSync(path.join(lock, 'owner.json'), 'utf8'));
+        let alive = true;
+        try { process.kill(Number(owner.pid), 0); } catch (error) { if (error && error.code === 'ESRCH') alive = false; }
+        stale = Date.now() - stat.mtimeMs > 30000 && !alive;
+      } catch (_) {
+        // A half-created fresh lock is contention, not evidence of staleness.
+        stale = false;
+      }
+      if (stale) {
+        const retired = `${lock}.stale-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+        try {
+          fs.renameSync(lock, retired);
+          try { fs.rmSync(retired, { recursive: true, force: true }); } catch (_) {}
+          continue;
+        } catch (_) {
+          // The owner or another contender changed it. Re-read on the next pass.
+        }
+      }
+      if (Date.now() >= deadline) {
+        throw new RunGuardBusyError(
+          `run guard for ${runId} is locked by another writer; retry from fresh state`,
+          { runId: String(runId), lock },
+        );
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+    }
+    return lock;
+  }
+
+  function releaseLock(lock) {
+    try { fs.rmSync(lock, { recursive: true, force: true }); } catch (_) {}
+  }
+
+  function withLock(runId, fn) {
+    const lock = acquireLock(runId);
+    try { return fn(); } finally { releaseLock(lock); }
+  }
+
+  function comparable(doc) {
+    const copy = JSON.parse(JSON.stringify(doc));
+    delete copy.revision;
+    delete copy.updatedAt;
+    return copy;
+  }
+
+  /** A durable terminal guard is immutable, including every charged counter. */
+  function assertTransition(onDisk, proposed) {
+    if (!onDisk.technicalStop) return;
+    if (JSON.stringify(comparable(onDisk)) !== JSON.stringify(comparable(proposed))) {
+      throw new RunGuardTerminalError(
+        `run guard for ${onDisk.runId} is terminal and cannot be changed`,
+        { runId: String(onDisk.runId) },
+      );
+    }
+  }
+
+  function writeNext(doc) {
+    const next = { ...doc, revision: doc.revision + 1, updatedAt: new Date().toISOString() };
+    const file = fileFor(doc.runId);
+    const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
+    fs.renameSync(tmp, file);
+    return next;
+  }
+
   function readDoc(runId) {
     const file = fileFor(runId);
     if (!fs.existsSync(file)) {
@@ -226,24 +349,25 @@ function createRunGuard({ statePath, isRegistered } = {}) {
    */
   function register(runId, { identity } = {}) {
     if (!runId) throw new Error('runGuard.register: runId is required');
-    const file = fileFor(runId);
-    if (fs.existsSync(file)) {
-      throw new RunGuardExistsError(
-        `run ${runId} already has a guard file — a run is registered once`,
-        { runId: String(runId), file },
-      );
-    }
-    fs.mkdirSync(dir, { recursive: true });
-    const doc = {
-      ...emptyDoc(runId),
-      ...(identity ? { identity } : {}),
-      revision: 1,
-      updatedAt: new Date().toISOString(),
-    };
-    const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(doc, null, 2));
-    fs.renameSync(tmp, file);
-    return doc;
+    return withLock(runId, () => {
+      const file = fileFor(runId);
+      if (fs.existsSync(file)) {
+        throw new RunGuardExistsError(
+          `run ${runId} already has a guard file — a run is registered once`,
+          { runId: String(runId), file },
+        );
+      }
+      const doc = {
+        ...emptyDoc(runId),
+        ...(identity ? { identity } : {}),
+        revision: 1,
+        updatedAt: new Date().toISOString(),
+      };
+      const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(doc, null, 2));
+      fs.renameSync(tmp, file);
+      return doc;
+    });
   }
 
   /**
@@ -255,20 +379,17 @@ function createRunGuard({ statePath, isRegistered } = {}) {
    */
   function save(doc) {
     if (!doc || !doc.runId) throw new Error('runGuard.save: doc.runId is required');
-    fs.mkdirSync(dir, { recursive: true });
-    const onDisk = readDoc(doc.runId);
-    if (onDisk.revision !== doc.revision) {
-      throw new RunGuardConflictError(
-        `run guard for ${doc.runId} moved on: held revision ${doc.revision}, disk is at ${onDisk.revision}`,
-        { runId: doc.runId, expected: doc.revision, actual: onDisk.revision },
-      );
-    }
-    const next = { ...doc, revision: doc.revision + 1, updatedAt: new Date().toISOString() };
-    const file = fileFor(doc.runId);
-    const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
-    fs.renameSync(tmp, file);
-    return next;
+    return withLock(doc.runId, () => {
+      const onDisk = readDoc(doc.runId);
+      if (onDisk.revision !== doc.revision) {
+        throw new RunGuardConflictError(
+          `run guard for ${doc.runId} moved on: held revision ${doc.revision}, disk is at ${onDisk.revision}`,
+          { runId: doc.runId, expected: doc.revision, actual: onDisk.revision },
+        );
+      }
+      assertTransition(onDisk, doc);
+      return writeNext(doc);
+    });
   }
 
   /**
@@ -279,18 +400,16 @@ function createRunGuard({ statePath, isRegistered } = {}) {
    * needs to see the conflict uses load() + save() directly.
    */
   function mutate(runId, fn) {
-    for (let attempt = 0; attempt < 2; attempt++) {
+    return withLock(runId, () => {
       const doc = readDoc(runId);
+      const before = JSON.parse(JSON.stringify(doc));
       const result = fn(doc);
-      try {
-        const saved = save(doc);
-        return { doc: saved, result };
-      } catch (e) {
-        if (!(e instanceof RunGuardConflictError) || attempt === 1) throw e;
+      assertTransition(before, doc);
+      if (JSON.stringify(comparable(before)) === JSON.stringify(comparable(doc))) {
+        return { doc: before, result, unchanged: true };
       }
-    }
-    /* istanbul ignore next — the loop above always returns or throws */
-    throw new RunGuardConflictError(`run guard for ${runId} could not be written`, { runId });
+      return { doc: writeNext(doc), result };
+    });
   }
 
   function count(runId, key) {
@@ -323,6 +442,7 @@ function createRunGuard({ statePath, isRegistered } = {}) {
 
   return {
     fileFor,
+    lockFor,
     register,
     load: readDoc,
     save,
@@ -339,6 +459,8 @@ function createRunGuard({ statePath, isRegistered } = {}) {
 module.exports = {
   createRunGuard,
   RunGuardConflictError,
+  RunGuardBusyError,
+  RunGuardTerminalError,
   RunGuardCorruptError,
   RunGuardMissingError,
   RunGuardExistsError,

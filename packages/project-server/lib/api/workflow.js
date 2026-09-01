@@ -3,6 +3,7 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { stripAnsi, renderPipePaneLog } = require('../tmux');
 const opencodeTelemetry = require('../opencode-telemetry');
 const { transitionFeaturesForPRD, parseBacklogSection, writeBacklogSection, readItem, isValidId, writeItem } = require('../backlog');
@@ -19,6 +20,10 @@ const gateBlocked = require('../gate-blocked');
 const qaSuite = require('../qa-suite-run');
 const { extractFixPlan, checkFeedbackContract, rejectionOutcome, MAX_REJECTIONS } = require('../plan-contract');
 const { RunGuardCorruptError } = require('../run-guard');
+const {
+  createSuccessorLaunchStore,
+  SuccessorLaunchBusyError,
+} = require('../successor-launch');
 const { attachStateAuthority } = require('../state');
 const runBudgets = require('../run-budgets');
 const blockedTasks = require('../blocked-tasks');
@@ -506,6 +511,9 @@ function createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast, deps = 
    */
   attachStateAuthority(state, config);
   const runGuard = state.runGuard;
+  const successorLaunchStore = createSuccessorLaunchStore({
+    statePath: config.statePath || path.join(projectRoot, '.build-studio'),
+  });
   const budgets = () => runBudgets.resolveBudgets(config);
 
   /**
@@ -1899,7 +1907,16 @@ ${EFFICIENCY_INSTRUCTIONS}`,
     }
   }
 
-  function launchWorkflowAgents(wf, agents, { useWorktrees = false, allowAll = true, cwd = projectRoot, stepKey = null } = {}) {
+  function launchWorkflowAgents(wf, agents, {
+    useWorktrees = false,
+    allowAll = true,
+    cwd = projectRoot,
+    stepKey = null,
+    beforeExternalLaunch = null,
+    afterExternalLaunch = null,
+    adoptTarget = null,
+    launchReceipt = null,
+  } = {}) {
     // A1b.1 backstop — BEFORE any side effect of a launch (the mkdirs below
     // included): the run this launch serves must hold a verified, stored,
     // server-generated admission. A run that was never admitted, or whose
@@ -1967,9 +1984,11 @@ ${EFFICIENCY_INSTRUCTIONS}`,
     const neededClis = new Set([resolveStepLaunchSettings(resolvedStep, wf, config.cli, config.step_groups).cli]);
 
     let cliError = null;
-    for (const cli of neededClis) {
-      cliError = probeBinary(cli, INSTALL_HINTS[cli] || `Install ${cli} and verify \`which ${cli}\` from a normal shell.`);
-      if (cliError) break;
+    if (!adoptTarget) {
+      for (const cli of neededClis) {
+        cliError = probeBinary(cli, INSTALL_HINTS[cli] || `Install ${cli} and verify \`which ${cli}\` from a normal shell.`);
+        if (cliError) break;
+      }
     }
     if (cliError) {
       console.error(`[workflow] Pre-launch check failed: ${cliError}`);
@@ -1984,7 +2003,7 @@ ${EFFICIENCY_INSTRUCTIONS}`,
     // by a ceiling that exists for six-agent review fan-outs. Fails open:
     // memory we cannot read never blocks a launch.
     const memCfg = config.memory_guard || {};
-    if (memCfg.enabled !== false) {
+    if (!adoptTarget && memCfg.enabled !== false) {
       let mem = null;
       try {
         mem = memoryGuard.parseAvailableMemory(
@@ -2242,7 +2261,18 @@ ${EFFICIENCY_INSTRUCTIONS}`,
       // (the "Pretty print" black screen). The workflow's own dev servers set
       // PORT explicitly and are unaffected; this only stops the stray
       // inheritance for agent-started processes.
+      const receiptFileArg = launchReceipt
+        ? Buffer.from(String(launchReceipt.file), 'utf8').toString('base64')
+        : null;
+      const receiptCli = launchReceipt ? require.resolve('../successor-launch') : null;
+      const receiptStart = launchReceipt
+        ? `${JSON.stringify(process.execPath)} ${JSON.stringify(receiptCli)} ${JSON.stringify(receiptFileArg)} started\n`
+        : '';
+      const receiptComplete = launchReceipt
+        ? `\nlaunch_status=$?\n${JSON.stringify(process.execPath)} ${JSON.stringify(receiptCli)} ${JSON.stringify(receiptFileArg)} completed "$launch_status"\nexit "$launch_status"`
+        : '';
       const startScript = `#!/bin/zsh
+set -o pipefail
 eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null
 unset PORT
 if ! command -v ${cliBin} >/dev/null 2>&1; then
@@ -2250,7 +2280,7 @@ if ! command -v ${cliBin} >/dev/null 2>&1; then
     if [ -x "$p/${cliBin}" ]; then PATH="$p:$PATH"; break; fi
   done
 fi
-${simEnvLine}${goalArmLine}${cliInvocation}
+${simEnvLine}${goalArmLine}${receiptStart}${cliInvocation}${receiptComplete}
 `;
       // Pre-trust project-scoped MCP servers so Claude Code's interactive
       // "New MCP server found in this project" prompt can't stall the agent.
@@ -2289,13 +2319,32 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
       const logFile = path.join(logsPath, `${windowName}-${wf.id}.log`);
       const keyUnset = unsetKey ? 'unset ANTHROPIC_API_KEY && ' : '';
 
+      agent.window = windowName;
+      agent.status = 'launching';
+      agent.cli = agentCli;
+      agent.model = agentCli === 'claude'
+        ? modelShortName
+        : agentCli === 'opencode'
+          ? (modelShortName ? `opencode:${modelShortName}` : 'opencode')
+          : 'codex';
+      agent.modelSource = modelSource;
+      agent.agentCwd = agentCwd;
+      agent.injectedLearnings = learningsResult.injected;
+      if (launchReceipt) agent.launchAttemptId = launchReceipt.attemptId;
+
       try {
+        if (beforeExternalLaunch) {
+          beforeExternalLaunch(agent, { windowName, agentCwd, launchReceipt });
+        }
         // ensureWindow handles both cases AND the race between them: reaping a
         // finished agent's window can end the session (and take the tmux server
         // with it) part-way through a launch that already checked the session
         // was alive.
-        const target = tmuxOps.ensureWindow(wf.sessionName, windowName, projectRoot, admissionCtx);
-        tmuxOps.sendKeys(target, `cd '${agentCwd}' && ${keyUnset}bash ${scriptName}`, projectRoot);
+        const target = adoptTarget || tmuxOps.ensureWindow(wf.sessionName, windowName, projectRoot, admissionCtx);
+        if (!adoptTarget) {
+          tmuxOps.sendKeys(target, `cd '${agentCwd}' && ${keyUnset}bash ${scriptName}`, projectRoot);
+          if (afterExternalLaunch) afterExternalLaunch(agent, { target, launchReceipt });
+        }
         tmuxOps.pipePaneToLog(target, logFile, projectRoot);
       } catch (e) {
         agent.status = 'error';
@@ -2304,26 +2353,16 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
         continue;
       }
 
-      agent.window = windowName;
       agent.status = 'running';
       // Which CLI + model this agent actually runs on — the hub badges both.
       // claude → the step_models short name; codex → 'codex' (self-selected
       // model); opencode → 'opencode:<provider/model>' or 'opencode' when
       // using opencode's own default model.
-      agent.cli = agentCli;
-      agent.model = agentCli === 'claude'
-        ? modelShortName
-        : agentCli === 'opencode'
-          ? (opencodeModel ? `opencode:${opencodeModel}` : 'opencode')
-          : 'codex';
       // Which layer chose that model — 'step' (project config.yaml or a per-run
       // override), 'role' (Agents-tab slot), 'preset' (shipped default), or
       // 'default'. Recorded so the UI can explain a model that isn't the one
       // picked in the UI, rather than leaving it to be read as a bug.
-      agent.modelSource = modelSource;
       agent.startedAt = new Date().toISOString();
-      agent.agentCwd = agentCwd;
-      agent.injectedLearnings = learningsResult.injected;
       results.push(agent);
 
       // Stagger launches to avoid simultaneous API cold-start collisions
@@ -3374,6 +3413,20 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     } catch (_) {
       return { advanced: false, baseHead, currentHead, reason: 'HEAD changed but is not a forward descendant of the repair baseline' };
     }
+    const dirty = execFileSync('git', ['status', '--porcelain=v1', '--untracked-files=all'], {
+      cwd: projectRoot,
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim().split('\n').filter(Boolean);
+    if (dirty.length > 0) {
+      return {
+        advanced: false,
+        baseHead,
+        currentHead,
+        dirtyPaths: dirty,
+        reason: `HEAD advanced but the repair worktree is not clean: ${dirty.join('; ')}`,
+      };
+    }
     return { advanced: true, baseHead, currentHead };
   }
 
@@ -3424,18 +3477,166 @@ Use \`yes\` only when the recorded technical cause is repaired and the cited ver
     };
   }
 
-  function launchSuccessorRepair(wf) {
+  const successorLaunchRetryTimers = new Map();
+  function scheduleSuccessorLaunchRetry(runId, delayMs = 50) {
+    const key = String(runId);
+    if (successorLaunchRetryTimers.has(key)) return;
+    const timer = setTimeout(() => {
+      successorLaunchRetryTimers.delete(key);
+      try {
+        const active = state.loadWorkflow();
+        const step = active && active.steps && active.steps.successor_repair;
+        if (active && String(active.id) === key && active.type === 'repair'
+          && active.currentStep === 'successor_repair' && step
+          && ['pending', 'launching'].includes(step.status)) {
+          launchSuccessorRepair(active);
+        }
+      } catch (error) {
+        console.warn(`[successor] launch reconciliation retry failed for ${key}: ${error.message}`);
+      }
+    }, delayMs);
+    if (timer.unref) timer.unref();
+    successorLaunchRetryTimers.set(key, timer);
+  }
+
+  function parkUncertainSuccessorLaunch(wf, receipt, reason) {
     const step = wf.steps.successor_repair;
-    if (step.status === 'running' && Array.isArray(step.agents) && step.agents.length > 0) return wf;
-    step.status = 'running';
-    step.agents = launchWorkflowAgents(wf, [repairAgentFor(wf)], {
-      useWorktrees: false,
-      cwd: projectRoot,
-      stepKey: 'successor_repair',
-    });
+    const agent = (Array.isArray(step.agents) && step.agents[0]) || repairAgentFor(wf);
+    agent.window = receipt.windowName;
+    agent.launchAttemptId = receipt.attemptId;
+    agent.status = 'error';
+    agent.error = reason;
+    step.status = 'blocked';
+    step.agents = [agent];
+    wf.successorRepair.launchFailure = {
+      code: 'SUCCESSOR_LAUNCH_UNCERTAIN',
+      principal: 'technical',
+      founderQuestion: false,
+      attemptId: receipt.attemptId,
+      receiptStatus: receipt.status,
+      reason,
+    };
     state.saveWorkflow(wf);
-    startAutoAdvanceTimer();
     return wf;
+  }
+
+  function launchSuccessorRepair(wf) {
+    const runId = String(wf.id);
+    if (typeof deps.beforeSuccessorLaunchLock === 'function') {
+      deps.beforeSuccessorLaunchLock({ runId, workflow: wf });
+    }
+    try {
+      return successorLaunchStore.withLock(runId, () => {
+        // Another server may have completed launch while this process waited
+        // for the cross-process lock. Never write the stale caller snapshot.
+        const persisted = state.loadWorkflow();
+        if (persisted && String(persisted.id) === runId
+          && persisted.type === 'repair' && persisted.currentStep === 'successor_repair') {
+          wf = persisted;
+        }
+        const step = wf.steps.successor_repair;
+        if (step.status === 'running' && Array.isArray(step.agents) && step.agents.length > 0) return wf;
+        if (step.status === 'blocked') return wf;
+
+        const agent = repairAgentFor(wf);
+        const baseWindow = String(agent.window || agent.role).replace(/[^a-zA-Z0-9_-]/g, '-').slice(0, 12).replace(/-+$/, '');
+        const windowName = wf.round > 1 ? `${baseWindow}-r${wf.round}` : baseWindow;
+        const attemptId = crypto.createHash('sha256').update([
+          runId,
+          'successor_repair',
+          wf.successorRepair.predecessorEvidence.fingerprint,
+        ].join('\n')).digest('hex');
+        let receipt = successorLaunchStore.ensureIntent(runId, {
+          attemptId,
+          sessionName: wf.sessionName,
+          windowName,
+        });
+        const receiptFile = successorLaunchStore.fileFor(runId);
+        const intentAlreadyPersisted = step.status === 'launching'
+          && wf.successorRepair.launch
+          && wf.successorRepair.launch.attemptId === attemptId;
+        wf.successorRepair.launch = {
+          attemptId,
+          receiptFile,
+          sessionName: receipt.sessionName,
+          windowName: receipt.windowName,
+          status: receipt.status,
+        };
+        step.status = 'launching';
+        if (!intentAlreadyPersisted) {
+          state.saveWorkflow(wf); // durable intent before any tmux/process side effect
+        }
+
+        const liveTarget = typeof tmuxOps.findWindow === 'function'
+          ? tmuxOps.findWindow(receipt.sessionName, receipt.windowName)
+          : null;
+        receipt = successorLaunchStore.read(runId);
+
+        if (receipt.status === 'completed') {
+          return parkUncertainSuccessorLaunch(
+            wf,
+            receipt,
+            `repair launch ${receipt.attemptId} completed with exit ${receipt.exitCode} before durable agent feedback; automatic relaunch is unsafe`,
+          );
+        }
+        if (receipt.status === 'started' && !liveTarget) {
+          return parkUncertainSuccessorLaunch(
+            wf,
+            receipt,
+            `repair launch ${receipt.attemptId} started but its tmux window is gone; automatic relaunch could duplicate repository side effects`,
+          );
+        }
+        if (receipt.status === 'intent' && liveTarget) {
+          const ageMs = Date.now() - Date.parse(receipt.createdAt);
+          if (Number.isFinite(ageMs) && ageMs < 30000) {
+            // tmux accepted the window but the wrapper may still be queued on a
+            // loaded machine. Observe without sending anything again.
+            scheduleSuccessorLaunchRetry(runId, 100);
+            return wf;
+          }
+          return parkUncertainSuccessorLaunch(
+            wf,
+            receipt,
+            `repair launch ${receipt.attemptId} has a tmux window but no durable started receipt; refusing to guess whether send-keys executed`,
+          );
+        }
+
+        const adopted = receipt.status === 'started' && liveTarget;
+        const launchedAgents = launchWorkflowAgents(wf, [agent], {
+          useWorktrees: false,
+          cwd: projectRoot,
+          stepKey: 'successor_repair',
+          adoptTarget: adopted ? liveTarget : null,
+          launchReceipt: { file: receiptFile, attemptId },
+          beforeExternalLaunch: adopted ? null : (plannedAgent) => {
+            step.status = 'launching';
+            step.agents = [plannedAgent];
+            state.saveWorkflow(wf);
+            if (typeof deps.beforeSuccessorAgentSend === 'function') {
+              deps.beforeSuccessorAgentSend({ workflow: wf, receipt });
+            }
+          },
+          afterExternalLaunch: adopted ? null : (plannedAgent, launch) => {
+            if (typeof deps.afterSuccessorAgentSend === 'function') {
+              deps.afterSuccessorAgentSend({ workflow: wf, receipt, agent: plannedAgent, ...launch });
+            }
+          },
+        });
+        step.agents = launchedAgents;
+        step.status = launchedAgents.some((entry) => entry.status === 'running') ? 'running' : 'error';
+        delete wf.successorRepair.launchFailure;
+        wf.successorRepair.launch.status = adopted ? 'adopted' : 'sent';
+        state.saveWorkflow(wf);
+        if (step.status === 'running') startAutoAdvanceTimer();
+        return wf;
+      });
+    } catch (error) {
+      if (error instanceof SuccessorLaunchBusyError) {
+        scheduleSuccessorLaunchRetry(runId, 50);
+        return wf;
+      }
+      throw error;
+    }
   }
 
   function buildSuccessorWorkflow(predecessor, created, repairBaseHead) {
@@ -3511,7 +3712,7 @@ Use \`yes\` only when the recorded technical cause is repaired and the cited ver
     const successor = buildSuccessorWorkflow(predecessor, created, repairBaseHead);
     state.saveWorkflow(successor);
     launchSuccessorRepair(successor);
-    return { created, workflow: successor };
+    return { created, workflow: state.loadWorkflow() };
   }
 
   function lineageRefusalPayload(error) {
@@ -3614,7 +3815,7 @@ Use \`yes\` only when the recorded technical cause is repaired and the cited ver
         scheduleSuccessor(active);
       } else if (active && active.type === 'repair' && active.currentStep === 'successor_repair'
         && active.steps && active.steps.successor_repair
-        && active.steps.successor_repair.status === 'pending') {
+        && ['pending', 'launching'].includes(active.steps.successor_repair.status)) {
         // Crash window: registry + guard + workflow committed, agent launch not
         // yet recorded. Resuming this pending repair is idempotent and avoids a
         // browser/manual action becoming part of recovery correctness.

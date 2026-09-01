@@ -200,7 +200,10 @@ function startServer(projectRoot, opts = {}) {
   const { router: queueRouter, parseExecutionPlan } = createQueueRouter(config, broadcast);
   const statusRouter = createStatusRouter(config, gitOps, state);
   const terminalRouter = createTerminalRouter(config, state, tmuxOps);
-  const workflowRouter = createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast, { admission });
+  const workflowRouter = createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast, {
+    admission,
+    ...(opts.workflowDeps || {}),
+  });
   const runRouter = createRunRouter(config, state, gitOps, tmuxOps, broadcast, parseExecutionPlan);
   // One monitor per project-server, shared by the CI/CD tab and the Monitor
   // tab so a single cached `gh run list` answers both.

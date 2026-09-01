@@ -75,6 +75,13 @@ addition to its revision check. Contending writers either observe the winner
 and return that exact successor or receive a typed fail-closed refusal; two
 processes cannot both commit children for one predecessor.
 
+The per-run guard applies the same discipline at a finer key: a mkdir lock
+serialises the complete read/mutate/rename cycle for that run. A revision check
+alone did not close the cross-process TOCTOU window. Once `technicalStop` is
+durable the whole guard freezes, including every charged counter, so successor
+charging reads a stable terminal document and no late writer can replace the
+stop with a stale pre-stop snapshot.
+
 Successor creation has this order:
 
 1. Read the registered predecessor and its guard. Verify a durable terminal
@@ -87,8 +94,13 @@ Successor creation has this order:
    leaves a registered but unlaunchable run; replay resumes materialisation
    from the registry. It never creates a runnable orphan.
 4. Replace the active workflow with a repair workflow carrying structured
-   predecessor evidence. Only after the committed registry and guard are
-   readable may branch/worktree/state/agent side effects begin.
+   predecessor evidence. Before tmux or a CLI starts, persist a deterministic
+   launch attempt and the planned agent under a separate per-run launch lock.
+   The wrapper records durable `started` and `completed` receipts. Restart
+   adopts the exact matching live window; it never kill-replaces a started
+   attempt. If process state and receipts cannot prove safe adoption or safe
+   first launch, the step parks with a typed technical failure instead of
+   risking duplicate repository side effects.
 
 The predecessor guard and registry entry are never edited back to active. A
 successor has a new `runId`, the same `lineageId`, the exact
@@ -132,11 +144,14 @@ fingerprint. The same successor machinery may make the next bounded attempt.
 A reported repair success is not trusted on its own. Before the repair agent is
 launched, the server records the repository's exact Git head. Continuation
 requires a different head that Git proves is a forward descendant of that
-baseline; an uncommitted edit, rewritten history, evidence-shaped prose or a
-free-form `yes` is a repeated failure. The head delta is deterministic evidence
-that a concrete repair candidate exists, **not** semantic proof that the cause
-is fixed. The original stopped step is therefore re-run and remains responsible
-for the real verification and acceptance evidence.
+baseline **and** an empty index/worktree under
+`git status --porcelain=v1 --untracked-files=all`; staged, unstaged or untracked
+residue, rewritten history, evidence-shaped prose or a free-form `yes` is a
+repeated failure. Dirty-path evidence is retained in the refusal. The clean
+head delta is deterministic evidence that a concrete repair candidate exists,
+**not** semantic proof that the cause is fixed. The original stopped step is
+therefore re-run and remains responsible for the real verification and
+acceptance evidence.
 
 Only then does the *successor* — never the predecessor — move onto the
 predecessor's stopped step with that step's transient agent state reset. The
@@ -149,6 +164,10 @@ forward progress can coexist without overstating what a commit proves.
 - The registry is the only writer of lineage identity, successor pointers and
   lineage spend.
 - The run guard remains the only writer of per-run spend and terminality.
+- The run guard serialises all writers across processes and is immutable after
+  its first durable terminal stop.
+- The successor launch receipt is the only writer of repair attempt identity
+  and external-process lifecycle; workflow state mirrors it for rendering.
 - State restore may restore operational fields only; registry identity, lineage
   spend and guard terminality are outside the snapshot and cannot be lowered.
 - The successor HTTP route is classified by the admission seam and has a
@@ -186,20 +205,47 @@ start SHA `5be72a5e7195d0ee2c2dc5ad96db1773ae1ee743` before implementation:
 - real-server route: 0/2 passed because
   `POST /api/workflow/successor` returned 404.
 
-The implemented contract now contains 12 lineage tests and six actual-server
+The implemented contract now contains 12 lineage tests and eleven actual-server
 canaries, including concurrent creation, cumulative spend, replay, restart,
 exact cap persistence, autonomous startup reconciliation on both sides of the
-workflow/agent-launch boundary, and rejection of a free-form success assertion
-without a forward Git delta. Transient registry contention is a bounded,
+workflow/agent-launch boundary, rejection of a free-form success assertion,
+all three dirty-worktree shapes after a valid forward commit, a crash
+immediately after real `send-keys`, and a synchronised two-server launch race.
+Two additional run-guard tests exercise 40 concurrent process writers and a
+counter/terminal-stop race. Transient registry contention is a bounded,
 retryable 503 and is never presented as an exhausted lineage. The final
 exact-head server CI receipt is recorded on the PR.
 
+## Independent review and bounded repair receipt
+
+The single context-free review of frozen head
+`0c96a7901728871fa173566c80418a5d6b9c6bb4` returned `REPAIR_REQUIRED` and
+blocked merge. It independently reproduced three release blockers:
+
+1. the run-guard revision check had a cross-process TOCTOU window that lost
+   acknowledged counters and could overwrite terminal truth;
+2. a forward descendant plus dirty staged/unstaged/untracked state was accepted
+   as progress; and
+3. the repair CLI started before its running receipt was persisted, so crash or
+   two servers could kill-replace/relaunch one assignment.
+
+The one authorised repair round fixes those causes rather than weakening the
+contract. A fresh context-free reviewer must falsify the new exact head after
+protected CI; no merge is permitted on the first head or on inherited review.
+
 ## Final local verification receipt
 
-- Focused A1b.2 contract: 12 lineage tests plus six actual-server canaries,
-  18/18 passed.
+- Focused A1b.2 contract: 12 lineage tests plus twelve actual-server canaries,
+  24/24 passed; the two cross-process run-guard stress tests also passed. The
+  final canary also proves that a local CLI preflight error can retry the same
+  durable attempt and still start exactly one process.
 - Full project-server suite (`node --test` from `packages/project-server`):
-  three fresh runs after the final code changes, each 1007/1007 passed.
+  three fresh runs after the final repair code changes, each 1015/1015 passed.
+- One pre-final repair run reached 1011/1014: three direct-router fixtures had
+  `projectRoot` but omitted the normalised `statePath` that the real server
+  always supplies. The launch store now uses the same
+  `<projectRoot>/.build-studio` fallback as state authority; the focused three
+  tests and every final full run pass without loosening their assertions.
 - One earlier full-suite attempt exposed an existing stream race: counters were
   complete while the promised QA log could still be empty. The focused test
   passed in isolation, but inspection showed the child `close` handler resolved

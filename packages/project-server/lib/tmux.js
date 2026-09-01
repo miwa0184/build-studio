@@ -93,6 +93,29 @@ function createTmuxOps(config) {
     return out.toString().trim();
   }
 
+  /** Resolve one existing window without creating, killing or renaming it. */
+  function findWindow(sessionName, windowName) {
+    if (!hasSession(sessionName)) return null;
+    try {
+      const out = execFileSync('tmux', ['list-windows', '-t', sessionName, '-F', '#{window_index} #{window_name}'], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }).toString();
+      const matches = out.split('\n').filter(Boolean).map((line) => {
+        const split = line.indexOf(' ');
+        return [line.slice(0, split), line.slice(split + 1)];
+      }).filter(([, name]) => name === windowName);
+      if (matches.length > 1) {
+        const error = new Error(`tmux session ${sessionName} has ${matches.length} windows named ${windowName}; refusing ambiguous adoption`);
+        error.code = 'TMUX_WINDOW_AMBIGUOUS';
+        throw error;
+      }
+      return matches.length === 1 ? `${sessionName}:${matches[0][0]}` : null;
+    } catch (error) {
+      if (error && error.code === 'TMUX_WINDOW_AMBIGUOUS') throw error;
+      return null;
+    }
+  }
+
   function sendKeys(target, command, cwd) {
     execFileSync('tmux', ['send-keys', '-t', target, command, 'Enter'], { cwd });
   }
@@ -268,6 +291,7 @@ function createTmuxOps(config) {
     hasSession,
     createSession,
     createWindow,
+    findWindow,
     ensureWindow,
     sendKeys,
     sendKeysRaw,

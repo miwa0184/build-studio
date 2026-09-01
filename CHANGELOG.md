@@ -46,6 +46,12 @@ record and red-first receipt:
   bounded technical builder automatically, including after a server restart.
   Its assignment contains only the predecessor's technical cause and expressly
   excludes product requirements, acceptance policy and founder decisions.
+- **Durable repair-launch receipts.** Before tmux or a repair CLI can start, the
+  server persists one deterministic launch attempt under a cross-process lock.
+  The wrapper records monotonic `intent` → `started` → `completed` receipts.
+  Restart adopts the exact live tmux window for a started attempt; an absent or
+  ambiguous process is parked as a typed technical launch failure rather than
+  being started twice.
 - **Deterministic candidate-progress evidence.** The server records the exact
   Git head before repair and accepts continuation only at a different forward
   descendant. This proves a concrete committed candidate exists, not that it is
@@ -60,6 +66,11 @@ record and red-first receipt:
   event are charged into cumulative lineage recovery units when a successor is
   created. Holds and observation time remain zero-cost because the engine does
   not truthfully meter wallclock, model tokens or money for every agent CLI.
+- **Run-guard writes are cross-process serialised and terminal guards freeze.**
+  The entire read/mutate/rename cycle now holds a per-run mkdir lock. Once a
+  technical stop is durable, counters and terminal evidence cannot change, so
+  two server processes cannot acknowledge lost spend or overwrite a stop with
+  a stale pre-stop document.
 - **Repeated identical failures stop before side effects.** A deterministic
   fingerprint over reason, step, tasks and evidence survives run ids and
   timestamps. At the configured cap, the server returns a typed terminal
@@ -69,6 +80,9 @@ record and red-first receipt:
   predecessor guard and registry evidence stay terminal. Operational context
   is copied forward, transient state for the stopped step is reset, and the
   remaining verification pipeline runs again under the new id.
+- **A forward repair commit must also leave a clean repository.** Staged,
+  unstaged or untracked residue is returned as deterministic dirty-path
+  evidence and cannot satisfy the progress signal.
 
 ### Upgrade steps
 
@@ -81,7 +95,9 @@ app and any running project-servers.
 lineage ledger immediately. An A1b.1 root without a ledger is captured atomically
 on its first eligible successor, using the then-current validated limits. The
 existing append-only `.build-studio/admission/` and `.build-studio/run-guard/`
-paths remain authoritative; do not delete them.
+paths remain authoritative; do not delete them. The new operational
+`.build-studio/successor-launch/` receipts are created automatically and must
+not be removed while a repair attempt is active.
 
 ### Known limitations
 
@@ -97,6 +113,17 @@ paths remain authoritative; do not delete them.
   still held queued output, briefly returning complete counters beside an empty
   `logPath`. The required three-pass validation exposed the race; the promise
   now waits for the stream's `finish` callback.
+- **Independent review blockers were repaired before merge.** The first frozen
+  PR head was not merged: review reproduced cross-process run-guard lost
+  updates, dirty-tree acceptance after a forward commit, and duplicate repair
+  launch side effects across the send/persist crash window. Permanent tests now
+  exercise 40 concurrent guard writers, a stop/counter race, all three dirty
+  Git states, crash immediately after real `send-keys`, and a synchronised
+  two-project-server launch race.
+- **OpenCode launch metadata uses the resolved step model.** A live fake-CLI
+  canary exposed an old reference to a nonexistent `opencodeModel` local. The
+  agent record now uses the already resolved `modelShortName`, matching the
+  launch flags and preventing a post-preflight 500.
 
 ## 2026-09-01 — Runs are admitted at the door, and a run's history cannot be deleted into a fresh start
 

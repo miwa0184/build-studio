@@ -16,11 +16,49 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { spawn } = require('child_process');
 
 const { createRunGuard, RunGuardConflictError } = require('./run-guard');
 
 function tmpState() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'bs-run-guard-'));
+}
+
+function guardChild(statePath, runId, operation) {
+  const source = `
+    const { createRunGuard } = require(process.argv[1]);
+    const guard = createRunGuard({ statePath: process.argv[2] });
+    try {
+      if (process.argv[4] === 'stop') {
+        guard.mutate(process.argv[3], (doc) => {
+          doc.technicalStop = {
+            outcome: 'TECHNICAL_STOP', schemaVersion: 2, principal: 'technical',
+            runId: process.argv[3], reasonCode: 'TEST_STOP', step: 'test',
+            tasks: [], evidence: ['cross-process terminal test'],
+          };
+        });
+      } else {
+        guard.bump(process.argv[3], 'cross_process_units');
+      }
+      process.stdout.write(JSON.stringify({ ok: true, operation: process.argv[4] }));
+    } catch (error) {
+      process.stdout.write(JSON.stringify({ ok: false, operation: process.argv[4], code: error.code, message: error.message }));
+    }
+  `;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [
+      '-e', source, require.resolve('./run-guard'), statePath, runId, operation,
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('exit', (code) => {
+      if (code !== 0) return reject(new Error(`guard child exited ${code}: ${stderr}`));
+      try { resolve(JSON.parse(stdout)); } catch (_) { reject(new Error(`invalid guard child output: ${stdout}\n${stderr}`)); }
+    });
+  });
 }
 
 test('a fresh run gets a guard doc with revision 0 and its own run id', () => {
@@ -133,4 +171,40 @@ test('mutate() applies under the current revision and records the result', () =>
   assert.equal(doc.blockingTasks.length, 1);
   assert.equal(doc.blockingTasks[0].index, 2);
   assert.ok(doc.revision > 0);
+});
+
+test('cross-process bumps serialize the entire read-modify-write and preserve every acknowledged unit', async (t) => {
+  const statePath = tmpState();
+  t.after(() => { try { fs.rmSync(statePath, { recursive: true, force: true }); } catch (_) {} });
+  const results = await Promise.all(Array.from({ length: 40 }, () => guardChild(statePath, 'run-cross-process', 'bump')));
+  assert.ok(results.every((result) => result.ok), JSON.stringify(results));
+  const guard = createRunGuard({ statePath });
+  assert.equal(guard.count('run-cross-process', 'cross_process_units'), 40,
+    'every child that returned success must have one durable unit');
+  assert.equal(fs.existsSync(guard.lockFor('run-cross-process')), false, 'the per-run lock is released');
+});
+
+test('a concurrent terminal write freezes the guard; later counters cannot erase it or be acknowledged invisibly', async (t) => {
+  const statePath = tmpState();
+  t.after(() => { try { fs.rmSync(statePath, { recursive: true, force: true }); } catch (_) {} });
+  const guard = createRunGuard({ statePath });
+  guard.save(guard.load('run-terminal-race')); // materialise the starting revision
+
+  const operations = [
+    ...Array.from({ length: 24 }, () => 'bump'),
+    'stop',
+  ].sort(() => Math.random() - 0.5);
+  const results = await Promise.all(operations.map((operation) => guardChild(statePath, 'run-terminal-race', operation)));
+  const stop = results.find((result) => result.operation === 'stop');
+  assert.equal(stop.ok, true, JSON.stringify(results));
+  const acknowledgedBumps = results.filter((result) => result.operation === 'bump' && result.ok).length;
+  const refusedBumps = results.filter((result) => result.operation === 'bump' && !result.ok);
+  assert.ok(refusedBumps.every((result) => result.code === 'RUN_GUARD_TERMINAL'), JSON.stringify(refusedBumps));
+
+  const final = guard.load('run-terminal-race');
+  assert.equal(final.counters.cross_process_units || 0, acknowledgedBumps,
+    'no successful counter write may disappear behind the stop');
+  assert.equal(final.technicalStop.reasonCode, 'TEST_STOP',
+    'no counter writer may replace durable terminal truth with a stale pre-stop document');
+  assert.throws(() => guard.bump('run-terminal-race', 'cross_process_units'), (error) => error.code === 'RUN_GUARD_TERMINAL');
 });
