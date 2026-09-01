@@ -54,7 +54,7 @@ function guardChild(statePath, runId, operation) {
     child.stdout.on('data', (chunk) => { stdout += chunk; });
     child.stderr.on('data', (chunk) => { stderr += chunk; });
     child.on('error', reject);
-    child.on('exit', (code) => {
+    child.on('close', (code) => {
       if (code !== 0) return reject(new Error(`guard child exited ${code}: ${stderr}`));
       try { resolve(JSON.parse(stdout)); } catch (_) { reject(new Error(`invalid guard child output: ${stdout}\n${stderr}`)); }
     });
