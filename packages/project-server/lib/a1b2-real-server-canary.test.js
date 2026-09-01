@@ -61,6 +61,7 @@ function makeFixture(overrides = {}) {
       '.build-studio/fake-opencode-launches',
       '.build-studio/launch-barrier/',
       '.tmux/',
+      '.claude/settings.local.json',
       'docs/agent-status.json',
       'tmp/',
       '',
@@ -87,6 +88,7 @@ function makeFixture(overrides = {}) {
     if (['test-bin/zsh', 'test-bin/opencode'].includes(rel)) fs.chmodSync(abs, 0o755);
   }
   git('init', '-q');
+  git('config', 'core.excludesFile', '/dev/null');
   git('config', 'user.email', 'test@example.com');
   git('config', 'user.name', 'Test');
   git('add', '-A');
@@ -574,7 +576,7 @@ test('C8 — real server: two project-server processes race one pending launch i
   const running = await waitFor(a.port, (wf) => wf && wf.type === 'repair'
     && wf.steps.successor_repair.status === 'running');
   await waitForJsonFile(running.successorRepair.launch.receiptFile, (receipt) => receipt.status === 'started');
-  await new Promise((resolve) => setTimeout(resolve, 250));
+  await waitForCondition(() => fakeLaunchCount(fx.root) === 1);
   assert.equal(fakeLaunchCount(fx.root), 1,
     'cross-process launch exclusion must emit exactly one repair CLI invocation');
   assert.equal(running.steps.successor_repair.agents.length, 1);
