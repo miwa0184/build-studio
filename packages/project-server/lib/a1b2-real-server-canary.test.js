@@ -14,6 +14,12 @@ const crypto = require('crypto');
 const { execFileSync, spawn } = require('child_process');
 
 const { createTechnicalStop, REASON_CODES } = require('./technical-stop');
+const {
+  createSuccessorLaunchStore,
+  measureGitAuthority,
+  startCheckedReceiptFile,
+  updateReceiptFile,
+} = require('./successor-launch');
 
 const SERVER_JS = path.join(__dirname, 'server.js');
 const ORIGIN = 'test-owner/test-repo';
@@ -60,6 +66,7 @@ function makeFixture(overrides = {}) {
       '.build-studio/successor-launch/',
       '.build-studio/fake-opencode-launches',
       '.build-studio/launch-barrier/',
+      '.build-studio/runtime-bin/',
       '.tmux/',
       '.claude/settings.local.json',
       'docs/agent-status.json',
@@ -138,6 +145,7 @@ async function spawnServer(root, {
   receiptFault = null,
   startConfirmationMs = null,
   crashAfterReceiptFault = true,
+  cliPathDir = null,
 } = {}) {
   const basePort = 22000 + Math.floor(Math.random() * 18000);
   const tmuxDir = path.join(root, '.tmux');
@@ -155,8 +163,16 @@ async function spawnServer(root, {
       if (confirmationMs > 0) workflowDeps.successorLaunchStartConfirmationMs = confirmationMs;
       if (point === 'before-send') workflowDeps.beforeSuccessorAgentSend = () => process.exit(86);
       if (point === 'after-send') workflowDeps.afterSuccessorAgentSend = () => process.exit(87);
+      if (point === 'after-send-lost-window') workflowDeps.afterSuccessorAgentSend = ({ workflow }) => {
+        try { fs.unlinkSync(workflow.successorRepair.launch.receiptFile); } catch (_) {}
+        try { execFileSync('tmux', ['kill-session', '-t', workflow.sessionName], { stdio: 'ignore' }); } catch (_) {}
+        process.exit(89);
+      };
       if (point === 'branch-drift-before-send') workflowDeps.beforeSuccessorAgentSend = () => {
         execFileSync('git', ['switch', '-q', '-c', 'send-boundary-drift'], { cwd: process.argv[2] });
+      };
+      if (point === 'branch-drift-after-window') workflowDeps.afterSuccessorWindowEnsure = () => {
+        execFileSync('git', ['switch', '-q', '-c', 'window-boundary-drift'], { cwd: process.argv[2] });
       };
       if (receiptFault) {
         workflowDeps.beforeSuccessorAgentSend = ({ workflow }) => {
@@ -187,7 +203,7 @@ async function spawnServer(root, {
     env: {
       ...process.env,
       PATH: strictCliPath
-        ? `${path.join(root, 'test-bin')}:/usr/bin:/bin:/usr/sbin:/sbin`
+        ? `${cliPathDir || path.join(root, 'test-bin')}:/usr/bin:/bin:/usr/sbin:/sbin`
         : `${path.join(root, 'test-bin')}:${process.env.PATH || ''}`,
       TMUX_TMPDIR: tmuxDir,
     },
@@ -589,7 +605,7 @@ test('C5b — real server: restart refuses launch after the checkout leaves the 
   srv = await spawnServer(fx.root);
   const blocked = await waitFor(srv.port, (wf) => wf && wf.type === 'repair'
     && wf.steps.successor_repair.status === 'blocked' && wf.successorRepair.launchFailure);
-  assert.equal(blocked.successorRepair.launchFailure.code, 'SUCCESSOR_REPAIR_BRANCH_DRIFT');
+  assert.equal(blocked.successorRepair.launchFailure.code, 'SUCCESSOR_REPAIR_GIT_AUTHORITY_REFUSED');
   assert.equal(fakeLaunchCount(fx.root), 0, 'branch drift must refuse before any repair CLI side effect');
 });
 
@@ -604,10 +620,26 @@ test('C5c — real server: a concurrent branch switch at the send boundary is ty
   assert.equal(created.status, 201, JSON.stringify(created.body));
   const blocked = await waitFor(srv.port, (wf) => wf && wf.type === 'repair'
     && wf.steps.successor_repair.status === 'blocked' && wf.successorRepair.launchFailure);
-  assert.equal(blocked.successorRepair.launchFailure.code, 'SUCCESSOR_REPAIR_BRANCH_DRIFT');
-  assert.equal(blocked.successorRepair.launchFailure.expectedRef, 'refs/heads/main');
+  assert.equal(blocked.successorRepair.launchFailure.code, 'SUCCESSOR_REPAIR_GIT_AUTHORITY_REFUSED');
+  assert.equal(blocked.successorRepair.launchFailure.expected.ref, 'refs/heads/main');
   assert.equal(blocked.successorRepair.launchFailure.currentRef, 'refs/heads/send-boundary-drift');
   assert.equal(fakeLaunchCount(fx.root), 0, 'send-boundary drift refuses before tmux/CLI launch');
+});
+
+test('P1-D — branch switch after ensureWindow but before sendKeys is typed with zero CLI side effect', async (t) => {
+  const fx = makeFixture();
+  const srv = await spawnServer(fx.root, { crashPoint: 'branch-drift-after-window' });
+  t.after(async () => { await srv.kill(); fx.clean(); });
+
+  const root = await startRoot(srv, fx);
+  plantTechnicalStop(fx, root.id);
+  const created = await httpJson(srv.port, 'POST', '/api/workflow/successor', {});
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const blocked = await waitFor(srv.port, (wf) => wf && wf.type === 'repair'
+    && wf.steps.successor_repair.status === 'blocked' && wf.successorRepair.launchFailure, 5000);
+  assert.equal(blocked.successorRepair.launchFailure.code, 'SUCCESSOR_REPAIR_GIT_AUTHORITY_REFUSED');
+  assert.equal(blocked.successorRepair.launchFailure.currentRef, 'refs/heads/window-boundary-drift');
+  assert.equal(fakeLaunchCount(fx.root), 0);
 });
 
 test('C6 — real server: transient registry contention is retryable, not a fake terminal cap', async (t) => {
@@ -657,12 +689,97 @@ test('C7 — real server: crash immediately after send-keys adopts the same live
   srv = await spawnServer(fx.root);
   const adopted = await waitFor(srv.port, (wf) => wf && wf.id === crashed.id
     && wf.steps.successor_repair.status === 'running'
-    && wf.successorRepair.launch.status === 'adopted');
+    && wf.successorRepair.launch.adopted === true);
   assert.equal(adopted.steps.successor_repair.agents[0].launchAttemptId,
     crashed.successorRepair.launch.attemptId);
   await new Promise((resolve) => setTimeout(resolve, 250));
   assert.equal(fakeLaunchCount(fx.root), 1, 'restart must not send the repair assignment twice');
 });
+
+test('P1-C — crash after send plus lost receipt/window becomes LAUNCH_AMBIGUOUS and never relaunches', async (t) => {
+  const fx = makeFixture();
+  let srv = await spawnServer(fx.root, { crashPoint: 'after-send-lost-window' });
+  t.after(async () => { await srv.kill(); fx.clean(); });
+
+  const root = await startRoot(srv, fx);
+  plantTechnicalStop(fx, root.id);
+  await assert.rejects(httpJson(srv.port, 'POST', '/api/workflow/successor', {}));
+  assert.equal(await srv.waitForExit(), 89, srv.logs());
+  assert.equal(fakeLaunchCount(fx.root), 0);
+
+  srv = await spawnServer(fx.root, { startConfirmationMs: 300 });
+  const blocked = await waitFor(srv.port, (wf) => wf && wf.type === 'repair'
+    && wf.steps.successor_repair.status === 'blocked' && wf.successorRepair.launchFailure, 5000);
+  assert.equal(blocked.successorRepair.launchFailure.code, 'LAUNCH_AMBIGUOUS');
+  await assertLaunchCountStable(fx.root, 0, 700);
+});
+
+function wrapperReceiptFixture(t) {
+  const fx = makeFixture();
+  t.after(() => fx.clean());
+  const statePath = path.join(fx.root, '.build-studio');
+  const store = createSuccessorLaunchStore({ statePath });
+  const measured = measureGitAuthority(fx.root);
+  const git = { cwd: measured.cwd, ref: measured.ref, head: measured.head, tree: measured.tree };
+  const runId = `wrapper-${crypto.randomBytes(4).toString('hex')}`;
+  const attemptId = crypto.createHash('sha256').update(runId).digest('hex');
+  const receipt = store.ensureIntent(runId, {
+    attemptId, sessionName: 'wrapper-session', windowName: 'wrapper-window', git,
+  });
+  store.markDispatching(runId, attemptId);
+  return { fx, store, runId, attemptId, receiptFile: store.fileFor(runId), git, receipt };
+}
+
+test('P1-D — executed wrapper self-check allows exact clean ref/head/tree and durably starts', (t) => {
+  const wrapped = wrapperReceiptFixture(t);
+  const started = startCheckedReceiptFile(wrapped.receiptFile);
+  assert.equal(started.status, 'started');
+  assert.equal(started.attemptId, wrapped.attemptId);
+});
+
+test('P1-C — receipt transitions cannot regress started, completed, or terminal authority', (t) => {
+  const completedFixture = wrapperReceiptFixture(t);
+  assert.equal(startCheckedReceiptFile(completedFixture.receiptFile).status, 'started');
+  assert.throws(() => startCheckedReceiptFile(completedFixture.receiptFile), /from started/);
+  const completed = updateReceiptFile(completedFixture.receiptFile, 'completed', 0);
+  assert.equal(completed.status, 'completed');
+  execFileSync('git', ['switch', '-q', '-c', 'post-completion-drift'], { cwd: completedFixture.fx.root });
+  assert.throws(() => startCheckedReceiptFile(completedFixture.receiptFile), /from completed/,
+    'a replayed wrapper checks monotonic status before it can rewrite completed authority');
+  assert.equal(completedFixture.store.markTerminal(
+    completedFixture.runId, completedFixture.attemptId, 'SHOULD_NOT_REPLACE', 'completed is final',
+  ).status, 'completed');
+  assert.equal(completedFixture.store.read(completedFixture.runId).status, 'completed');
+
+  const terminalFixture = wrapperReceiptFixture(t);
+  terminalFixture.store.markTerminal(
+    terminalFixture.runId, terminalFixture.attemptId, 'TEST_TERMINAL', 'terminal authority is final',
+  );
+  assert.throws(() => startCheckedReceiptFile(terminalFixture.receiptFile), /from terminal/);
+  assert.equal(terminalFixture.store.read(terminalFixture.runId).terminalCode, 'TEST_TERMINAL');
+  assert.equal(fakeLaunchCount(terminalFixture.fx.root), 0);
+});
+
+for (const drift of ['wrong-branch', 'detached', 'same-branch-head-tree']) {
+  test(`P1-D — executed wrapper self-check refuses ${drift} before durable started/CLI`, (t) => {
+    const wrapped = wrapperReceiptFixture(t);
+    if (drift === 'wrong-branch') {
+      execFileSync('git', ['switch', '-q', '-c', 'wrapper-wrong-branch'], { cwd: wrapped.fx.root });
+    } else if (drift === 'detached') {
+      execFileSync('git', ['checkout', '-q', '--detach', 'HEAD'], { cwd: wrapped.fx.root });
+    } else {
+      fs.appendFileSync(path.join(wrapped.fx.root, 'README.md'), 'wrapper drift\n');
+      execFileSync('git', ['add', 'README.md'], { cwd: wrapped.fx.root });
+      execFileSync('git', ['commit', '-q', '-m', 'test: wrapper head drift'], { cwd: wrapped.fx.root });
+    }
+    assert.throws(() => startCheckedReceiptFile(wrapped.receiptFile),
+      (error) => error.code === 'SUCCESSOR_REPAIR_GIT_AUTHORITY_REFUSED');
+    const terminal = wrapped.store.read(wrapped.runId);
+    assert.equal(terminal.status, 'terminal');
+    assert.equal(terminal.terminalCode, 'SUCCESSOR_REPAIR_GIT_AUTHORITY_REFUSED');
+    assert.equal(fakeLaunchCount(wrapped.fx.root), 0);
+  });
+}
 
 for (const receiptFault of ['missing', 'unreadable', 'unwritable']) {
   test(`C7b — real server: ${receiptFault} started-receipt fails closed before CLI and remains safe on restart`, async (t) => {
@@ -672,19 +789,23 @@ for (const receiptFault of ['missing', 'unreadable', 'unwritable']) {
 
     const root = await startRoot(srv, fx);
     plantTechnicalStop(fx, root.id);
-    await assert.rejects(httpJson(srv.port, 'POST', '/api/workflow/successor', {}));
-    assert.equal(await srv.waitForExit(), 88, srv.logs());
-    await new Promise((resolve) => setTimeout(resolve, 750));
+    const created = await httpJson(srv.port, 'POST', '/api/workflow/successor', {});
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const blockedLive = await waitFor(srv.port, (wf) => wf && wf.type === 'repair'
+      && wf.steps.successor_repair.status === 'blocked' && wf.successorRepair.launchFailure);
     assert.equal(fakeLaunchCount(fx.root), 0,
       'a CLI process must not start when its durable started receipt cannot be written');
+    assert.match(blockedLive.successorRepair.launchFailure.code,
+      /^SUCCESSOR_LAUNCH_(UNREADABLE|RECEIPT_UNWRITABLE)$/);
 
     const receiptDir = path.join(fx.root, '.build-studio', 'successor-launch');
     if (receiptFault === 'unwritable') fs.chmodSync(receiptDir, 0o755);
+    await srv.kill();
     srv = await spawnServer(fx.root, { startConfirmationMs: 300 });
     const blocked = await waitFor(srv.port, (wf) => wf && wf.type === 'repair'
       && wf.steps.successor_repair.status === 'blocked' && wf.successorRepair.launchFailure);
     assert.match(blocked.successorRepair.launchFailure.code,
-      /^SUCCESSOR_LAUNCH_(STARTED_RECEIPT_UNCONFIRMED|UNREADABLE)$/);
+      /^SUCCESSOR_LAUNCH_(UNREADABLE|RECEIPT_UNWRITABLE)$/);
     await assertLaunchCountStable(fx.root, 0, 700);
   });
 }
@@ -704,7 +825,7 @@ test('C7c — real server: a live server parks an unconfirmed started receipt in
   assert.equal(created.status, 201, JSON.stringify(created.body));
   const blocked = await waitFor(srv.port, (wf) => wf && wf.type === 'repair'
     && wf.steps.successor_repair.status === 'blocked' && wf.successorRepair.launchFailure);
-  assert.equal(blocked.successorRepair.launchFailure.code, 'SUCCESSOR_LAUNCH_STARTED_RECEIPT_UNCONFIRMED');
+  assert.equal(blocked.successorRepair.launchFailure.code, 'SUCCESSOR_LAUNCH_UNREADABLE');
   await assertLaunchCountStable(fx.root, 0, 700);
 });
 
@@ -756,16 +877,19 @@ test('C8m — the bounded C8 observer catches an intentionally delayed second la
 
 test('C9 — real server: a failed CLI preflight can retry the same durable attempt exactly once', async (t) => {
   const fx = makeFixture();
-  const fakeCli = path.join(fx.root, 'test-bin', 'opencode');
-  const fakeCliBody = fs.readFileSync(fakeCli, 'utf8');
+  const trackedCli = path.join(fx.root, 'test-bin', 'opencode');
+  const fakeCliBody = fs.readFileSync(trackedCli, 'utf8');
+  const runtimeBin = path.join(fx.root, '.build-studio', 'runtime-bin');
+  fs.mkdirSync(runtimeBin, { recursive: true });
+  fs.symlinkSync(path.join(fx.root, 'test-bin', 'zsh'), path.join(runtimeBin, 'zsh'));
   const tmuxBin = execFileSync('/usr/bin/which', ['tmux'], { encoding: 'utf8' }).trim();
-  fs.symlinkSync(tmuxBin, path.join(fx.root, 'test-bin', 'tmux'));
-  const srv = await spawnServer(fx.root, { strictCliPath: true });
+  fs.symlinkSync(tmuxBin, path.join(runtimeBin, 'tmux'));
+  const fakeCli = path.join(runtimeBin, 'opencode');
+  const srv = await spawnServer(fx.root, { strictCliPath: true, cliPathDir: runtimeBin });
   t.after(async () => { await srv.kill(); fx.clean(); });
 
   const root = await startRoot(srv, fx);
   plantTechnicalStop(fx, root.id);
-  fs.unlinkSync(fakeCli);
 
   const created = await httpJson(srv.port, 'POST', '/api/workflow/successor', {});
   assert.equal(created.status, 201, JSON.stringify(created.body));

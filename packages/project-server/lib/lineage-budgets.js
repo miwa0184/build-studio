@@ -10,7 +10,12 @@
  */
 
 const { resolveBudgets, COUNTERS } = require('./run-budgets');
-const { REASON_CODES, isTechnicalStop, technicalStopFingerprint } = require('./technical-stop');
+const {
+  REASON_CODES,
+  isTechnicalStop,
+  technicalStopCause,
+  technicalStopFingerprint,
+} = require('./technical-stop');
 
 const DEFAULT_MAX_SUCCESSORS = 2;
 const DEFAULT_MAX_NO_PROGRESS_REPEATS = 1;
@@ -71,7 +76,8 @@ function successorRecoveryEligibility(stop) {
       return { eligible: false, reason: 'the stop does not allow successor_repair' };
     }
   }
-  return { eligible: true, fingerprint: technicalStopFingerprint(stop) };
+  const cause = technicalStopCause(stop);
+  return { eligible: true, cause, fingerprint: technicalStopFingerprint(stop) };
 }
 
 function recoveryCharge(guardDoc) {

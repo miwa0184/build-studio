@@ -33,6 +33,10 @@ const path = require('path');
 const crypto = require('crypto');
 
 const { DEFAULT_MAX_SUCCESSORS, DEFAULT_MAX_NO_PROGRESS_REPEATS } = require('./lineage-budgets');
+const {
+  technicalStopFingerprint,
+  technicalCauseFingerprint,
+} = require('./technical-stop');
 
 const SCHEMA_VERSION = 2;
 const ADMISSION_DIR = 'admission';
@@ -118,6 +122,24 @@ function isNonNegativeInteger(value) {
   return Number.isInteger(value) && value >= 0;
 }
 
+function isSha256(value) {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+}
+
+/** Stable recursive JSON used for durable request identity. */
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const keys = Object.keys(value).sort();
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function requestAuthorityDigest(request) {
+  return crypto.createHash('sha256').update(canonicalJson(request)).digest('hex');
+}
+
 function corrupt(file, pathName, message, actual) {
   throw new AdmissionRegistryCorruptError(
     `admission registry ${pathName} ${message}`,
@@ -196,6 +218,104 @@ function validateV2Registry(doc, file) {
   validateCommonRegistry(doc, file);
   requireRecord(doc.lineages, file, 'lineages');
   const seenRuns = new Set();
+  const nonceByRun = new Map();
+
+  // Schema 2 makes replay authority bidirectional. A nonce entry is not enough:
+  // every root must point back to exactly one consumed nonce and its canonical
+  // request digest, so deleting the nonce cannot make the request look unused.
+  for (const [nonce, entry] of Object.entries(doc.nonces)) {
+    requireString(entry.requestDigest, file, `nonces.${nonce}.requestDigest`);
+    if (!isSha256(entry.requestDigest)) {
+      corrupt(file, `nonces.${nonce}.requestDigest`, 'must be a 64-character lowercase sha256', entry.requestDigest);
+    }
+    if (nonceByRun.has(entry.runId)) {
+      corrupt(file, `nonces.${nonce}.runId`, 'must be the only consumed nonce for its root run', entry.runId);
+    }
+    if (doc.runs[entry.runId].lineage.predecessorRunId !== null) {
+      corrupt(file, `nonces.${nonce}.runId`, 'must reference a root run, never a successor', entry.runId);
+    }
+    nonceByRun.set(entry.runId, { nonce, requestDigest: entry.requestDigest });
+  }
+
+  for (const [runId, entry] of Object.entries(doc.runs)) {
+    const identity = requireRecord(entry.requestIdentity, file, `runs.${runId}.requestIdentity`);
+    const lineage = entry.lineage;
+    if (entry.verdict.kind !== 'GateVerdict' || entry.verdict.decision !== 'ADMITTED'
+      || entry.verdict.runId !== runId) {
+      corrupt(file, `runs.${runId}.verdict`, 'must be the server-issued admission verdict for this run', entry.verdict);
+    }
+    if (lineage.predecessorRunId === null) {
+      if (!['RUN_REQUEST_V1', 'LEGACY_V1_CAPTURE'].includes(identity.kind)) {
+        corrupt(file, `runs.${runId}.requestIdentity.kind`, 'must identify a canonical request or explicit legacy-v1 capture', identity.kind);
+      }
+      requireString(identity.nonce, file, `runs.${runId}.requestIdentity.nonce`);
+      requireString(identity.requestDigest, file, `runs.${runId}.requestIdentity.requestDigest`);
+      if (!isSha256(identity.requestDigest)) {
+        corrupt(file, `runs.${runId}.requestIdentity.requestDigest`, 'must be a 64-character lowercase sha256', identity.requestDigest);
+      }
+      const nonceAuthority = nonceByRun.get(runId);
+      if (!nonceAuthority || nonceAuthority.nonce !== identity.nonce) {
+        corrupt(file, `runs.${runId}.requestIdentity.nonce`, 'must point to the root run\'s one consumed nonce', identity.nonce);
+      }
+      if (nonceAuthority.requestDigest !== identity.requestDigest) {
+        corrupt(file, `runs.${runId}.requestIdentity.requestDigest`, 'must match the consumed nonce digest', identity.requestDigest);
+      }
+      if (entry.verdict.nonce !== identity.nonce) {
+        corrupt(file, `runs.${runId}.verdict.nonce`, 'must match canonical request identity', entry.verdict.nonce);
+      }
+      if (entry.verdict.requestDigest !== identity.requestDigest
+        || lineage.admissionRequestDigest !== identity.requestDigest) {
+        corrupt(file, `runs.${runId}.requestIdentity.requestDigest`, 'must match verdict and lineage request digests', identity.requestDigest);
+      }
+      if (identity.kind === 'RUN_REQUEST_V1') {
+        const request = requireRecord(identity.request, file, `runs.${runId}.requestIdentity.request`);
+        if (request.version !== 1
+          || !isNonEmptyString(request.repo)
+          || !/^[0-9a-f]{40,64}$/.test(String(request.head || ''))
+          || !isNonEmptyString(request.task_packet)
+          || !Array.isArray(request.claims)
+          || !isNonEmptyString(request.issued_at)
+          || !isNonEmptyString(request.expires_at)) {
+          corrupt(file, `runs.${runId}.requestIdentity.request`, 'must retain the complete canonical RunRequest v1', request);
+        }
+        if (request.nonce !== identity.nonce) {
+          corrupt(file, `runs.${runId}.requestIdentity.request.nonce`, 'must match canonical request identity', request.nonce);
+        }
+        const recomputed = requestAuthorityDigest(request);
+        if (recomputed !== identity.requestDigest) {
+          corrupt(file, `runs.${runId}.requestIdentity.requestDigest`, 'does not match the canonical stored request', identity.requestDigest);
+        }
+        if (entry.verdict.repo !== request.repo
+          || entry.verdict.head !== request.head
+          || entry.verdict.taskPacket !== request.task_packet
+          || lineage.admittedRepo !== request.repo
+          || lineage.admittedHead !== request.head) {
+          corrupt(file, `runs.${runId}.requestIdentity`, 'must agree with every verdict and lineage field derived from the canonical request', identity);
+        }
+      } else {
+        requireString(identity.capturedAt, file, `runs.${runId}.requestIdentity.capturedAt`);
+        if (Object.prototype.hasOwnProperty.call(identity, 'request')) {
+          corrupt(file, `runs.${runId}.requestIdentity.request`, 'must be absent for an explicit legacy-v1 capture');
+        }
+      }
+    } else {
+      if (identity.kind !== 'SUCCESSOR') {
+        corrupt(file, `runs.${runId}.requestIdentity.kind`, 'must identify inherited successor request authority', identity.kind);
+      }
+      if (identity.rootRunId !== lineage.lineageId) {
+        corrupt(file, `runs.${runId}.requestIdentity.rootRunId`, 'must equal the lineage root', identity.rootRunId);
+      }
+      requireString(identity.rootRequestDigest, file, `runs.${runId}.requestIdentity.rootRequestDigest`);
+      if (!isSha256(identity.rootRequestDigest)) {
+        corrupt(file, `runs.${runId}.requestIdentity.rootRequestDigest`, 'must be a 64-character lowercase sha256', identity.rootRequestDigest);
+      }
+      if (entry.verdict.successor !== true
+        || entry.verdict.predecessorRunId !== lineage.predecessorRunId
+        || entry.verdict.lineageId !== lineage.lineageId) {
+        corrupt(file, `runs.${runId}.verdict`, 'must identify this exact successor transition', entry.verdict);
+      }
+    }
+  }
 
   for (const [lineageId, ledger] of Object.entries(doc.lineages)) {
     requireString(lineageId, file, `lineages.${lineageId}`);
@@ -257,6 +377,21 @@ function validateV2Registry(doc, file) {
         || identity.predecessorRunId !== (index === 0 ? null : ledger.runs[index - 1])) {
         corrupt(file, `runs.${runId}.lineage`, 'disagrees with the ordered lineage ledger', identity);
       }
+      const rootRequest = doc.runs[lineageId] && doc.runs[lineageId].requestIdentity;
+      const rootRun = doc.runs[lineageId];
+      const requestIdentity = run.requestIdentity;
+      if (index > 0 && (!rootRequest
+        || requestIdentity.rootRunId !== lineageId
+        || requestIdentity.rootRequestDigest !== rootRequest.requestDigest
+        || run.verdict.requestDigest !== rootRequest.requestDigest
+        || identity.admissionRequestDigest !== rootRequest.requestDigest
+        || run.verdict.repo !== rootRun.verdict.repo
+        || run.verdict.head !== rootRun.verdict.head
+        || run.verdict.taskPacket !== rootRun.verdict.taskPacket
+        || identity.admittedRepo !== rootRun.lineage.admittedRepo
+        || identity.admittedHead !== rootRun.lineage.admittedHead)) {
+        corrupt(file, `runs.${runId}.requestIdentity`, 'does not inherit the canonical root request digest', requestIdentity);
+      }
       const expectedSuccessor = ledger.runs[index + 1];
       if (expectedSuccessor ? run.successorRunId !== expectedSuccessor : run.successorRunId !== undefined) {
         corrupt(file, `runs.${runId}.successorRunId`, 'disagrees with the ordered lineage ledger', run.successorRunId);
@@ -273,6 +408,23 @@ function validateV2Registry(doc, file) {
       requireString(event.causeFingerprint, file, `lineages.${lineageId}.events.${index}.causeFingerprint`);
       if (!/^[0-9a-f]{64}$/.test(event.causeFingerprint)) {
         corrupt(file, `lineages.${lineageId}.events.${index}.causeFingerprint`, 'must be a 64-character lowercase sha256', event.causeFingerprint);
+      }
+      const cause = requireRecord(event.cause, file, `lineages.${lineageId}.events.${index}.cause`);
+      let recomputedCause;
+      try { recomputedCause = technicalCauseFingerprint(cause); } catch (error) {
+        corrupt(file, `lineages.${lineageId}.events.${index}.cause`, `must be reproducible: ${error.message}`);
+      }
+      if (recomputedCause !== event.causeFingerprint) {
+        corrupt(file, `lineages.${lineageId}.events.${index}.causeFingerprint`, 'must match the canonical event cause', event.causeFingerprint);
+      }
+      const predecessor = doc.runs[event.predecessorRunId];
+      let predecessorFingerprint;
+      try { predecessorFingerprint = technicalStopFingerprint(predecessor && predecessor.terminalStop); } catch (error) {
+        corrupt(file, `runs.${event.predecessorRunId}.terminalStop`, `has unverifiable cause authority: ${error.message}`);
+      }
+      if (predecessorFingerprint !== event.causeFingerprint
+        || predecessor.terminalFingerprint !== event.causeFingerprint) {
+        corrupt(file, `runs.${event.predecessorRunId}.terminalFingerprint`, 'must match the canonical successor event cause', predecessor && predecessor.terminalFingerprint);
       }
       requireString(event.reasonCode, file, `lineages.${lineageId}.events.${index}.reasonCode`);
       const charge = requireRecord(event.charge, file, `lineages.${lineageId}.events.${index}.charge`);
@@ -323,6 +475,29 @@ function upgradeV1Registry(reg, limits) {
   reg.schemaVersion = SCHEMA_VERSION;
   reg.lineages = {};
   for (const [runId, run] of Object.entries(reg.runs)) {
+    const nonceEntries = Object.entries(reg.nonces).filter(([, entry]) => entry.runId === runId);
+    if (nonceEntries.length !== 1) {
+      corrupt('legacy schema-1 registry', `runs.${runId}.requestIdentity.nonce`, 'cannot be captured without exactly one consumed nonce', nonceEntries.length);
+    }
+    const [nonce, nonceEntry] = nonceEntries[0];
+    const digest = run.verdict && run.verdict.requestDigest
+      || run.lineage && run.lineage.admissionRequestDigest;
+    if (!isSha256(digest)) {
+      corrupt('legacy schema-1 registry', `runs.${runId}.requestIdentity.requestDigest`, 'cannot be captured without a valid stored request digest', digest);
+    }
+    if (run.verdict.nonce !== undefined && run.verdict.nonce !== nonce) {
+      corrupt('legacy schema-1 registry', `runs.${runId}.verdict.nonce`, 'does not match its consumed nonce', run.verdict.nonce);
+    }
+    nonceEntry.requestDigest = digest;
+    run.verdict.nonce = nonce;
+    run.verdict.requestDigest = digest;
+    run.lineage.admissionRequestDigest = digest;
+    run.requestIdentity = {
+      kind: 'LEGACY_V1_CAPTURE',
+      nonce,
+      requestDigest: digest,
+      capturedAt: now,
+    };
     reg.lineages[runId] = {
       lineageId: runId,
       rootRunId: runId,
@@ -470,9 +645,15 @@ function createAdmissionRegistry({ statePath }) {
    * one cannot double-spend a nonce or double-register a run id — the retry
    * re-reads the file the winner wrote.
    */
-  function admit({ nonce, runId, verdict, lineage, claims, lineageBudget }) {
+  function admit({ nonce, runId, verdict, lineage, claims, lineageBudget, request, requestDigest }) {
     if (!nonce || typeof nonce !== 'string') throw new Error('admit: nonce is required');
     if (!runId || typeof runId !== 'string') throw new Error('admit: runId is required');
+    if (!request || typeof request !== 'object' || Array.isArray(request)) throw new Error('admit: canonical request is required');
+    const recomputedRequestDigest = requestAuthorityDigest(request);
+    if (!isSha256(requestDigest) || requestDigest !== recomputedRequestDigest) {
+      throw new Error('admit: requestDigest must match the canonical request');
+    }
+    if (request.nonce !== nonce) throw new Error('admit: request nonce must match the consumed nonce');
     const { doc } = mutate((reg) => {
       upgradeV1Registry(reg, lineageBudget || {
         maxSuccessors: DEFAULT_MAX_SUCCESSORS,
@@ -481,12 +662,18 @@ function createAdmissionRegistry({ statePath }) {
       });
       if (reg.nonces[nonce]) throw new NonceReplayError(nonce);
       if (reg.runs[runId]) throw new Error(`run ${runId} is already registered`);
-      reg.nonces[nonce] = { consumedAt: new Date().toISOString(), runId };
+      reg.nonces[nonce] = { consumedAt: new Date().toISOString(), runId, requestDigest };
       reg.runs[runId] = {
         registeredAt: new Date().toISOString(),
         verdict,
         lineage,
         claims: Array.isArray(claims) ? claims : [],
+        requestIdentity: {
+          kind: 'RUN_REQUEST_V1',
+          nonce,
+          requestDigest,
+          request: JSON.parse(JSON.stringify(request)),
+        },
       };
       const lineageId = lineage && lineage.lineageId || runId;
       if (!reg.lineages[lineageId]) {
@@ -515,12 +702,115 @@ function createAdmissionRegistry({ statePath }) {
    * charge in one registry write. The caller has already verified the guard's
    * terminal stop; every registry fact is checked again inside the mutation.
    */
+  function evaluateSuccessorAuthority(reg, {
+    predecessorRunId,
+    lineage,
+    terminalStop,
+    terminalCause,
+    terminalFingerprint,
+    charge,
+  }) {
+    const predecessor = reg.runs[String(predecessorRunId)];
+    if (!predecessor) {
+      throw new LineageRegistryRefusalError('RUN_NOT_ADMITTED', `predecessor ${predecessorRunId} is not registered`);
+    }
+
+    let recomputedStopFingerprint;
+    let recomputedCauseFingerprint;
+    try {
+      recomputedStopFingerprint = technicalStopFingerprint(terminalStop);
+      recomputedCauseFingerprint = technicalCauseFingerprint(terminalCause);
+    } catch (error) {
+      throw new LineageRegistryRefusalError(
+        'TECHNICAL_STOP_CAUSE_UNVERIFIABLE',
+        `predecessor ${predecessorRunId} has no reproducible canonical cause: ${error.message}`,
+      );
+    }
+    if (recomputedStopFingerprint !== terminalFingerprint
+      || recomputedCauseFingerprint !== terminalFingerprint) {
+      throw new LineageRegistryRefusalError(
+        'TECHNICAL_STOP_CAUSE_UNVERIFIABLE',
+        `predecessor ${predecessorRunId} cause receipt does not match its canonical source`,
+        { terminalFingerprint, recomputedStopFingerprint, recomputedCauseFingerprint },
+      );
+    }
+    if (predecessor.successorRunId) {
+      if (predecessor.terminalFingerprint !== terminalFingerprint) {
+        throw new LineageRegistryRefusalError(
+          'TECHNICAL_STOP_CAUSE_UNVERIFIABLE',
+          `predecessor ${predecessorRunId} guard cause no longer matches its committed successor authority`,
+          { terminalFingerprint, committedFingerprint: predecessor.terminalFingerprint },
+        );
+      }
+      return {
+        replay: {
+          run: reg.runs[predecessor.successorRunId],
+          runId: predecessor.successorRunId,
+          replayed: true,
+          lineage: reg.lineages[predecessor.lineage.lineageId] || null,
+        },
+      };
+    }
+
+    const lineageId = predecessor.lineage && predecessor.lineage.lineageId;
+    if (!lineageId || lineage && lineage.lineageId !== lineageId) {
+      throw new LineageRegistryRefusalError('LINEAGE_IDENTITY_MISMATCH', 'successor lineage does not match its registered predecessor');
+    }
+    const ledger = reg.lineages[lineageId];
+    if (!ledger) {
+      throw new LineageRegistryRefusalError(
+        'LINEAGE_AUTHORITY_MISSING',
+        `schema-2 lineage ${lineageId} is missing from the authoritative ledger`,
+        { lineageId },
+      );
+    }
+
+    const spent = ledger.spent;
+    const limits = ledger.limits;
+    const previousEvent = [...ledger.events].reverse().find((event) => event.type === 'SUCCESSOR_CREATED');
+    const repeated = previousEvent && previousEvent.causeFingerprint === terminalFingerprint ? 1 : 0;
+    const nextNoProgress = spent.noProgressRepeats + repeated;
+    if (nextNoProgress > limits.maxNoProgressRepeats) {
+      throw new LineageRegistryRefusalError(
+        'LINEAGE_NO_PROGRESS_BUDGET_EXHAUSTED',
+        `lineage ${lineageId} repeated cause ${terminalFingerprint} ${nextNoProgress} times; cap is ${limits.maxNoProgressRepeats}`,
+        { lineageId, terminalFingerprint, used: spent.noProgressRepeats, requested: nextNoProgress, max: limits.maxNoProgressRepeats },
+      );
+    }
+    if (spent.successors + 1 > limits.maxSuccessors) {
+      throw new LineageRegistryRefusalError(
+        'LINEAGE_SUCCESSOR_BUDGET_EXHAUSTED',
+        `lineage ${lineageId} already created ${spent.successors} successor(s); cap is ${limits.maxSuccessors}`,
+        { lineageId, used: spent.successors, requested: 1, max: limits.maxSuccessors },
+      );
+    }
+    if (spent.recoveryUnits + charge.units > limits.maxRecoveryUnits) {
+      throw new LineageRegistryRefusalError(
+        'LINEAGE_RECOVERY_BUDGET_EXHAUSTED',
+        `lineage ${lineageId} would spend ${spent.recoveryUnits + charge.units} recovery units; cap is ${limits.maxRecoveryUnits}`,
+        { lineageId, used: spent.recoveryUnits, requested: charge.units, max: limits.maxRecoveryUnits, charge },
+      );
+    }
+    return { predecessor, lineageId, ledger, spent, nextNoProgress };
+  }
+
+  function inspectSuccessor(input) {
+    const reg = read();
+    upgradeV1Registry(reg, input.legacyLineageBudget || {
+      maxSuccessors: DEFAULT_MAX_SUCCESSORS,
+      maxRecoveryUnits: 58,
+      maxNoProgressRepeats: DEFAULT_MAX_NO_PROGRESS_REPEATS,
+    });
+    return evaluateSuccessorAuthority(reg, input);
+  }
+
   function createSuccessor({
     predecessorRunId,
     successorRunId,
     verdict,
     lineage,
     terminalStop,
+    terminalCause,
     terminalFingerprint,
     repairSpec,
     charge,
@@ -532,61 +822,21 @@ function createAdmissionRegistry({ statePath }) {
         maxRecoveryUnits: 58,
         maxNoProgressRepeats: DEFAULT_MAX_NO_PROGRESS_REPEATS,
       });
-      const predecessor = reg.runs[String(predecessorRunId)];
-      if (!predecessor) {
-        throw new LineageRegistryRefusalError('RUN_NOT_ADMITTED', `predecessor ${predecessorRunId} is not registered`);
-      }
-      if (predecessor.successorRunId) {
+      const authority = evaluateSuccessorAuthority(reg, {
+        predecessorRunId,
+        lineage,
+        terminalStop,
+        terminalCause,
+        terminalFingerprint,
+        charge,
+      });
+      if (authority.replay) {
         return {
           noWrite: true,
-          value: {
-            run: reg.runs[predecessor.successorRunId],
-            runId: predecessor.successorRunId,
-            replayed: true,
-            lineage: reg.lineages[predecessor.lineage.lineageId] || null,
-          },
+          value: authority.replay,
         };
       }
-
-      const lineageId = predecessor.lineage && predecessor.lineage.lineageId;
-      if (!lineageId || lineage.lineageId !== lineageId) {
-        throw new LineageRegistryRefusalError('LINEAGE_IDENTITY_MISMATCH', 'successor lineage does not match its registered predecessor');
-      }
-      let ledger = reg.lineages[lineageId];
-      if (!ledger) {
-        throw new LineageRegistryRefusalError(
-          'LINEAGE_AUTHORITY_MISSING',
-          `schema-2 lineage ${lineageId} is missing from the authoritative ledger`,
-          { lineageId },
-        );
-      }
-
-      const spent = ledger.spent || { successors: 0, recoveryUnits: 0, noProgressRepeats: 0 };
-      const limits = ledger.limits || {};
-      const previousEvent = [...(ledger.events || [])].reverse().find((event) => event.type === 'SUCCESSOR_CREATED');
-      const repeated = previousEvent && previousEvent.causeFingerprint === terminalFingerprint ? 1 : 0;
-      const nextNoProgress = Number(spent.noProgressRepeats || 0) + repeated;
-      if (nextNoProgress > limits.maxNoProgressRepeats) {
-        throw new LineageRegistryRefusalError(
-          'LINEAGE_NO_PROGRESS_BUDGET_EXHAUSTED',
-          `lineage ${lineageId} repeated cause ${terminalFingerprint} ${nextNoProgress} times; cap is ${limits.maxNoProgressRepeats}`,
-          { lineageId, terminalFingerprint, used: spent.noProgressRepeats || 0, requested: nextNoProgress, max: limits.maxNoProgressRepeats },
-        );
-      }
-      if (Number(spent.successors || 0) + 1 > limits.maxSuccessors) {
-        throw new LineageRegistryRefusalError(
-          'LINEAGE_SUCCESSOR_BUDGET_EXHAUSTED',
-          `lineage ${lineageId} already created ${spent.successors || 0} successor(s); cap is ${limits.maxSuccessors}`,
-          { lineageId, used: spent.successors || 0, requested: 1, max: limits.maxSuccessors },
-        );
-      }
-      if (Number(spent.recoveryUnits || 0) + charge.units > limits.maxRecoveryUnits) {
-        throw new LineageRegistryRefusalError(
-          'LINEAGE_RECOVERY_BUDGET_EXHAUSTED',
-          `lineage ${lineageId} would spend ${Number(spent.recoveryUnits || 0) + charge.units} recovery units; cap is ${limits.maxRecoveryUnits}`,
-          { lineageId, used: spent.recoveryUnits || 0, requested: charge.units, max: limits.maxRecoveryUnits, charge },
-        );
-      }
+      const { predecessor, ledger, spent, nextNoProgress } = authority;
       if (reg.runs[successorRunId]) {
         throw new LineageRegistryRefusalError('RUN_ALREADY_REGISTERED', `successor id ${successorRunId} already exists`);
       }
@@ -601,11 +851,16 @@ function createAdmissionRegistry({ statePath }) {
         lineage,
         claims: [],
         repairSpec,
+        requestIdentity: {
+          kind: 'SUCCESSOR',
+          rootRunId: lineage.lineageId,
+          rootRequestDigest: lineage.admissionRequestDigest,
+        },
       };
       ledger.runs = [...(ledger.runs || []), successorRunId];
       ledger.spent = {
-        successors: Number(spent.successors || 0) + 1,
-        recoveryUnits: Number(spent.recoveryUnits || 0) + charge.units,
+        successors: spent.successors + 1,
+        recoveryUnits: spent.recoveryUnits + charge.units,
         noProgressRepeats: nextNoProgress,
       };
       ledger.events = [...(ledger.events || []), {
@@ -615,6 +870,7 @@ function createAdmissionRegistry({ statePath }) {
         successorRunId,
         successorOrdinal: lineage.successorOrdinal,
         causeFingerprint: terminalFingerprint,
+        cause: terminalCause,
         reasonCode: terminalStop.reasonCode,
         charge,
       }];
@@ -644,6 +900,7 @@ function createAdmissionRegistry({ statePath }) {
     mutate,
     admit,
     createSuccessor,
+    inspectSuccessor,
     isRegistered,
     getRun,
     hasNonce,
@@ -662,4 +919,6 @@ module.exports = {
   NonceReplayError,
   SCHEMA_VERSION,
   ADMISSION_DIR,
+  canonicalJson,
+  requestAuthorityDigest,
 };

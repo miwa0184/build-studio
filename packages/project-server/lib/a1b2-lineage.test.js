@@ -319,6 +319,96 @@ test('L7c — an unknown future registry schema fails closed with typed evidence
     && error.detail.actual === 3);
 });
 
+test('P1-A — deleting a consumed nonce from schema 2 cannot reconstruct or replay its request authority', (t) => {
+  const fx = fixture(t);
+  const admission = createAdmission(fx.config);
+  const runRequest = request(fx);
+  const root = admission.admit(runRequest, { runIdPrefix: 'nonce-root' });
+  const registry = admission.registry.read();
+  delete registry.nonces[runRequest.nonce];
+  fs.writeFileSync(admission.registry.file, JSON.stringify(registry, null, 2));
+
+  assert.throws(() => admission.registry.read(), (error) => error.code === 'ADMISSION_REGISTRY_UNREADABLE'
+    && error.detail && /requestIdentity|nonces/.test(error.detail.path));
+  assert.throws(() => admission.admit(runRequest, { runIdPrefix: 'replay' }),
+    (error) => error.code === 'ADMISSION_VALIDATOR_FAILURE');
+  assert.equal(fs.readdirSync(path.join(fx.statePath, 'run-guard')).length, 1,
+    `the replay must not materialise a second guard beside ${root.runId}`);
+});
+
+for (const { name, mutate, expectedPath } of [
+  {
+    name: 'missing nonce digest',
+    mutate: (doc, runId, nonce) => { delete doc.nonces[nonce].requestDigest; },
+    expectedPath: /nonces\..+\.requestDigest$/,
+  },
+  {
+    name: 'mistyped nonce digest',
+    mutate: (doc, runId, nonce) => { doc.nonces[nonce].requestDigest = 7; },
+    expectedPath: /nonces\..+\.requestDigest$/,
+  },
+  {
+    name: 'missing root request identity',
+    mutate: (doc, runId) => { delete doc.runs[runId].requestIdentity; },
+    expectedPath: /runs\..+\.requestIdentity$/,
+  },
+  {
+    name: 'inconsistent root request digest',
+    mutate: (doc, runId) => { doc.runs[runId].requestIdentity.requestDigest = 'f'.repeat(64); },
+    expectedPath: /runs\..+\.requestIdentity\.requestDigest$/,
+  },
+]) {
+  test(`P1-A — schema-2 ${name} is corrupt authority`, (t) => {
+    const fx = fixture(t);
+    const admission = createAdmission(fx.config);
+    const runRequest = request(fx);
+    const { runId } = admission.admit(runRequest, { runIdPrefix: 'nonce-shape' });
+    const registry = admission.registry.read();
+    mutate(registry, runId, runRequest.nonce);
+    fs.writeFileSync(admission.registry.file, JSON.stringify(registry, null, 2));
+    assert.throws(() => admission.registry.read(), (error) => error.code === 'ADMISSION_REGISTRY_UNREADABLE'
+      && error.detail && expectedPath.test(error.detail.path));
+  });
+}
+
+test('P1-A — canonical request-derived verdict and guard identity cannot drift independently', (t) => {
+  const fx = fixture(t);
+  const { admission, runId } = rootRun(fx);
+  stopRun(admission, runId);
+  const registry = admission.registry.read();
+  registry.runs[runId].verdict.head = 'f'.repeat(40);
+  fs.writeFileSync(admission.registry.file, JSON.stringify(registry, null, 2));
+  assert.throws(() => admission.registry.read(), (error) => error.code === 'ADMISSION_REGISTRY_UNREADABLE'
+    && error.detail && error.detail.path === `runs.${runId}.requestIdentity`);
+
+  // Restore registry authority, then prove the independent run-guard mirror is
+  // compared field-for-field rather than accepted on lineage id alone.
+  registry.runs[runId].verdict.head = registry.runs[runId].requestIdentity.request.head;
+  fs.writeFileSync(admission.registry.file, JSON.stringify(registry, null, 2));
+  const guardFile = admission.runGuard.fileFor(runId);
+  const guard = JSON.parse(fs.readFileSync(guardFile, 'utf8'));
+  guard.identity.admissionRequestDigest = 'f'.repeat(64);
+  fs.writeFileSync(guardFile, JSON.stringify(guard, null, 2));
+  assert.throws(() => admission.createSuccessor(runId),
+    (error) => error.code === 'LINEAGE_IDENTITY_MISMATCH');
+});
+
+test('P1-A — a consumed nonce cannot be attached to a successor identity', (t) => {
+  const fx = fixture(t);
+  const { admission, runId } = rootRun(fx);
+  stopRun(admission, runId);
+  const successor = admission.createSuccessor(runId);
+  const registry = admission.registry.read();
+  registry.nonces['forged-successor-nonce'] = {
+    consumedAt: new Date().toISOString(),
+    runId: successor.runId,
+    requestDigest: registry.runs[runId].requestIdentity.requestDigest,
+  };
+  fs.writeFileSync(admission.registry.file, JSON.stringify(registry, null, 2));
+  assert.throws(() => admission.registry.read(), (error) => error.code === 'ADMISSION_REGISTRY_UNREADABLE'
+    && error.detail && /nonces\.forged-successor-nonce\.runId$/.test(error.detail.path));
+});
+
 test('L7d — the explicit v1→v2 upgrade captures every legacy root with complete immutable authority', (t) => {
   const fx = fixture(t, {
     max_successor_runs: 1,
@@ -345,7 +435,64 @@ test('L7d — the explicit v1→v2 upgrade captures every legacy root with compl
       maxNoProgressRepeats: 0,
     });
     assert.deepEqual(upgraded.lineages[rootId].runs.slice(0, 1), [rootId]);
+    assert.equal(upgraded.runs[rootId].requestIdentity.kind, 'LEGACY_V1_CAPTURE');
+    assert.match(upgraded.runs[rootId].requestIdentity.requestDigest, /^[0-9a-f]{64}$/);
   }
+  const consumedNonce = Object.entries(upgraded.nonces)
+    .find(([, entry]) => entry.runId === runId)[0];
+  const replay = request(fx);
+  replay.nonce = consumedNonce;
+  assert.throws(() => admission.admit(replay), (error) => error.code === 'ADMISSION_NONCE_REPLAYED',
+    'legacy capture must preserve consumed authority rather than mint a fresh nonce');
+});
+
+test('P1-B — lineage event fingerprint replacement is rejected against its canonical cause', (t) => {
+  const fx = fixture(t);
+  const { admission, runId } = rootRun(fx);
+  stopRun(admission, runId);
+  admission.createSuccessor(runId);
+  const registry = admission.registry.read();
+  const event = registry.lineages[runId].events[1];
+  event.causeFingerprint = event.causeFingerprint === 'f'.repeat(64) ? 'e'.repeat(64) : 'f'.repeat(64);
+  fs.writeFileSync(admission.registry.file, JSON.stringify(registry, null, 2));
+  assert.throws(() => admission.registry.read(), (error) => error.code === 'ADMISSION_REGISTRY_UNREADABLE'
+    && error.detail && /events\.1\.causeFingerprint$/.test(error.detail.path));
+});
+
+test('P1-B — replay revalidates the live guard cause against committed predecessor authority', (t) => {
+  const fx = fixture(t);
+  const { admission, runId } = rootRun(fx);
+  stopRun(admission, runId);
+  const successor = admission.createSuccessor(runId);
+  const before = admission.registry.read();
+  const guardFile = admission.runGuard.fileFor(runId);
+  const guard = JSON.parse(fs.readFileSync(guardFile, 'utf8'));
+  guard.technicalStop = createTechnicalStop({
+    reasonCode: REASON_CODES.BLOCKED_TASKS,
+    runId,
+    step: 'task_execution',
+    tasks: [{ index: 0, name: 'different target', reason: 'different canonical failure' }],
+    evidence: ['exit=2', 'test=changed-after-successor'],
+  });
+  fs.writeFileSync(guardFile, JSON.stringify(guard, null, 2));
+
+  assert.throws(() => admission.createSuccessor(runId),
+    (error) => error.code === 'TECHNICAL_STOP_CAUSE_UNVERIFIABLE');
+  const after = admission.registry.read();
+  assert.equal(after.revision, before.revision, 'refused replay cannot mutate committed authority');
+  assert.equal(after.runs[runId].successorRunId, successor.runId);
+});
+
+test('P1-B — visible stop fields cannot diverge from their canonical cause receipt', (t) => {
+  const fx = fixture(t);
+  const { admission, runId } = rootRun(fx);
+  stopRun(admission, runId);
+  const guardFile = admission.runGuard.fileFor(runId);
+  const guard = JSON.parse(fs.readFileSync(guardFile, 'utf8'));
+  guard.technicalStop.evidence = ['mutated-visible-evidence'];
+  fs.writeFileSync(guardFile, JSON.stringify(guard, null, 2));
+  assert.throws(() => admission.createSuccessor(runId),
+    (error) => error.code === 'TECHNICAL_STOP_CAUSE_UNVERIFIABLE');
 });
 
 for (const { name, corrupt: corruptAuthority, expectedPath } of [
@@ -419,7 +566,7 @@ test('L9 — a reproducible repeated-cause fingerprint reaches an exact no-progr
 
   const repeated1 = stopRun(admission, first.runId, {
     reasonCode: REASON_CODES.SUCCESSOR_REPAIR_FAILED,
-    causeFingerprint: firstStop.fingerprint,
+    causeSource: firstStop.cause,
   });
   assert.equal(repeated1.fingerprint, firstStop.fingerprint);
   const second = admission.createSuccessor(first.runId);
@@ -427,12 +574,77 @@ test('L9 — a reproducible repeated-cause fingerprint reaches an exact no-progr
 
   stopRun(admission, second.runId, {
     reasonCode: REASON_CODES.SUCCESSOR_REPAIR_FAILED,
-    causeFingerprint: firstStop.fingerprint,
+    causeSource: firstStop.cause,
   });
   const before = admission.registry.read().revision;
   assert.throws(() => admission.createSuccessor(second.runId), (e) => e.code === 'LINEAGE_NO_PROGRESS_BUDGET_EXHAUSTED');
   assert.equal(admission.registry.read().revision, before, 'the over-cap replay is side-effect free');
   assert.equal(lineage(admission, runId).spent.successors, 2, 'the exact cap, not an off-by-one third successor');
+});
+
+test('P1-B — canonical predecessor cause is recomputed across ordering and restart', (t) => {
+  const fx = fixture(t, {
+    max_successor_runs: 4,
+    max_lineage_recovery_units: 99,
+    max_lineage_no_progress_repeats: 1,
+  });
+  const { admission, runId } = rootRun(fx);
+  const firstStop = stopRun(admission, runId);
+  const first = admission.createSuccessor(runId);
+  const reorderedCause = {
+    evidence: [...firstStop.cause.evidence],
+    tasks: firstStop.cause.tasks.map((task) => ({ reason: task.reason, name: task.name, index: task.index })),
+    step: firstStop.cause.step,
+    reasonCode: firstStop.cause.reasonCode,
+  };
+  const repeated = createTechnicalStop({
+    reasonCode: REASON_CODES.SUCCESSOR_REPAIR_FAILED,
+    runId: first.runId,
+    step: 'successor_repair',
+    evidence: ['repair report says the cause remains'],
+    causeSource: reorderedCause,
+  });
+  assert.equal(repeated.fingerprint, firstStop.fingerprint,
+    'recursive field ordering cannot change canonical cause identity');
+  admission.runGuard.mutate(first.runId, (doc) => { doc.technicalStop = repeated; });
+
+  const restarted = createAdmission(fx.config);
+  restarted.createSuccessor(first.runId);
+  assert.equal(lineage(restarted, runId).spent.noProgressRepeats, 1);
+});
+
+test('P1-B — replaced fingerprint and missing inherited cause source both fail closed', (t) => {
+  const fx = fixture(t, { max_successor_runs: 4, max_lineage_recovery_units: 99 });
+  const { admission, runId } = rootRun(fx);
+  const firstStop = stopRun(admission, runId);
+  const first = admission.createSuccessor(runId);
+
+  const forged = createTechnicalStop({
+    reasonCode: REASON_CODES.SUCCESSOR_REPAIR_FAILED,
+    runId: first.runId,
+    step: 'successor_repair',
+    evidence: ['repair report says the cause remains'],
+    causeSource: firstStop.cause,
+  });
+  forged.fingerprint = forged.fingerprint === 'f'.repeat(64) ? 'e'.repeat(64) : 'f'.repeat(64);
+  admission.runGuard.mutate(first.runId, (doc) => { doc.technicalStop = forged; });
+  assert.throws(() => admission.createSuccessor(first.runId),
+    (error) => error.code === 'TECHNICAL_STOP_CAUSE_UNVERIFIABLE');
+
+  const restored = createTechnicalStop({
+    reasonCode: REASON_CODES.SUCCESSOR_REPAIR_FAILED,
+    runId: first.runId,
+    step: 'successor_repair',
+    evidence: ['repair report says the cause remains'],
+    causeSource: firstStop.cause,
+  });
+  delete restored.cause;
+  const guardFile = admission.runGuard.fileFor(first.runId);
+  const guardDoc = JSON.parse(fs.readFileSync(guardFile, 'utf8'));
+  guardDoc.technicalStop = restored;
+  fs.writeFileSync(guardFile, JSON.stringify(guardDoc, null, 2));
+  assert.throws(() => admission.createSuccessor(first.runId),
+    (error) => error.code === 'TECHNICAL_STOP_CAUSE_UNVERIFIABLE');
 });
 
 test('L10 — lineage and spend are outside workflow snapshots and cannot be restored backwards', (t) => {

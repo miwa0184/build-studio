@@ -48,13 +48,13 @@ record and red-first receipt:
   excludes product requirements, acceptance policy and founder decisions.
 - **Durable repair-launch receipts.** Before tmux or a repair CLI can start, the
   server persists one deterministic launch attempt under a cross-process lock.
-  The wrapper records monotonic `intent` → `started` → `completed` receipts.
-  Persisting `started` is a hard shell precondition: if the receipt path is
-  missing, unreadable or unwritable, the wrapper exits before invoking the CLI
-  and reconciliation parks the attempt with typed evidence.
-  Restart adopts the exact live tmux window for a started attempt; an absent or
-  ambiguous process is parked as a typed technical launch failure rather than
-  being started twice.
+  The wrapper records a monotonic `intent` → `dispatching` → `started` →
+  `completed` outbox, with a terminal alternative. Persisting `dispatching`
+  retires the right to send again before tmux is touched; persisting `started`
+  remains a hard shell precondition before the CLI. Missing, unreadable or
+  unwritable receipts park the attempt with typed evidence. Restart may adopt
+  the exact live tmux window, but any post-dispatch state that cannot prove safe
+  adoption becomes `LAUNCH_AMBIGUOUS` and is never relaunched.
 - **Deterministic candidate-progress evidence.** The server records the exact
   Git head and full branch ref before repair and accepts continuation only on
   that same ref, at a different forward descendant whose committed tree differs
@@ -92,6 +92,17 @@ record and red-first receipt:
   must agree at every read and before every write. Missing authority and unknown
   future schemas fail closed; schema 2 never defaults a missing limit or spend
   field.
+- **Root request authority and technical causes are now canonical data, not
+  reconstructable hints.** A consumed nonce, its canonical RunRequest digest,
+  the root run, verdict and lineage must agree bidirectionally. Successor cause
+  fingerprints are recomputed from the stored predecessor cause; a missing
+  cause source or changed cached digest refuses instead of charging a lineage.
+- **Repair launch is bound to exact Git authority through the executed
+  wrapper.** The durable attempt captures absolute checkout path, attached ref,
+  head and tree. The server checks them immediately before `send-keys`, and the
+  wrapper checks the same identity plus a clean worktree before writing
+  `started` or invoking the CLI. Detached HEAD, branch drift, head/tree drift
+  and dirty state are typed refusals with no repair CLI side effect.
 
 ### Upgrade steps
 
@@ -103,7 +114,9 @@ app and any running project-servers.
 **In each managed project** — nothing to edit. New root admissions capture the
 lineage ledger immediately. On the first successful registry mutation after
 upgrade, the explicit schema-1→schema-2 path captures every legacy A1b.1 root
-with the then-current validated limits; partial schema-2 ledgers are refused
+with the then-current validated limits and an explicit legacy request-authority
+record derived from its one consumed nonce and stored request digest; incomplete
+or ambiguous legacy authority refuses. Partial schema-2 ledgers are refused
 rather than repaired by defaults. The existing append-only
 `.build-studio/admission/` and `.build-studio/run-guard/` paths remain
 authoritative; do not delete them. The new operational

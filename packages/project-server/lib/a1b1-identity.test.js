@@ -16,7 +16,11 @@ const os = require('os');
 const path = require('path');
 
 const { createRunGuard } = require('./run-guard');
-const { createAdmissionRegistry, AdmissionRegistryConflictError } = require('./admission-registry');
+const {
+  createAdmissionRegistry,
+  AdmissionRegistryConflictError,
+  requestAuthorityDigest,
+} = require('./admission-registry');
 const { createAdmission } = require('./admission');
 const { attachStateAuthority } = require('./state');
 
@@ -28,14 +32,48 @@ function tmpState(t) {
 
 let n = 0;
 const nonce = () => `id-test-nonce-${process.pid}-${++n}-abcdef`;
-const rootIdentity = (runId) => ({ runId, lineageId: runId, predecessorRunId: null, successorOrdinal: 0 });
+const rootIdentity = (runId, digest, request = {}) => ({
+  runId,
+  lineageId: runId,
+  predecessorRunId: null,
+  successorOrdinal: 0,
+  admissionRequestDigest: digest,
+  admittedRepo: request.repo,
+  admittedHead: request.head,
+});
+function registryAdmission(runId, usedNonce = nonce()) {
+  const request = {
+    version: 1,
+    repo: 'test-owner/test-repo',
+    head: 'a'.repeat(40),
+    task_packet: 'README.md',
+    claims: [],
+    issued_at: '2026-01-01T00:00:00.000Z',
+    expires_at: '2026-01-01T00:05:00.000Z',
+    nonce: usedNonce,
+  };
+  const requestDigest = requestAuthorityDigest(request);
+  return {
+    nonce: usedNonce,
+    runId,
+    request,
+    requestDigest,
+    verdict: {
+      kind: 'GateVerdict', version: 1, decision: 'ADMITTED', runId,
+      repo: request.repo, head: request.head, taskPacket: request.task_packet,
+      nonce: usedNonce, requestDigest,
+    },
+    lineage: rootIdentity(runId, requestDigest, request),
+  };
+}
 
 /** Register a run the way the admission service does: registry entry + guard. */
 function registerRun(statePath, runId) {
   const registry = createAdmissionRegistry({ statePath });
   const guard = createRunGuard({ statePath, isRegistered: registry.isRegistered });
-  registry.admit({ nonce: nonce(), runId, verdict: { kind: 'GateVerdict', decision: 'ADMITTED', runId }, lineage: rootIdentity(runId) });
-  guard.register(runId, { identity: rootIdentity(runId) });
+  const admitted = registryAdmission(runId);
+  registry.admit(admitted);
+  guard.register(runId, { identity: admitted.lineage });
   return { registry, guard };
 }
 
@@ -121,14 +159,14 @@ test('I4 — nonce, registration and identity survive a new process (new instanc
   const statePath = tmpState(t);
   const first = createAdmissionRegistry({ statePath });
   const usedNonce = nonce();
-  first.admit({ nonce: usedNonce, runId: 'run-r', verdict: { kind: 'GateVerdict', runId: 'run-r' }, lineage: rootIdentity('run-r') });
+  first.admit(registryAdmission('run-r', usedNonce));
 
   // A fresh instance over the same statePath — the restart.
   const second = createAdmissionRegistry({ statePath });
   assert.equal(second.hasNonce(usedNonce), true, 'a consumed nonce must survive restart');
   assert.equal(second.isRegistered('run-r'), true, 'a registration must survive restart');
   assert.equal(second.getRun('run-r').lineage.lineageId, 'run-r');
-  assert.throws(() => second.admit({ nonce: usedNonce, runId: 'run-r2', verdict: {}, lineage: {} }),
+  assert.throws(() => second.admit(registryAdmission('run-r2', usedNonce)),
     (e) => e.code === 'ADMISSION_NONCE_REPLAYED');
 });
 
@@ -140,7 +178,7 @@ test('I5 — a stale snapshot cannot overwrite a consumed nonce or a registratio
   const stale = registry.read(); // revision 0, empty
 
   const spent = nonce();
-  registry.admit({ nonce: spent, runId: 'run-s', verdict: { kind: 'GateVerdict', runId: 'run-s' }, lineage: rootIdentity('run-s') });
+  registry.admit(registryAdmission('run-s', spent));
 
   assert.throws(() => registry.save(stale), AdmissionRegistryConflictError,
     'a writer holding an older revision must be refused');

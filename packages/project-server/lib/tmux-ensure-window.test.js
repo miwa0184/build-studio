@@ -29,11 +29,38 @@ const { execFileSync } = require('child_process');
 function admittedContext(t) {
   const statePath = fs.mkdtempSync(path.join(os.tmpdir(), 'bs-adm-ctx-'));
   t.after(() => { try { fs.rmSync(statePath, { recursive: true, force: true }); } catch (_) {} });
-  const { createAdmission } = require('./admission');
+const { createAdmission } = require('./admission');
+const { requestAuthorityDigest } = require('./admission-registry');
   const admission = createAdmission({ projectRoot: statePath, statePath });
   const runId = `test-run-${Date.now().toString(36)}`;
-  const identity = { runId, lineageId: runId, predecessorRunId: null, successorOrdinal: 0 };
-  admission.registry.admit({ nonce: `n-${runId}-0123456789abcdef`, runId, verdict: { kind: 'GateVerdict', runId }, lineage: identity });
+  const nonce = `n-${runId}-0123456789abcdef`;
+  const request = {
+    version: 1,
+    repo: 'test-owner/test-repo',
+    head: 'a'.repeat(40),
+    task_packet: 'README.md',
+    claims: [],
+    issued_at: '2026-01-01T00:00:00.000Z',
+    expires_at: '2026-01-01T00:05:00.000Z',
+    nonce,
+  };
+  const requestDigest = requestAuthorityDigest(request);
+  const identity = {
+    runId, lineageId: runId, predecessorRunId: null, successorOrdinal: 0,
+    admissionRequestDigest: requestDigest, admittedRepo: request.repo, admittedHead: request.head,
+  };
+  admission.registry.admit({
+    nonce,
+    runId,
+    request,
+    requestDigest,
+    verdict: {
+      kind: 'GateVerdict', version: 1, decision: 'ADMITTED', runId,
+      repo: request.repo, head: request.head, taskPacket: request.task_packet,
+      nonce, requestDigest,
+    },
+    lineage: identity,
+  });
   admission.runGuard.register(runId, { identity });
   return admission.contextFor(runId);
 }

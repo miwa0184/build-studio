@@ -63,6 +63,23 @@ resource.
 
 ## Authority and transaction model
 
+### Authority/state closure table
+
+| State or transition | Server-owned authority | Fail-closed proof | May create external CLI side effect? | Terminal/ambiguous states |
+| --- | --- | --- | --- | --- |
+| Registry schema | The complete on-disk registry document at one supported `schemaVersion` | Deep schema validation precedes every read or mutation; unknown future schemas and partial schema-2 documents refuse | No | Corrupt or unknown schema is terminal until repaired out of band |
+| Nonce and request identity | Canonical RunRequest plus its server-computed digest, cross-linked from the root run and consumed nonce entry | Digest is recomputed; nonce, run, verdict, lineage and request identity must agree bidirectionally | No | Missing, mistyped or inconsistent schema-2 authority refuses; only explicit v1 capture may add the new binding |
+| Canonical cause identity | Canonical predecessor technical cause (`reasonCode`, step, tasks and evidence), never a supplied fingerprint | Server recomputes the digest with stable recursive key ordering; stored digest is only a checked receipt | No | Missing source or digest mismatch is terminal authority corruption |
+| Lineage charge | One locked registry mutation over predecessor claim, ordered runs/events, immutable limits and cumulative spend | Charge and cause are revalidated inside the registry lock before the one commit point | No | Budget exhaustion and corrupt lineage authority are terminal refusals |
+| Launch attempt/outbox | Per-run launch receipt under the launch lock: intent -> dispatching -> started -> completed, or terminal | Immutable attempt and Git identity; every transition is monotonic and durable before the next boundary | Only `dispatching` may attempt one `send-keys`; only durable `started` may invoke the CLI | A dispatched attempt without provable safe adoption becomes `LAUNCH_AMBIGUOUS`; it is never relaunched |
+| Git branch/ref/head/tree | Durable baseline captured before successor commit and copied into the immutable launch attempt | Attached concrete ref, exact head/tree and clean status are checked under launch exclusion immediately before send; the executed wrapper repeats the same check before `started` and CLI | Yes, only after both the durable dispatch claim and final server check | Detached, wrong ref, dirty tree or head/tree drift is a typed terminal launch refusal |
+| External side-effect transition | The launch receipt plus verified admission context and exact Git identity | At-most-once dispatch is chosen over false liveness across filesystem/tmux/process boundaries | Exactly one attempted dispatch; no automatic retry after dispatch begins | Unprovable post-dispatch state is terminal ambiguity, not evidence that the process never started |
+
+Exactly-once execution cannot be proven across the filesystem/tmux/process
+boundary. The implementable contract is therefore at-most-once dispatch plus a
+terminal ambiguity outcome. Liveness is intentionally surrendered whenever a
+crash leaves insufficient proof that the assignment was not sent.
+
 Every root admission creates a lineage entry in the registry. The entry pins:
 
 - immutable `lineageId` and `rootRunId`,
@@ -226,6 +243,29 @@ counter/terminal-stop race. Transient registry contention is a bounded,
 retryable 503 and is never presented as an exhausted lineage. The final
 exact-head server CI receipt is recorded on the PR.
 
+### Authority-closure red-first receipt
+
+The P1-A–D authority mutations were copied into a separate disposable worktree
+at exact start head `ef0c887a5758abba27e7ee02abb231d52e426779`. Production
+files were unchanged there. Every new assertion failed before this closure:
+
+- P1-A: 0/5 passed. Deleting the consumed nonce reconstructed usable authority;
+  missing or mistyped nonce digests and missing or inconsistent root request
+  identities were accepted.
+- P1-B: 0/2 passed. No canonical predecessor cause source existed, and replacing
+  a structurally valid cached cause fingerprint did not invalidate authority.
+- P1-C: 0/1 passed against a real server. After `send-keys`, deleting the launch
+  receipt, killing the exact tmux window and restarting caused a second launch
+  instead of terminal `LAUNCH_AMBIGUOUS`.
+- P1-D: 0/1 passed against a real server. Switching branch after window creation
+  but before `send-keys` still launched the repair CLI.
+
+The same permanent tests now exercise fail-closed nonce/request binding,
+canonical cause recomputation, durable pre-send dispatch retirement, and both
+server-side and executed-wrapper Git self-checks. Their green counts belong to
+the final local verification receipt below; protected CI and independent review
+must bind the result to one frozen remote head.
+
 ## Independent review and bounded repair receipt
 
 The single context-free review of frozen head
@@ -256,18 +296,31 @@ new context-free review; inherited green status is not a merge verdict.
 
 ## Final local verification receipt
 
-- Focused A1b.2 contract after the successor repair: 21 lineage tests plus 21
-  actual-server canaries, 42/42 passed. They include partial-schema authority
-  across identity/limits/spend/run/event invariants, missing/unreadable/
-  unwritable started receipts with crash/restart, live-server receipt
-  confirmation, allow-empty and branch-drift refusal at launch/send/approval,
-  every dirty-worktree shape, positive clean same-ref tree progress and the
-  local CLI retry. The two cross-process run-guard stress tests also passed.
-  A disposable delayed-duplicate mutation made the strengthened C8 fail at
-  `observed 2`, proving its post-reconciliation stability window is active.
+- Focused authority closure after the final code change: lineage plus A1b.1
+  identity 41/41 passed, and the real-server/wrapper canary 28/28 passed. The
+  matrix includes the original P1-A–D mutations plus canonical request-derived
+  verdict/guard drift, a nonce forged onto a successor, live-guard cause drift
+  hidden behind replay, visible-stop/canonical-cause divergence, monotonic
+  terminal/completed receipt replay, exact clean wrapper success, detached/wrong
+  branch and same-branch head/tree refusal, lost receipt plus lost tmux window,
+  and the ensure-window/send boundary. The external CLI count stays zero in
+  every refusal case.
+- The earlier repair canaries remain in the same real-server suite: partial
+  schema authority across identity/limits/spend/run/event invariants,
+  missing/unreadable/unwritable started receipts with crash/restart, live-server
+  confirmation, allow-empty and branch-drift refusal, every dirty-worktree
+  shape, positive clean same-ref tree progress and local CLI retry. The two
+  cross-process run-guard stress tests also pass. A disposable delayed-duplicate
+  mutation still makes strengthened C8 fail at `observed 2`, proving its
+  post-reconciliation stability window is active.
+- The final focused historical A1b.1/A1b.2 matrix passed 149/149 with zero
+  skips, cancellations or todos against the same frozen local code.
 - Full project-server suite (`node --test` from `packages/project-server`):
-  three fresh runs after the final successor-repair code changes, each
-  1033/1033 passed with zero skips, cancellations or todos.
+  three fresh successful processes after the final authority-closure code
+  changes, each 1052/1052 passed with zero skips, cancellations or todos. One
+  non-counted intervening attempt hit the operating system's transient `EMFILE`
+  limit in `watch-paths.test.js` (1051/1052); the unchanged watcher suite then
+  passed 6/6 in isolation and the replacement full process passed 1052/1052.
 - One pre-final repair run reached 1011/1014: three direct-router fixtures had
   `projectRoot` but omitted the normalised `statePath` that the real server
   always supplies. The launch store now uses the same

@@ -66,6 +66,7 @@ const {
   NonceReplayError,
   AdmissionRegistryBusyError,
   LineageRegistryRefusalError,
+  requestAuthorityDigest,
 } = require('./admission-registry');
 const { createRunGuard } = require('./run-guard');
 const {
@@ -110,21 +111,6 @@ function isAdmissionContext(ctx) {
 
 function refuse(code, message, detail) {
   throw new AdmissionRefusedError(code, message, detail);
-}
-
-/** Deterministic JSON: object keys sorted at every depth. */
-function canonicalJson(value) {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  if (value && typeof value === 'object') {
-    const keys = Object.keys(value).sort();
-    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(',')}}`;
-  }
-  return JSON.stringify(value);
-}
-
-/** Canonical digest: sha256 over the request with sorted keys, hex. */
-function requestDigest(request) {
-  return crypto.createHash('sha256').update(canonicalJson(request)).digest('hex');
 }
 
 function isSafeRelativePath(p) {
@@ -314,8 +300,13 @@ function createAdmission(config) {
     if (!existsAtHead(head, raw.task_packet)) {
       refuse('ADMISSION_TASK_PACKET_MISSING', `task packet ${raw.task_packet} does not exist at head ${head.slice(0, 12)} — commit it first; the working tree does not count`);
     }
-    if (registry.hasNonce(raw.nonce)) {
-      refuse('ADMISSION_NONCE_REPLAYED', 'this nonce has already been consumed — a runRequest is single-use');
+    try {
+      if (registry.hasNonce(raw.nonce)) {
+        refuse('ADMISSION_NONCE_REPLAYED', 'this nonce has already been consumed — a runRequest is single-use');
+      }
+    } catch (error) {
+      if (error instanceof AdmissionRefusedError) throw error;
+      refuse('ADMISSION_VALIDATOR_FAILURE', `admission registry unreadable: ${error.message}`);
     }
 
     const request = {
@@ -328,7 +319,7 @@ function createAdmission(config) {
       expires_at: raw.expires_at,
       nonce: raw.nonce,
     };
-    return { request, digest: requestDigest(request), claims };
+    return { request, digest: requestAuthorityDigest(request), claims };
   }
 
   /**
@@ -384,6 +375,8 @@ function createAdmission(config) {
         lineage,
         claims,
         lineageBudget: resolveLineageBudgets(config),
+        request,
+        requestDigest: digest,
       });
     } catch (e) {
       if (e instanceof NonceReplayError) {
@@ -405,7 +398,7 @@ function createAdmission(config) {
    * fails closed, so a crash can leave an inert pending run but never a
    * runnable orphan. Replaying the predecessor resumes that materialisation.
    */
-  function createSuccessor(predecessorRunId, { now = new Date() } = {}) {
+  function loadSuccessorAuthority(predecessorRunId) {
     let predecessor;
     try {
       predecessor = registry.getRun(predecessorRunId);
@@ -424,19 +417,63 @@ function createAdmission(config) {
     const identity = predecessor.lineage;
     const guardIdentity = predecessorGuard.identity;
     if (!identity || !guardIdentity
+      || String(identity.runId) !== String(guardIdentity.runId)
       || identity.lineageId !== guardIdentity.lineageId
+      || identity.predecessorRunId !== guardIdentity.predecessorRunId
+      || identity.admissionRequestDigest !== guardIdentity.admissionRequestDigest
+      || identity.admittedHead !== guardIdentity.admittedHead
+      || identity.admittedRepo !== guardIdentity.admittedRepo
       || Number(identity.successorOrdinal || 0) !== Number(guardIdentity.successorOrdinal || 0)) {
       refuse('LINEAGE_IDENTITY_MISMATCH', `registry and guard identity disagree for predecessor ${predecessorRunId}`);
     }
 
     const stop = predecessorGuard.technicalStop;
-    const eligibility = successorRecoveryEligibility(stop);
+    let eligibility;
+    try {
+      eligibility = successorRecoveryEligibility(stop);
+    } catch (error) {
+      if (error && error.code === 'TECHNICAL_STOP_CAUSE_UNVERIFIABLE') {
+        refuse(error.code, error.message, error.detail || {});
+      }
+      throw error;
+    }
     if (!eligibility.eligible) {
       refuse('SUCCESSOR_NOT_ELIGIBLE', `run ${predecessorRunId} cannot create a successor: ${eligibility.reason}`);
     }
     if (String(stop.runId) !== String(predecessorRunId)) {
       refuse('LINEAGE_IDENTITY_MISMATCH', `technical stop belongs to ${stop.runId}, not predecessor ${predecessorRunId}`);
     }
+    return { predecessor, predecessorGuard, identity, stop, eligibility };
+  }
+
+  /** Read-only budget/cause preflight. The locked commit re-runs every check. */
+  function inspectSuccessor(predecessorRunId) {
+    const authority = loadSuccessorAuthority(predecessorRunId);
+    try {
+      return registry.inspectSuccessor({
+        predecessorRunId: String(predecessorRunId),
+        terminalStop: authority.stop,
+        terminalCause: authority.eligibility.cause,
+        terminalFingerprint: authority.eligibility.fingerprint,
+        charge: recoveryCharge(authority.predecessorGuard),
+        legacyLineageBudget: resolveLineageBudgets(config),
+      });
+    } catch (e) {
+      if (e instanceof LineageRegistryRefusalError || e && /^(?:LINEAGE_|RUN_|TECHNICAL_STOP_)/.test(e.code || '')) {
+        refuse(e.code, e.message, e.detail || {});
+      }
+      refuse('ADMISSION_VALIDATOR_FAILURE', `successor registry preflight failed: ${e.message}`);
+    }
+  }
+
+  function createSuccessor(predecessorRunId, { now = new Date() } = {}) {
+    const {
+      predecessor,
+      predecessorGuard,
+      identity,
+      stop,
+      eligibility,
+    } = loadSuccessorAuthority(predecessorRunId);
 
     const timestamp = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
     const successorRunId = `repair-${timestamp}-${crypto.randomBytes(3).toString('hex')}`;
@@ -473,6 +510,7 @@ function createAdmission(config) {
       step: stop.step,
       tasks: Array.isArray(stop.tasks) ? stop.tasks : [],
       evidence: Array.isArray(stop.evidence) ? stop.evidence : [],
+      cause: eligibility.cause,
       fingerprint: eligibility.fingerprint,
       assignment: 'Repair only the recorded technical cause. Do not change product requirements, acceptance policy, or founder decisions.',
     };
@@ -485,6 +523,7 @@ function createAdmission(config) {
         verdict,
         lineage: successorIdentity,
         terminalStop: stop,
+        terminalCause: eligibility.cause,
         terminalFingerprint: eligibility.fingerprint,
         repairSpec,
         charge: recoveryCharge(predecessorGuard),
@@ -668,6 +707,7 @@ function createAdmission(config) {
     verifyRunRequest,
     admit,
     createSuccessor,
+    inspectSuccessor,
     contextFor,
     assertRunAdmitted,
     describeContext,

@@ -96,33 +96,117 @@ function stableJson(value) {
   return JSON.stringify(value);
 }
 
+class TechnicalStopCauseError extends Error {
+  constructor(message, detail = {}) {
+    super(message);
+    this.name = 'TechnicalStopCauseError';
+    this.code = 'TECHNICAL_STOP_CAUSE_UNVERIFIABLE';
+    this.detail = detail;
+  }
+}
+
+function normaliseTechnicalCause(source) {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) {
+    throw new TechnicalStopCauseError('technical stop has no reproducible canonical cause source');
+  }
+  if (typeof source.reasonCode !== 'string' || !source.reasonCode
+    || (source.step !== null && typeof source.step !== 'string')
+    || !Array.isArray(source.tasks) || !Array.isArray(source.evidence)) {
+    throw new TechnicalStopCauseError('technical stop canonical cause source has an invalid shape');
+  }
+  return JSON.parse(JSON.stringify({
+    reasonCode: source.reasonCode,
+    step: source.step === undefined ? null : source.step,
+    tasks: source.tasks,
+    evidence: source.evidence,
+  }));
+}
+
+function technicalCauseFingerprint(cause) {
+  return crypto.createHash('sha256').update(stableJson(normaliseTechnicalCause(cause))).digest('hex');
+}
+
+function technicalStopCause(stop) {
+  if (!stop || typeof stop !== 'object' || Array.isArray(stop)) {
+    throw new TechnicalStopCauseError('technical stop is not an object');
+  }
+  if (stop.cause !== undefined) {
+    const cause = normaliseTechnicalCause(stop.cause);
+    if (stop.reasonCode !== REASON_CODES.SUCCESSOR_REPAIR_FAILED) {
+      const localCause = normaliseTechnicalCause({
+        reasonCode: stop.reasonCode,
+        step: stop.step === undefined ? null : stop.step,
+        tasks: Array.isArray(stop.tasks) ? stop.tasks : [],
+        evidence: Array.isArray(stop.evidence) ? stop.evidence : [],
+      });
+      if (stableJson(cause) !== stableJson(localCause)) {
+        throw new TechnicalStopCauseError('technical stop canonical cause disagrees with its visible stop fields');
+      }
+    }
+    return cause;
+  }
+  // A successor failure means "the predecessor cause remains". Its local
+  // reason/evidence describes the failed attempt, not that predecessor cause,
+  // so it cannot be reconstructed when the inherited source is missing.
+  if (stop.reasonCode === REASON_CODES.SUCCESSOR_REPAIR_FAILED) {
+    throw new TechnicalStopCauseError('successor repair stop is missing its inherited canonical cause source');
+  }
+  return normaliseTechnicalCause({
+    reasonCode: stop.reasonCode,
+    step: stop.step === undefined ? null : stop.step,
+    tasks: Array.isArray(stop.tasks) ? stop.tasks : [],
+    evidence: Array.isArray(stop.evidence) ? stop.evidence : [],
+  });
+}
+
 /**
  * A reproducible signal for "the same recorded technical cause".
  *
  * This intentionally does not claim semantic code progress. It hashes only
  * the machine-stable cause: reason, step, tasks and evidence. Run ids and
  * timestamps are excluded so the same failure in a successor compares equal.
- * A successor repair failure may carry its predecessor's fingerprint directly
- * (`causeFingerprint`) because that outcome means exactly "this cause remains".
+ * A successor repair failure carries the predecessor's canonical cause source;
+ * its stored fingerprint is only a receipt checked against that source.
  */
 function technicalStopFingerprint(stop) {
-  if (stop && typeof stop.causeFingerprint === 'string' && /^[0-9a-f]{64}$/.test(stop.causeFingerprint)) {
-    return stop.causeFingerprint;
+  const computed = technicalCauseFingerprint(technicalStopCause(stop));
+  for (const [field, cached] of [['fingerprint', stop && stop.fingerprint], ['causeFingerprint', stop && stop.causeFingerprint]]) {
+    if (cached === undefined) continue;
+    if (typeof cached !== 'string' || !/^[0-9a-f]{64}$/.test(cached) || cached !== computed) {
+      throw new TechnicalStopCauseError(`technical stop ${field} does not match its canonical cause`, {
+        field, expected: computed, actual: cached,
+      });
+    }
   }
-  const canonical = {
-    reasonCode: stop && stop.reasonCode || null,
-    step: stop && stop.step || null,
-    tasks: Array.isArray(stop && stop.tasks) ? stop.tasks : [],
-    evidence: Array.isArray(stop && stop.evidence) ? stop.evidence : [],
-  };
-  return crypto.createHash('sha256').update(stableJson(canonical)).digest('hex');
+  return computed;
 }
 
-function createTechnicalStop({ reasonCode, runId, step, tasks, evidence, recoveryHint, causeFingerprint } = {}) {
+function createTechnicalStop({ reasonCode, runId, step, tasks, evidence, recoveryHint, causeSource, causeFingerprint } = {}) {
   if (!VALID_REASON_CODES.has(reasonCode)) {
     throw new Error(
       `createTechnicalStop: unknown reasonCode ${JSON.stringify(reasonCode)} — expected one of ${[...VALID_REASON_CODES].join(', ')}`,
     );
+  }
+  if (reasonCode === REASON_CODES.SUCCESSOR_REPAIR_FAILED && !causeSource) {
+    throw new TechnicalStopCauseError('SUCCESSOR_REPAIR_FAILED requires the predecessor canonical cause source');
+  }
+  const localCause = normaliseTechnicalCause({
+    reasonCode,
+    step: step || null,
+    tasks: Array.isArray(tasks) ? tasks : [],
+    evidence: Array.isArray(evidence) ? evidence : [],
+  });
+  const cause = causeSource ? normaliseTechnicalCause(causeSource) : localCause;
+  if (causeSource && reasonCode !== REASON_CODES.SUCCESSOR_REPAIR_FAILED
+    && stableJson(cause) !== stableJson(localCause)) {
+    throw new TechnicalStopCauseError('causeSource may differ from visible fields only for SUCCESSOR_REPAIR_FAILED');
+  }
+  const computedFingerprint = technicalCauseFingerprint(cause);
+  if (causeFingerprint !== undefined && causeFingerprint !== computedFingerprint) {
+    throw new TechnicalStopCauseError('supplied cause fingerprint does not match the canonical cause source', {
+      expected: computedFingerprint,
+      actual: causeFingerprint,
+    });
   }
   const stop = {
     schemaVersion: SCHEMA_VERSION,
@@ -148,10 +232,10 @@ function createTechnicalStop({ reasonCode, runId, step, tasks, evidence, recover
     // The contract A1b.2 reads. The reason whitelist remains a second check;
     // this field alone can never turn an owner/product outcome into recovery.
     recovery: { mode: 'successor_repair', eligible: true },
-    ...(causeFingerprint ? { causeFingerprint } : {}),
+    cause,
     createdAt: new Date().toISOString(),
   };
-  stop.fingerprint = technicalStopFingerprint(stop);
+  stop.fingerprint = computedFingerprint;
   return stop;
 }
 
@@ -262,6 +346,7 @@ module.exports = {
   REASON_CODES,
   TerminalRunError,
   TechnicalStopPersistError,
+  TechnicalStopCauseError,
   createTechnicalStop,
   isTechnicalStop,
   countsAsApproval,
@@ -269,6 +354,8 @@ module.exports = {
   isMergeEligible,
   isAcceptanceEligible,
   technicalStopFingerprint,
+  technicalStopCause,
+  technicalCauseFingerprint,
   applyToWorkflow,
   refusalPayload,
 };
