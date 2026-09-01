@@ -49,15 +49,19 @@ record and red-first receipt:
 - **Durable repair-launch receipts.** Before tmux or a repair CLI can start, the
   server persists one deterministic launch attempt under a cross-process lock.
   The wrapper records monotonic `intent` → `started` → `completed` receipts.
+  Persisting `started` is a hard shell precondition: if the receipt path is
+  missing, unreadable or unwritable, the wrapper exits before invoking the CLI
+  and reconciliation parks the attempt with typed evidence.
   Restart adopts the exact live tmux window for a started attempt; an absent or
   ambiguous process is parked as a typed technical launch failure rather than
   being started twice.
 - **Deterministic candidate-progress evidence.** The server records the exact
-  Git head before repair and accepts continuation only at a different forward
-  descendant. This proves a concrete committed candidate exists, not that it is
-  correct: the successor re-runs the predecessor's original step for semantic
-  verification. Free-form success prose, dirty edits and rewritten history do
-  not count.
+  Git head and full branch ref before repair and accepts continuation only on
+  that same ref, at a different forward descendant whose committed tree differs
+  from the baseline. This proves a concrete committed candidate exists, not
+  that it is correct: the successor re-runs the predecessor's original step for
+  semantic verification. Free-form success prose, allow-empty commits, branch
+  drift, dirty edits and rewritten history do not count.
 
 ### Changed
 
@@ -83,6 +87,11 @@ record and red-first receipt:
 - **A forward repair commit must also leave a clean repository.** Staged,
   unstaged or untracked residue is returned as deterministic dirty-path
   evidence and cannot satisfy the progress signal.
+- **Schema-2 lineage authority is validated as a complete ledger before use.**
+  Run identity, immutable limits, cumulative spend, ordered runs and events
+  must agree at every read and before every write. Missing authority and unknown
+  future schemas fail closed; schema 2 never defaults a missing limit or spend
+  field.
 
 ### Upgrade steps
 
@@ -92,10 +101,12 @@ both changed): `cd packages/hub && npx next build`, then
 app and any running project-servers.
 
 **In each managed project** — nothing to edit. New root admissions capture the
-lineage ledger immediately. An A1b.1 root without a ledger is captured atomically
-on its first eligible successor, using the then-current validated limits. The
-existing append-only `.build-studio/admission/` and `.build-studio/run-guard/`
-paths remain authoritative; do not delete them. The new operational
+lineage ledger immediately. On the first successful registry mutation after
+upgrade, the explicit schema-1→schema-2 path captures every legacy A1b.1 root
+with the then-current validated limits; partial schema-2 ledgers are refused
+rather than repaired by defaults. The existing append-only
+`.build-studio/admission/` and `.build-studio/run-guard/` paths remain
+authoritative; do not delete them. The new operational
 `.build-studio/successor-launch/` receipts are created automatically and must
 not be removed while a repair attempt is active.
 
@@ -124,6 +135,13 @@ not be removed while a repair attempt is active.
   canary exposed an old reference to a nonexistent `opencodeModel` local. The
   agent record now uses the already resolved `modelShortName`, matching the
   launch flags and preventing a post-preflight 500.
+- **A second independent review's four successor blockers were repaired before
+  merge.** Malformed-but-parseable schema-2 lineage data can no longer omit
+  budget authority and fail open; a failed `started` receipt cannot fall
+  through to the external CLI; repair progress is bound to the captured branch
+  ref and a non-empty committed tree delta; and the two-server launch canary now
+  waits for both contenders plus a bounded stability window. A delayed duplicate
+  launch mutation makes that strengthened canary fail.
 
 ## 2026-09-01 — Runs are admitted at the door, and a run's history cannot be deleted into a fresh start
 

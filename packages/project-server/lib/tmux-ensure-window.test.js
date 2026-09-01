@@ -32,8 +32,9 @@ function admittedContext(t) {
   const { createAdmission } = require('./admission');
   const admission = createAdmission({ projectRoot: statePath, statePath });
   const runId = `test-run-${Date.now().toString(36)}`;
-  admission.registry.admit({ nonce: `n-${runId}-0123456789abcdef`, runId, verdict: { kind: 'GateVerdict', runId }, lineage: { runId } });
-  admission.runGuard.register(runId, { identity: { runId } });
+  const identity = { runId, lineageId: runId, predecessorRunId: null, successorOrdinal: 0 };
+  admission.registry.admit({ nonce: `n-${runId}-0123456789abcdef`, runId, verdict: { kind: 'GateVerdict', runId }, lineage: identity });
+  admission.runGuard.register(runId, { identity });
   return admission.contextFor(runId);
 }
 

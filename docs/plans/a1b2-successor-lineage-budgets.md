@@ -75,6 +75,14 @@ addition to its revision check. Contending writers either observe the winner
 and return that exact successor or receive a typed fail-closed refusal; two
 processes cannot both commit children for one predecessor.
 
+Schema 2 is authority, not a best-effort cache. Every read and pre-write check
+validates run identity, immutable limits, cumulative spend, the ordered run
+chain and its append-only events as one internally consistent document. Unknown
+future versions and partial schema-2 structures fail closed with typed path
+evidence; no missing schema-2 authority field is defaulted. The only upgrade is
+an explicit schema-1→schema-2 transaction that captures every legacy root with
+complete limits before the first schema-2 write.
+
 The per-run guard applies the same discipline at a finer key: a mkdir lock
 serialises the complete read/mutate/rename cycle for that run. A revision check
 alone did not close the cross-process TOCTOU window. Once `technicalStop` is
@@ -142,13 +150,15 @@ policy. It must report a structured repaired/not-repaired outcome and evidence.
 A reported repair failure creates a new technical stop bound to the same cause
 fingerprint. The same successor machinery may make the next bounded attempt.
 A reported repair success is not trusted on its own. Before the repair agent is
-launched, the server records the repository's exact Git head. Continuation
-requires a different head that Git proves is a forward descendant of that
-baseline **and** an empty index/worktree under
+launched, the server records the repository's exact Git head and full branch
+ref. Launch and continuation both require that same concrete ref. Continuation
+also requires a different head that Git proves is a forward descendant, a
+non-empty committed tree delta from the baseline, **and** an empty index/worktree under
 `git status --porcelain=v1 --untracked-files=all`; staged, unstaged or untracked
-residue, rewritten history, evidence-shaped prose or a free-form `yes` is a
-repeated failure. Dirty-path evidence is retained in the refusal. The clean
-head delta is deterministic evidence that a concrete repair candidate exists,
+residue, an allow-empty commit, branch drift, rewritten history,
+evidence-shaped prose or a free-form `yes` is a repeated failure. Typed branch,
+tree and dirty-path evidence is retained in the refusal. The clean same-ref
+tree delta is deterministic evidence that a concrete repair candidate exists,
 **not** semantic proof that the cause is fixed. The original stopped step is
 therefore re-run and remains responsible for the real verification and
 acceptance evidence.
@@ -233,14 +243,31 @@ The one authorised repair round fixes those causes rather than weakening the
 contract. A fresh context-free reviewer must falsify the new exact head after
 protected CI; no merge is permitted on the first head or on inherited review.
 
+A second frozen review of `e43aff8a2a33f3ba2e4f58e32413f5589d350fc0`
+returned `REPAIR_REQUIRED` and found four further blockers: partial schema-2
+lineage authority failed open; a failed wrapper `started` write still invoked
+the CLI; allow-empty or wrong-branch commits counted as progress; and C8 could
+finish before a delayed second launch. The successor repair adds deep
+schema-specific validation with one explicit v1 upgrade, hard-gates the CLI on
+durable `started`, binds launch and approval to the captured ref plus a real
+tree delta, and strengthens C8 with two-contender reconciliation and a bounded
+stability window. This repair likewise requires protected exact-head CI and one
+new context-free review; inherited green status is not a merge verdict.
+
 ## Final local verification receipt
 
-- Focused A1b.2 contract: 12 lineage tests plus twelve actual-server canaries,
-  24/24 passed; the two cross-process run-guard stress tests also passed. The
-  final canary also proves that a local CLI preflight error can retry the same
-  durable attempt and still start exactly one process.
+- Focused A1b.2 contract after the successor repair: 21 lineage tests plus 21
+  actual-server canaries, 42/42 passed. They include partial-schema authority
+  across identity/limits/spend/run/event invariants, missing/unreadable/
+  unwritable started receipts with crash/restart, live-server receipt
+  confirmation, allow-empty and branch-drift refusal at launch/send/approval,
+  every dirty-worktree shape, positive clean same-ref tree progress and the
+  local CLI retry. The two cross-process run-guard stress tests also passed.
+  A disposable delayed-duplicate mutation made the strengthened C8 fail at
+  `observed 2`, proving its post-reconciliation stability window is active.
 - Full project-server suite (`node --test` from `packages/project-server`):
-  three fresh runs after the final repair code changes, each 1015/1015 passed.
+  three fresh runs after the final successor-repair code changes, each
+  1033/1033 passed with zero skips, cancellations or todos.
 - One pre-final repair run reached 1011/1014: three direct-router fixtures had
   `projectRoot` but omitted the normalised `statePath` that the real server
   always supplies. The launch store now uses the same

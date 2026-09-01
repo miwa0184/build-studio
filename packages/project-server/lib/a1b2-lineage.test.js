@@ -288,6 +288,112 @@ test('L7 — missing or corrupt authority fails closed before successor side eff
   assert.equal(fs.readdirSync(path.join(fx.statePath, 'run-guard')).length, 1);
 });
 
+test('L7b — structurally corrupt schema-2 lineage authority fails closed instead of renewing a zero cap', (t) => {
+  const fx = fixture(t, { max_successor_runs: 0, max_lineage_recovery_units: 1 });
+  const { admission, runId } = rootRun(fx);
+  stopRun(admission, runId);
+
+  const registryFile = admission.registry.file;
+  const corrupt = admission.registry.read();
+  delete corrupt.lineages[runId].limits;
+  fs.writeFileSync(registryFile, JSON.stringify(corrupt, null, 2));
+  const guardFilesBefore = fs.readdirSync(path.join(fx.statePath, 'run-guard')).sort();
+
+  assert.throws(() => admission.registry.read(), (error) => error.code === 'ADMISSION_REGISTRY_UNREADABLE'
+    && error.detail && error.detail.path === `lineages.${runId}.limits`);
+  assert.throws(() => admission.createSuccessor(runId), (error) => error.code === 'ADMISSION_VALIDATOR_FAILURE'
+    && /limits/.test(error.message));
+  assert.deepEqual(fs.readdirSync(path.join(fx.statePath, 'run-guard')).sort(), guardFilesBefore,
+    'corrupt lineage authority cannot materialise a successor guard');
+});
+
+test('L7c — an unknown future registry schema fails closed with typed evidence', (t) => {
+  const fx = fixture(t);
+  const { admission } = rootRun(fx);
+  const future = admission.registry.read();
+  future.schemaVersion = 3;
+  fs.writeFileSync(admission.registry.file, JSON.stringify(future, null, 2));
+
+  assert.throws(() => admission.registry.read(), (error) => error.code === 'ADMISSION_REGISTRY_UNREADABLE'
+    && error.detail && error.detail.path === 'schemaVersion'
+    && error.detail.actual === 3);
+});
+
+test('L7d — the explicit v1→v2 upgrade captures every legacy root with complete immutable authority', (t) => {
+  const fx = fixture(t, {
+    max_successor_runs: 1,
+    max_lineage_recovery_units: 9,
+    max_lineage_no_progress_repeats: 0,
+  });
+  const { admission, runId } = rootRun(fx);
+  const second = admission.admit(request(fx), { runIdPrefix: 'other-root' }).runId;
+  stopRun(admission, runId);
+
+  const legacy = admission.registry.read();
+  legacy.schemaVersion = 1;
+  delete legacy.lineages;
+  fs.writeFileSync(admission.registry.file, JSON.stringify(legacy, null, 2));
+
+  const created = admission.createSuccessor(runId);
+  assert.equal(created.replayed, false);
+  const upgraded = admission.registry.read();
+  assert.equal(upgraded.schemaVersion, 2);
+  for (const rootId of [runId, second]) {
+    assert.deepEqual(upgraded.lineages[rootId].limits, {
+      maxSuccessors: 1,
+      maxRecoveryUnits: 9,
+      maxNoProgressRepeats: 0,
+    });
+    assert.deepEqual(upgraded.lineages[rootId].runs.slice(0, 1), [rootId]);
+  }
+});
+
+for (const { name, corrupt: corruptAuthority, expectedPath } of [
+  {
+    name: 'run identity',
+    corrupt: (doc, rootId) => { doc.runs[rootId].lineage.lineageId = 'foreign-lineage'; },
+    expectedPath: /^runs\..+\.lineage$/,
+  },
+  {
+    name: 'limit type',
+    corrupt: (doc, rootId) => { doc.lineages[rootId].limits.maxSuccessors = '2'; },
+    expectedPath: /^lineages\..+\.limits\.maxSuccessors$/,
+  },
+  {
+    name: 'spent invariant',
+    corrupt: (doc, rootId) => { doc.lineages[rootId].spent.recoveryUnits += 1; },
+    expectedPath: /^lineages\..+\.spent\.recoveryUnits$/,
+  },
+  {
+    name: 'ordered runs',
+    corrupt: (doc, rootId, successorId) => { doc.lineages[rootId].runs.push(successorId); },
+    expectedPath: /^lineages\..+\.runs$/,
+  },
+  {
+    name: 'successor event',
+    corrupt: (doc, rootId) => { doc.lineages[rootId].events[1].successorRunId = rootId; },
+    expectedPath: /^lineages\..+\.events\.1$/,
+  },
+  {
+    name: 'event charge',
+    corrupt: (doc, rootId) => { doc.lineages[rootId].events[1].charge.counters.review_rounds = '1'; },
+    expectedPath: /^lineages\..+\.events\.1\.charge\.counters\.review_rounds$/,
+  },
+]) {
+  test(`L7e — schema-2 ${name} corruption is typed and fail-closed`, (t) => {
+    const fx = fixture(t);
+    const { admission, runId } = rootRun(fx);
+    stopRun(admission, runId);
+    const successor = admission.createSuccessor(runId);
+    const doc = admission.registry.read();
+    corruptAuthority(doc, runId, successor.runId);
+    fs.writeFileSync(admission.registry.file, JSON.stringify(doc, null, 2));
+
+    assert.throws(() => admission.registry.read(), (error) => error.code === 'ADMISSION_REGISTRY_UNREADABLE'
+      && error.detail && expectedPath.test(error.detail.path));
+  });
+}
+
 test('L8 — successor count refuses before a guard, workflow or agent can exist', (t) => {
   const fx = fixture(t, { max_successor_runs: 1, max_lineage_recovery_units: 99 });
   const { admission, runId } = rootRun(fx);

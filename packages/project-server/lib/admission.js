@@ -505,15 +505,21 @@ function createAdmission(config) {
     const committedIdentity = committedEntry.lineage;
     try {
       if (!fs.existsSync(runGuard.fileFor(committedRunId))) {
-        runGuard.register(committedRunId, { identity: committedIdentity });
-      } else {
-        const materialized = runGuard.load(committedRunId);
-        if (!materialized.identity
-          || materialized.identity.lineageId !== committedIdentity.lineageId
-          || materialized.identity.predecessorRunId !== committedIdentity.predecessorRunId
-          || materialized.identity.successorOrdinal !== committedIdentity.successorOrdinal) {
-          refuse('LINEAGE_IDENTITY_MISMATCH', `materialized guard identity disagrees for successor ${committedRunId}`);
+        try {
+          runGuard.register(committedRunId, { identity: committedIdentity });
+        } catch (error) {
+          // Two replaying processes can both observe the committed registry
+          // child before either materialises its guard. RUN_GUARD_EXISTS means
+          // the peer won that one-shot write; verify its exact identity below.
+          if (!error || error.code !== 'RUN_GUARD_EXISTS') throw error;
         }
+      }
+      const materialized = runGuard.load(committedRunId);
+      if (!materialized.identity
+        || materialized.identity.lineageId !== committedIdentity.lineageId
+        || materialized.identity.predecessorRunId !== committedIdentity.predecessorRunId
+        || materialized.identity.successorOrdinal !== committedIdentity.successorOrdinal) {
+        refuse('LINEAGE_IDENTITY_MISMATCH', `materialized guard identity disagrees for successor ${committedRunId}`);
       }
     } catch (e) {
       if (e instanceof AdmissionRefusedError) throw e;

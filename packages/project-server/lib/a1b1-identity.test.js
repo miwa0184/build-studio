@@ -28,13 +28,14 @@ function tmpState(t) {
 
 let n = 0;
 const nonce = () => `id-test-nonce-${process.pid}-${++n}-abcdef`;
+const rootIdentity = (runId) => ({ runId, lineageId: runId, predecessorRunId: null, successorOrdinal: 0 });
 
 /** Register a run the way the admission service does: registry entry + guard. */
 function registerRun(statePath, runId) {
   const registry = createAdmissionRegistry({ statePath });
   const guard = createRunGuard({ statePath, isRegistered: registry.isRegistered });
-  registry.admit({ nonce: nonce(), runId, verdict: { kind: 'GateVerdict', decision: 'ADMITTED', runId }, lineage: { runId, lineageId: runId, predecessorRunId: null, successorOrdinal: 0 } });
-  guard.register(runId, { identity: { runId, lineageId: runId, predecessorRunId: null, successorOrdinal: 0 } });
+  registry.admit({ nonce: nonce(), runId, verdict: { kind: 'GateVerdict', decision: 'ADMITTED', runId }, lineage: rootIdentity(runId) });
+  guard.register(runId, { identity: rootIdentity(runId) });
   return { registry, guard };
 }
 
@@ -120,7 +121,7 @@ test('I4 — nonce, registration and identity survive a new process (new instanc
   const statePath = tmpState(t);
   const first = createAdmissionRegistry({ statePath });
   const usedNonce = nonce();
-  first.admit({ nonce: usedNonce, runId: 'run-r', verdict: { kind: 'GateVerdict', runId: 'run-r' }, lineage: { runId: 'run-r', lineageId: 'run-r' } });
+  first.admit({ nonce: usedNonce, runId: 'run-r', verdict: { kind: 'GateVerdict', runId: 'run-r' }, lineage: rootIdentity('run-r') });
 
   // A fresh instance over the same statePath — the restart.
   const second = createAdmissionRegistry({ statePath });
@@ -139,7 +140,7 @@ test('I5 — a stale snapshot cannot overwrite a consumed nonce or a registratio
   const stale = registry.read(); // revision 0, empty
 
   const spent = nonce();
-  registry.admit({ nonce: spent, runId: 'run-s', verdict: { kind: 'GateVerdict', runId: 'run-s' }, lineage: { runId: 'run-s' } });
+  registry.admit({ nonce: spent, runId: 'run-s', verdict: { kind: 'GateVerdict', runId: 'run-s' }, lineage: rootIdentity('run-s') });
 
   assert.throws(() => registry.save(stale), AdmissionRegistryConflictError,
     'a writer holding an older revision must be refused');

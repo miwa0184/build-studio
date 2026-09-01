@@ -74,11 +74,12 @@ class LineageRegistryRefusalError extends Error {
  * store exists to withhold. Fails closed; the file stays as evidence.
  */
 class AdmissionRegistryCorruptError extends Error {
-  constructor(message, { file, cause } = {}) {
+  constructor(message, { file, cause, detail } = {}) {
     super(message);
     this.name = 'AdmissionRegistryCorruptError';
     this.code = 'ADMISSION_REGISTRY_UNREADABLE';
     this.file = file;
+    this.detail = detail || {};
     if (cause) this.cause = cause;
   }
 }
@@ -105,6 +106,237 @@ function emptyRegistry() {
   };
 }
 
+function isRecord(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function isNonNegativeInteger(value) {
+  return Number.isInteger(value) && value >= 0;
+}
+
+function corrupt(file, pathName, message, actual) {
+  throw new AdmissionRegistryCorruptError(
+    `admission registry ${pathName} ${message}`,
+    { file, detail: { path: pathName, ...(actual === undefined ? {} : { actual }) } },
+  );
+}
+
+function requireRecord(value, file, pathName) {
+  if (!isRecord(value)) corrupt(file, pathName, 'must be an object', value);
+  return value;
+}
+
+function requireString(value, file, pathName) {
+  if (!isNonEmptyString(value)) corrupt(file, pathName, 'must be a non-empty string', value);
+  return value;
+}
+
+function requireInteger(value, file, pathName) {
+  if (!isNonNegativeInteger(value)) corrupt(file, pathName, 'must be a non-negative integer', value);
+  return value;
+}
+
+function validateCommonRegistry(doc, file) {
+  requireRecord(doc, file, 'root');
+  requireInteger(doc.revision, file, 'revision');
+  requireRecord(doc.nonces, file, 'nonces');
+  requireRecord(doc.runs, file, 'runs');
+  requireString(doc.updatedAt, file, 'updatedAt');
+
+  for (const [nonce, entry] of Object.entries(doc.nonces)) {
+    requireString(nonce, file, `nonces.${nonce}`);
+    requireRecord(entry, file, `nonces.${nonce}`);
+    requireString(entry.consumedAt, file, `nonces.${nonce}.consumedAt`);
+    requireString(entry.runId, file, `nonces.${nonce}.runId`);
+    if (!doc.runs[entry.runId]) {
+      corrupt(file, `nonces.${nonce}.runId`, 'must reference a registered run', entry.runId);
+    }
+  }
+
+  for (const [runId, entry] of Object.entries(doc.runs)) {
+    requireString(runId, file, `runs.${runId}`);
+    requireRecord(entry, file, `runs.${runId}`);
+    requireString(entry.registeredAt, file, `runs.${runId}.registeredAt`);
+    requireRecord(entry.verdict, file, `runs.${runId}.verdict`);
+    if (!Array.isArray(entry.claims)) corrupt(file, `runs.${runId}.claims`, 'must be an array', entry.claims);
+    const identity = requireRecord(entry.lineage, file, `runs.${runId}.lineage`);
+    if (identity.runId !== runId) corrupt(file, `runs.${runId}.lineage.runId`, 'must equal its registry key', identity.runId);
+    requireString(identity.lineageId, file, `runs.${runId}.lineage.lineageId`);
+    if (identity.predecessorRunId !== null && !isNonEmptyString(identity.predecessorRunId)) {
+      corrupt(file, `runs.${runId}.lineage.predecessorRunId`, 'must be null or a non-empty string', identity.predecessorRunId);
+    }
+    requireInteger(identity.successorOrdinal, file, `runs.${runId}.lineage.successorOrdinal`);
+    if (entry.successorRunId !== undefined && !isNonEmptyString(entry.successorRunId)) {
+      corrupt(file, `runs.${runId}.successorRunId`, 'must be a non-empty string when present', entry.successorRunId);
+    }
+  }
+}
+
+function validateV1Registry(doc, file) {
+  validateCommonRegistry(doc, file);
+  if (Object.prototype.hasOwnProperty.call(doc, 'lineages')) {
+    corrupt(file, 'lineages', 'is not valid in schemaVersion 1');
+  }
+  for (const [runId, entry] of Object.entries(doc.runs)) {
+    const identity = entry.lineage;
+    if (identity.lineageId !== runId || identity.predecessorRunId !== null || identity.successorOrdinal !== 0) {
+      corrupt(file, `runs.${runId}.lineage`, 'must be a root identity in schemaVersion 1', identity);
+    }
+    if (entry.successorRunId !== undefined) {
+      corrupt(file, `runs.${runId}.successorRunId`, 'is not valid in schemaVersion 1', entry.successorRunId);
+    }
+  }
+}
+
+function validateV2Registry(doc, file) {
+  validateCommonRegistry(doc, file);
+  requireRecord(doc.lineages, file, 'lineages');
+  const seenRuns = new Set();
+
+  for (const [lineageId, ledger] of Object.entries(doc.lineages)) {
+    requireString(lineageId, file, `lineages.${lineageId}`);
+    requireRecord(ledger, file, `lineages.${lineageId}`);
+    if (ledger.lineageId !== lineageId) corrupt(file, `lineages.${lineageId}.lineageId`, 'must equal its registry key', ledger.lineageId);
+    if (ledger.rootRunId !== lineageId) corrupt(file, `lineages.${lineageId}.rootRunId`, 'must equal the lineage id', ledger.rootRunId);
+    const limits = requireRecord(ledger.limits, file, `lineages.${lineageId}.limits`);
+    const spent = requireRecord(ledger.spent, file, `lineages.${lineageId}.spent`);
+    for (const key of ['maxSuccessors', 'maxRecoveryUnits', 'maxNoProgressRepeats']) {
+      requireInteger(limits[key], file, `lineages.${lineageId}.limits.${key}`);
+    }
+    for (const key of ['successors', 'recoveryUnits', 'noProgressRepeats']) {
+      requireInteger(spent[key], file, `lineages.${lineageId}.spent.${key}`);
+    }
+    if (!Array.isArray(ledger.runs) || ledger.runs.length === 0) {
+      corrupt(file, `lineages.${lineageId}.runs`, 'must be a non-empty array', ledger.runs);
+    }
+    if (!Array.isArray(ledger.events) || ledger.events.length === 0) {
+      corrupt(file, `lineages.${lineageId}.events`, 'must be a non-empty array', ledger.events);
+    }
+    requireString(ledger.createdAt, file, `lineages.${lineageId}.createdAt`);
+    requireString(ledger.updatedAt, file, `lineages.${lineageId}.updatedAt`);
+
+    if (ledger.runs[0] !== lineageId) {
+      corrupt(file, `lineages.${lineageId}.runs.0`, 'must be the root run id', ledger.runs[0]);
+    }
+    if (new Set(ledger.runs).size !== ledger.runs.length) {
+      corrupt(file, `lineages.${lineageId}.runs`, 'must not contain duplicate run ids', ledger.runs);
+    }
+    if (spent.successors !== ledger.runs.length - 1) {
+      corrupt(file, `lineages.${lineageId}.spent.successors`, 'must equal runs.length - 1', spent.successors);
+    }
+    if (spent.successors > limits.maxSuccessors
+      || spent.recoveryUnits > limits.maxRecoveryUnits
+      || spent.noProgressRepeats > limits.maxNoProgressRepeats
+      || spent.noProgressRepeats > spent.successors) {
+      corrupt(file, `lineages.${lineageId}.spent`, 'exceeds its immutable limits or successor count', spent);
+    }
+
+    const rootEvent = requireRecord(ledger.events[0], file, `lineages.${lineageId}.events.0`);
+    if (!['ROOT_ADMITTED', 'LEGACY_LINEAGE_CAPTURED'].includes(rootEvent.type)
+      || rootEvent.runId !== lineageId) {
+      corrupt(file, `lineages.${lineageId}.events.0`, 'must capture this root admission', rootEvent);
+    }
+    requireString(rootEvent.at, file, `lineages.${lineageId}.events.0.at`);
+
+    let chargedUnits = 0;
+    let repeatedCauses = 0;
+    let priorFingerprint = null;
+    for (let index = 0; index < ledger.runs.length; index++) {
+      const runId = ledger.runs[index];
+      requireString(runId, file, `lineages.${lineageId}.runs.${index}`);
+      const run = doc.runs[runId];
+      if (!run) corrupt(file, `lineages.${lineageId}.runs.${index}`, 'must reference a registered run', runId);
+      if (seenRuns.has(runId)) corrupt(file, `lineages.${lineageId}.runs.${index}`, 'belongs to more than one lineage', runId);
+      seenRuns.add(runId);
+      const identity = run.lineage;
+      if (identity.lineageId !== lineageId || identity.successorOrdinal !== index
+        || identity.predecessorRunId !== (index === 0 ? null : ledger.runs[index - 1])) {
+        corrupt(file, `runs.${runId}.lineage`, 'disagrees with the ordered lineage ledger', identity);
+      }
+      const expectedSuccessor = ledger.runs[index + 1];
+      if (expectedSuccessor ? run.successorRunId !== expectedSuccessor : run.successorRunId !== undefined) {
+        corrupt(file, `runs.${runId}.successorRunId`, 'disagrees with the ordered lineage ledger', run.successorRunId);
+      }
+      if (index === 0) continue;
+      const event = requireRecord(ledger.events[index], file, `lineages.${lineageId}.events.${index}`);
+      if (event.type !== 'SUCCESSOR_CREATED'
+        || event.predecessorRunId !== ledger.runs[index - 1]
+        || event.successorRunId !== runId
+        || event.successorOrdinal !== index) {
+        corrupt(file, `lineages.${lineageId}.events.${index}`, 'must match the ordered successor transition', event);
+      }
+      requireString(event.at, file, `lineages.${lineageId}.events.${index}.at`);
+      requireString(event.causeFingerprint, file, `lineages.${lineageId}.events.${index}.causeFingerprint`);
+      if (!/^[0-9a-f]{64}$/.test(event.causeFingerprint)) {
+        corrupt(file, `lineages.${lineageId}.events.${index}.causeFingerprint`, 'must be a 64-character lowercase sha256', event.causeFingerprint);
+      }
+      requireString(event.reasonCode, file, `lineages.${lineageId}.events.${index}.reasonCode`);
+      const charge = requireRecord(event.charge, file, `lineages.${lineageId}.events.${index}.charge`);
+      requireInteger(charge.units, file, `lineages.${lineageId}.events.${index}.charge.units`);
+      const counters = requireRecord(charge.counters, file, `lineages.${lineageId}.events.${index}.charge.counters`);
+      let counterUnits = 0;
+      for (const [counter, value] of Object.entries(counters)) {
+        requireString(counter, file, `lineages.${lineageId}.events.${index}.charge.counters.${counter}`);
+        counterUnits += requireInteger(value, file, `lineages.${lineageId}.events.${index}.charge.counters.${counter}`);
+      }
+      if (charge.terminalEvents !== 1) {
+        corrupt(file, `lineages.${lineageId}.events.${index}.charge.terminalEvents`, 'must equal 1', charge.terminalEvents);
+      }
+      if (charge.units !== counterUnits + charge.terminalEvents) {
+        corrupt(file, `lineages.${lineageId}.events.${index}.charge.units`, 'must equal counters plus the terminal event', charge.units);
+      }
+      chargedUnits += charge.units;
+      if (priorFingerprint === event.causeFingerprint) repeatedCauses += 1;
+      priorFingerprint = event.causeFingerprint;
+    }
+    if (ledger.events.length !== ledger.runs.length) {
+      corrupt(file, `lineages.${lineageId}.events`, 'must contain exactly one root event plus one event per successor', ledger.events.length);
+    }
+    if (chargedUnits !== spent.recoveryUnits) {
+      corrupt(file, `lineages.${lineageId}.spent.recoveryUnits`, 'must equal the sum of successor charges', spent.recoveryUnits);
+    }
+    if (repeatedCauses !== spent.noProgressRepeats) {
+      corrupt(file, `lineages.${lineageId}.spent.noProgressRepeats`, 'must equal the repeated adjacent cause count', spent.noProgressRepeats);
+    }
+  }
+
+  for (const runId of Object.keys(doc.runs)) {
+    if (!seenRuns.has(runId)) corrupt(file, `runs.${runId}.lineage`, 'has no authoritative lineage ledger');
+  }
+}
+
+function validateRegistryDocument(doc, file) {
+  requireRecord(doc, file, 'root');
+  if (doc.schemaVersion === 1) validateV1Registry(doc, file);
+  else if (doc.schemaVersion === SCHEMA_VERSION) validateV2Registry(doc, file);
+  else corrupt(file, 'schemaVersion', `must be 1 or ${SCHEMA_VERSION}`, doc.schemaVersion);
+  return doc;
+}
+
+function upgradeV1Registry(reg, limits) {
+  if (reg.schemaVersion !== 1) return reg;
+  const now = new Date().toISOString();
+  reg.schemaVersion = SCHEMA_VERSION;
+  reg.lineages = {};
+  for (const [runId, run] of Object.entries(reg.runs)) {
+    reg.lineages[runId] = {
+      lineageId: runId,
+      rootRunId: runId,
+      limits: { ...limits },
+      spent: { successors: 0, recoveryUnits: 0, noProgressRepeats: 0 },
+      runs: [runId],
+      events: [{ type: 'LEGACY_LINEAGE_CAPTURED', runId, at: now }],
+      createdAt: run.registeredAt || now,
+      updatedAt: now,
+    };
+  }
+  return reg;
+}
+
 function createAdmissionRegistry({ statePath }) {
   if (!statePath) throw new Error('createAdmissionRegistry: statePath is required');
   const dir = path.join(statePath, ADMISSION_DIR);
@@ -120,15 +352,8 @@ function createAdmissionRegistry({ statePath }) {
         `admission registry exists but cannot be read: ${e.message}`, { file, cause: e },
       );
     }
-    if (!doc || typeof doc !== 'object' || Array.isArray(doc)
-      || !Number.isInteger(doc.schemaVersion) || doc.schemaVersion < 1
-      || !Number.isInteger(doc.revision) || doc.revision < 0
-      || !doc.nonces || typeof doc.nonces !== 'object'
-      || !doc.runs || typeof doc.runs !== 'object'
-      || (doc.lineages !== undefined && (!doc.lineages || typeof doc.lineages !== 'object'))) {
-      throw new AdmissionRegistryCorruptError('admission registry has an unrecognisable schema', { file });
-    }
-    return { ...emptyRegistry(), ...doc, lineages: doc.lineages || {} };
+    validateRegistryDocument(doc, file);
+    return doc.schemaVersion === 1 ? { ...doc, lineages: {} } : doc;
   }
 
   const lock = path.join(dir, 'registry.lock');
@@ -212,6 +437,7 @@ function createAdmissionRegistry({ statePath }) {
         revision: doc.revision + 1,
         updatedAt: new Date().toISOString(),
       };
+      validateV2Registry(next, file);
       const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
       fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
       fs.renameSync(tmp, file);
@@ -248,6 +474,11 @@ function createAdmissionRegistry({ statePath }) {
     if (!nonce || typeof nonce !== 'string') throw new Error('admit: nonce is required');
     if (!runId || typeof runId !== 'string') throw new Error('admit: runId is required');
     const { doc } = mutate((reg) => {
+      upgradeV1Registry(reg, lineageBudget || {
+        maxSuccessors: DEFAULT_MAX_SUCCESSORS,
+        maxRecoveryUnits: 58,
+        maxNoProgressRepeats: DEFAULT_MAX_NO_PROGRESS_REPEATS,
+      });
       if (reg.nonces[nonce]) throw new NonceReplayError(nonce);
       if (reg.runs[runId]) throw new Error(`run ${runId} is already registered`);
       reg.nonces[nonce] = { consumedAt: new Date().toISOString(), runId };
@@ -296,6 +527,11 @@ function createAdmissionRegistry({ statePath }) {
     legacyLineageBudget,
   }) {
     const { doc, result, unchanged } = mutate((reg) => {
+      upgradeV1Registry(reg, legacyLineageBudget || {
+        maxSuccessors: DEFAULT_MAX_SUCCESSORS,
+        maxRecoveryUnits: 58,
+        maxNoProgressRepeats: DEFAULT_MAX_NO_PROGRESS_REPEATS,
+      });
       const predecessor = reg.runs[String(predecessorRunId)];
       if (!predecessor) {
         throw new LineageRegistryRefusalError('RUN_NOT_ADMITTED', `predecessor ${predecessorRunId} is not registered`);
@@ -318,23 +554,11 @@ function createAdmissionRegistry({ statePath }) {
       }
       let ledger = reg.lineages[lineageId];
       if (!ledger) {
-        // Upgrade path for a root admitted by A1b.1. Limits are captured once,
-        // in this same first successor transaction, then immutable.
-        const limits = legacyLineageBudget || {
-          maxSuccessors: DEFAULT_MAX_SUCCESSORS,
-          maxRecoveryUnits: 58,
-          maxNoProgressRepeats: DEFAULT_MAX_NO_PROGRESS_REPEATS,
-        };
-        ledger = reg.lineages[lineageId] = {
-          lineageId,
-          rootRunId: predecessor.lineage.lineageId,
-          limits: { ...limits },
-          spent: { successors: 0, recoveryUnits: 0, noProgressRepeats: 0 },
-          runs: [predecessor.lineage.lineageId],
-          events: [{ type: 'LEGACY_LINEAGE_CAPTURED', runId: predecessor.lineage.lineageId, at: new Date().toISOString() }],
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        };
+        throw new LineageRegistryRefusalError(
+          'LINEAGE_AUTHORITY_MISSING',
+          `schema-2 lineage ${lineageId} is missing from the authoritative ledger`,
+          { lineageId },
+        );
       }
 
       const spent = ledger.spent || { successors: 0, recoveryUnits: 0, noProgressRepeats: 0 };

@@ -23,6 +23,7 @@ const { RunGuardCorruptError } = require('../run-guard');
 const {
   createSuccessorLaunchStore,
   SuccessorLaunchBusyError,
+  SuccessorLaunchCorruptError,
 } = require('../successor-launch');
 const { attachStateAuthority } = require('../state');
 const runBudgets = require('../run-budgets');
@@ -2266,7 +2267,7 @@ ${EFFICIENCY_INSTRUCTIONS}`,
         : null;
       const receiptCli = launchReceipt ? require.resolve('../successor-launch') : null;
       const receiptStart = launchReceipt
-        ? `${JSON.stringify(process.execPath)} ${JSON.stringify(receiptCli)} ${JSON.stringify(receiptFileArg)} started\n`
+        ? `if ! ${JSON.stringify(process.execPath)} ${JSON.stringify(receiptCli)} ${JSON.stringify(receiptFileArg)} started; then\n  exit 70\nfi\n`
         : '';
       const receiptComplete = launchReceipt
         ? `\nlaunch_status=$?\n${JSON.stringify(process.execPath)} ${JSON.stringify(receiptCli)} ${JSON.stringify(receiptFileArg)} completed "$launch_status"\nexit "$launch_status"`
@@ -2347,6 +2348,7 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
         }
         tmuxOps.pipePaneToLog(target, logFile, projectRoot);
       } catch (e) {
+        if (e && e.code === 'SUCCESSOR_REPAIR_BRANCH_DRIFT') throw e;
         agent.status = 'error';
         agent.error = `tmux: ${e.message}`;
         results.push(agent);
@@ -3401,17 +3403,80 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     return head;
   }
 
-  function measuredForwardHead(baseHead) {
+  function measuredProjectRef() {
+    const { execFileSync } = require('child_process');
+    let ref;
+    try {
+      ref = execFileSync('git', ['symbolic-ref', '--quiet', 'HEAD'], {
+        cwd: projectRoot,
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      }).trim();
+    } catch (error) {
+      throw new Error(`repair checkout must be attached to a concrete branch ref: ${error.message}`);
+    }
+    if (!ref.startsWith('refs/heads/') || ref.includes('\n') || ref.includes('\0')) {
+      throw new Error(`git returned an invalid repair branch ref: ${JSON.stringify(ref)}`);
+    }
+    return ref;
+  }
+
+  function measuredProjectBaseline() {
+    return { head: measuredProjectHead(), ref: measuredProjectRef() };
+  }
+
+  function measuredForwardHead(baseHead, baseRef) {
     const { execFileSync } = require('child_process');
     const currentHead = measuredProjectHead();
-    if (currentHead === baseHead) return { advanced: false, baseHead, currentHead, reason: 'HEAD did not change' };
+    const currentRef = measuredProjectRef();
+    if (currentRef !== baseRef) {
+      return {
+        advanced: false,
+        code: 'REPAIR_BRANCH_DRIFT',
+        baseHead,
+        currentHead,
+        baseRef,
+        currentRef,
+        reason: `repair checkout moved from ${baseRef} to ${currentRef}`,
+      };
+    }
+    if (currentHead === baseHead) {
+      return { advanced: false, code: 'REPAIR_HEAD_UNCHANGED', baseHead, currentHead, baseRef, currentRef, reason: 'HEAD did not change' };
+    }
     try {
       execFileSync('git', ['merge-base', '--is-ancestor', baseHead, currentHead], {
         cwd: projectRoot,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
     } catch (_) {
-      return { advanced: false, baseHead, currentHead, reason: 'HEAD changed but is not a forward descendant of the repair baseline' };
+      return {
+        advanced: false,
+        code: 'REPAIR_NON_FORWARD_HISTORY',
+        baseHead,
+        currentHead,
+        baseRef,
+        currentRef,
+        reason: 'HEAD changed but is not a forward descendant of the repair baseline',
+      };
+    }
+    const baseTree = execFileSync('git', ['rev-parse', `${baseHead}^{tree}`], {
+      cwd: projectRoot, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    const currentTree = execFileSync('git', ['rev-parse', `${currentHead}^{tree}`], {
+      cwd: projectRoot, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    if (baseTree === currentTree) {
+      return {
+        advanced: false,
+        code: 'REPAIR_EMPTY_TREE_DELTA',
+        baseHead,
+        currentHead,
+        baseRef,
+        currentRef,
+        baseTree,
+        currentTree,
+        reason: 'HEAD advanced but its committed tree is byte-identical to the repair baseline',
+      };
     }
     const dirty = execFileSync('git', ['status', '--porcelain=v1', '--untracked-files=all'], {
       cwd: projectRoot,
@@ -3421,13 +3486,18 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     if (dirty.length > 0) {
       return {
         advanced: false,
+        code: 'REPAIR_WORKTREE_DIRTY',
         baseHead,
         currentHead,
+        baseRef,
+        currentRef,
+        baseTree,
+        currentTree,
         dirtyPaths: dirty,
         reason: `HEAD advanced but the repair worktree is not clean: ${dirty.join('; ')}`,
       };
     }
-    return { advanced: true, baseHead, currentHead };
+    return { advanced: true, code: 'REPAIR_PROGRESS_CANDIDATE', baseHead, currentHead, baseRef, currentRef, baseTree, currentTree };
   }
 
   /** The predecessor state a successful repair may continue under a NEW id. */
@@ -3463,6 +3533,7 @@ Repair only the recorded technical cause below. Do not change product requiremen
 - Stopped step: ${evidence.step}
 - Cause fingerprint: ${evidence.fingerprint}
 - Server-measured repair baseline: ${wf.successorRepair.progressSignal.baseHead}
+- Required checkout ref: ${wf.successorRepair.progressSignal.baseRef}
 - Tasks: ${JSON.stringify(evidence.tasks || [])}
 - Evidence: ${JSON.stringify(evidence.evidence || [])}
 
@@ -3478,6 +3549,13 @@ Use \`yes\` only when the recorded technical cause is repaired and the cited ver
   }
 
   const successorLaunchRetryTimers = new Map();
+  const successorLaunchConfirmationTimers = new Map();
+  function successorLaunchStartConfirmationMs() {
+    return Number.isFinite(deps.successorLaunchStartConfirmationMs)
+      ? Math.max(100, Number(deps.successorLaunchStartConfirmationMs))
+      : 30000;
+  }
+
   function scheduleSuccessorLaunchRetry(runId, delayMs = 50) {
     const key = String(runId);
     if (successorLaunchRetryTimers.has(key)) return;
@@ -3499,25 +3577,76 @@ Use \`yes\` only when the recorded technical cause is repaired and the cited ver
     successorLaunchRetryTimers.set(key, timer);
   }
 
-  function parkUncertainSuccessorLaunch(wf, receipt, reason) {
+  function scheduleSuccessorLaunchConfirmation(runId, delayMs = 100) {
+    const key = String(runId);
+    if (successorLaunchConfirmationTimers.has(key)) return;
+    const timer = setTimeout(() => {
+      successorLaunchConfirmationTimers.delete(key);
+      let active;
+      try {
+        active = state.loadWorkflow();
+        const step = active && active.steps && active.steps.successor_repair;
+        const launch = active && active.successorRepair && active.successorRepair.launch;
+        if (!active || String(active.id) !== key || active.type !== 'repair'
+          || active.currentStep !== 'successor_repair' || !step || !launch
+          || !['launching', 'running'].includes(step.status)) return;
+        const receipt = successorLaunchStore.read(key);
+        if (receipt && ['started', 'completed'].includes(receipt.status)) return;
+        const createdAt = receipt && receipt.createdAt || launch.createdAt;
+        const ageMs = Date.now() - Date.parse(createdAt);
+        const confirmationMs = successorLaunchStartConfirmationMs();
+        if (Number.isFinite(ageMs) && ageMs < confirmationMs) {
+          scheduleSuccessorLaunchConfirmation(key, Math.min(250, confirmationMs - ageMs));
+          return;
+        }
+        parkSuccessorLaunchFailure(active, {
+          code: 'SUCCESSOR_LAUNCH_STARTED_RECEIPT_UNCONFIRMED',
+          receipt,
+          reason: `repair launch ${launch.attemptId} did not produce a durable started receipt within ${confirmationMs}ms; the CLI was gated off and automatic relaunch is unsafe`,
+        });
+      } catch (error) {
+        if (active && error instanceof SuccessorLaunchCorruptError) {
+          parkSuccessorLaunchFailure(active, {
+            code: 'SUCCESSOR_LAUNCH_UNREADABLE',
+            reason: error.message,
+            detail: { receiptFile: error.file || null },
+          });
+          return;
+        }
+        console.warn(`[successor] started-receipt confirmation failed for ${key}: ${error.message}`);
+      }
+    }, delayMs);
+    if (timer.unref) timer.unref();
+    successorLaunchConfirmationTimers.set(key, timer);
+  }
+
+  function parkSuccessorLaunchFailure(wf, { code, receipt = null, reason, detail = {} }) {
     const step = wf.steps.successor_repair;
     const agent = (Array.isArray(step.agents) && step.agents[0]) || repairAgentFor(wf);
-    agent.window = receipt.windowName;
-    agent.launchAttemptId = receipt.attemptId;
+    const launch = wf.successorRepair.launch || {};
+    agent.window = receipt && receipt.windowName || launch.windowName || agent.window;
+    agent.launchAttemptId = receipt && receipt.attemptId || launch.attemptId || agent.launchAttemptId;
     agent.status = 'error';
     agent.error = reason;
     step.status = 'blocked';
     step.agents = [agent];
     wf.successorRepair.launchFailure = {
-      code: 'SUCCESSOR_LAUNCH_UNCERTAIN',
+      code,
       principal: 'technical',
       founderQuestion: false,
-      attemptId: receipt.attemptId,
-      receiptStatus: receipt.status,
+      attemptId: receipt && receipt.attemptId || launch.attemptId || null,
+      receiptStatus: receipt && receipt.status || launch.status || null,
       reason,
+      ...detail,
     };
     state.saveWorkflow(wf);
     return wf;
+  }
+
+  function parkUncertainSuccessorLaunch(wf, receipt, reason) {
+    return parkSuccessorLaunchFailure(wf, {
+      code: 'SUCCESSOR_LAUNCH_UNCERTAIN', receipt, reason,
+    });
   }
 
   function launchSuccessorRepair(wf) {
@@ -3537,6 +3666,25 @@ Use \`yes\` only when the recorded technical cause is repaired and the cited ver
         const step = wf.steps.successor_repair;
         if (step.status === 'running' && Array.isArray(step.agents) && step.agents.length > 0) return wf;
         if (step.status === 'blocked') return wf;
+
+        const expectedRef = wf.successorRepair.progressSignal.baseRef;
+        let currentRef;
+        try {
+          currentRef = measuredProjectRef();
+        } catch (error) {
+          return parkSuccessorLaunchFailure(wf, {
+            code: 'SUCCESSOR_REPAIR_BRANCH_UNVERIFIABLE',
+            reason: error.message,
+            detail: { expectedRef },
+          });
+        }
+        if (currentRef !== expectedRef) {
+          return parkSuccessorLaunchFailure(wf, {
+            code: 'SUCCESSOR_REPAIR_BRANCH_DRIFT',
+            reason: `repair launch refused because the checkout moved from ${expectedRef} to ${currentRef}`,
+            detail: { expectedRef, currentRef },
+          });
+        }
 
         const agent = repairAgentFor(wf);
         const baseWindow = String(agent.window || agent.role).replace(/[^a-zA-Z0-9_-]/g, '-').slice(0, 12).replace(/-+$/, '');
@@ -3561,6 +3709,7 @@ Use \`yes\` only when the recorded technical cause is repaired and the cited ver
           sessionName: receipt.sessionName,
           windowName: receipt.windowName,
           status: receipt.status,
+          createdAt: receipt.createdAt,
         };
         step.status = 'launching';
         if (!intentAlreadyPersisted) {
@@ -3588,17 +3737,18 @@ Use \`yes\` only when the recorded technical cause is repaired and the cited ver
         }
         if (receipt.status === 'intent' && liveTarget) {
           const ageMs = Date.now() - Date.parse(receipt.createdAt);
-          if (Number.isFinite(ageMs) && ageMs < 30000) {
+          const confirmationMs = successorLaunchStartConfirmationMs();
+          if (Number.isFinite(ageMs) && ageMs < confirmationMs) {
             // tmux accepted the window but the wrapper may still be queued on a
             // loaded machine. Observe without sending anything again.
             scheduleSuccessorLaunchRetry(runId, 100);
             return wf;
           }
-          return parkUncertainSuccessorLaunch(
-            wf,
+          return parkSuccessorLaunchFailure(wf, {
+            code: 'SUCCESSOR_LAUNCH_STARTED_RECEIPT_UNCONFIRMED',
             receipt,
-            `repair launch ${receipt.attemptId} has a tmux window but no durable started receipt; refusing to guess whether send-keys executed`,
-          );
+            reason: `repair launch ${receipt.attemptId} has a tmux window but no durable started receipt after ${confirmationMs}ms; refusing to guess whether send-keys executed`,
+          });
         }
 
         const adopted = receipt.status === 'started' && liveTarget;
@@ -3615,6 +3765,16 @@ Use \`yes\` only when the recorded technical cause is repaired and the cited ver
             if (typeof deps.beforeSuccessorAgentSend === 'function') {
               deps.beforeSuccessorAgentSend({ workflow: wf, receipt });
             }
+            // Re-measure at the last synchronous boundary before ensureWindow
+            // and send-keys. The earlier check protects reconciliation; this
+            // one closes a concurrent checkout switch during script assembly.
+            const sendRef = measuredProjectRef();
+            if (sendRef !== expectedRef) {
+              const error = new Error(`repair launch checkout moved from ${expectedRef} to ${sendRef} before send-keys`);
+              error.code = 'SUCCESSOR_REPAIR_BRANCH_DRIFT';
+              error.detail = { expectedRef, currentRef: sendRef };
+              throw error;
+            }
           },
           afterExternalLaunch: adopted ? null : (plannedAgent, launch) => {
             if (typeof deps.afterSuccessorAgentSend === 'function') {
@@ -3627,7 +3787,10 @@ Use \`yes\` only when the recorded technical cause is repaired and the cited ver
         delete wf.successorRepair.launchFailure;
         wf.successorRepair.launch.status = adopted ? 'adopted' : 'sent';
         state.saveWorkflow(wf);
-        if (step.status === 'running') startAutoAdvanceTimer();
+        if (step.status === 'running') {
+          scheduleSuccessorLaunchConfirmation(runId);
+          startAutoAdvanceTimer();
+        }
         return wf;
       });
     } catch (error) {
@@ -3635,11 +3798,40 @@ Use \`yes\` only when the recorded technical cause is repaired and the cited ver
         scheduleSuccessorLaunchRetry(runId, 50);
         return wf;
       }
+      if (error instanceof SuccessorLaunchCorruptError) {
+        const persisted = state.loadWorkflow();
+        if (persisted && String(persisted.id) === runId && persisted.type === 'repair') {
+          return parkSuccessorLaunchFailure(persisted, {
+            code: 'SUCCESSOR_LAUNCH_UNREADABLE',
+            reason: error.message,
+            detail: { receiptFile: error.file || null },
+          });
+        }
+      }
+      if (error && error.code === 'SUCCESSOR_REPAIR_BRANCH_DRIFT') {
+        const persisted = state.loadWorkflow();
+        if (persisted && String(persisted.id) === runId && persisted.type === 'repair') {
+          return parkSuccessorLaunchFailure(persisted, {
+            code: 'SUCCESSOR_REPAIR_BRANCH_DRIFT',
+            reason: error.message,
+            detail: error.detail || {},
+          });
+        }
+      }
+      if (error && ['EACCES', 'EPERM', 'ENOENT', 'EISDIR', 'ENOTDIR', 'EROFS'].includes(error.code)) {
+        const persisted = state.loadWorkflow();
+        if (persisted && String(persisted.id) === runId && persisted.type === 'repair') {
+          return parkSuccessorLaunchFailure(persisted, {
+            code: 'SUCCESSOR_LAUNCH_RECEIPT_UNWRITABLE',
+            reason: `successor launch receipt cannot be persisted: ${error.message}`,
+          });
+        }
+      }
       throw error;
     }
   }
 
-  function buildSuccessorWorkflow(predecessor, created, repairBaseHead) {
+  function buildSuccessorWorkflow(predecessor, created, repairBaseline) {
     const now = new Date().toISOString();
     const evidence = {
       predecessorRunId: created.repairSpec.predecessorRunId,
@@ -3681,9 +3873,11 @@ Use \`yes\` only when the recorded technical cause is repaired and the cited ver
         // that the cause is semantically fixed; the original step must verify
         // that after continuation.
         progressSignal: {
-          kind: 'git_head_forward_delta',
-          baseHead: repairBaseHead,
+          kind: 'git_same_ref_clean_tree_delta',
+          baseHead: repairBaseline.head,
+          baseRef: repairBaseline.ref,
           currentHead: null,
+          currentRef: null,
           candidateOnly: true,
         },
         continuationWorkflow: continuationFrom(predecessor),
@@ -3702,14 +3896,14 @@ Use \`yes\` only when the recorded technical cause is repaired and the cited ver
     // Capture the deterministic repair baseline before the lineage commit and
     // before any workflow/agent side effect. If git authority is unavailable,
     // no successor budget is spent.
-    const repairBaseHead = measuredProjectHead();
+    const repairBaseline = measuredProjectBaseline();
     const created = admission.createSuccessor(predecessor.id);
     const active = state.loadWorkflow();
     if (active && active.id === created.runId) {
       if (active.type === 'repair' && active.currentStep === 'successor_repair') launchSuccessorRepair(active);
       return { created, workflow: state.loadWorkflow() };
     }
-    const successor = buildSuccessorWorkflow(predecessor, created, repairBaseHead);
+    const successor = buildSuccessorWorkflow(predecessor, created, repairBaseline);
     state.saveWorkflow(successor);
     launchSuccessorRepair(successor);
     return { created, workflow: state.loadWorkflow() };
@@ -3820,6 +4014,14 @@ Use \`yes\` only when the recorded technical cause is repaired and the cited ver
         // yet recorded. Resuming this pending repair is idempotent and avoids a
         // browser/manual action becoming part of recovery correctness.
         launchSuccessorRepair(active);
+      } else if (active && active.type === 'repair' && active.currentStep === 'successor_repair'
+        && active.steps && active.steps.successor_repair
+        && active.steps.successor_repair.status === 'running'
+        && active.successorRepair && active.successorRepair.launch) {
+        // The server may restart after recording the agent as running but
+        // before observing the wrapper's started receipt. Re-check the hard
+        // precondition instead of leaving a phantom running agent forever.
+        scheduleSuccessorLaunchConfirmation(active.id);
       }
     } catch (error) {
       console.warn(`[successor] startup reconciliation could not inspect active workflow: ${error.message}`);
@@ -5322,7 +5524,10 @@ Use \`yes\` only when the recorded technical cause is repaired and the cited ver
     let progress = null;
     if (repaired && evidence) {
       try {
-        progress = measuredForwardHead(wf.successorRepair.progressSignal.baseHead);
+        progress = measuredForwardHead(
+          wf.successorRepair.progressSignal.baseHead,
+          wf.successorRepair.progressSignal.baseRef,
+        );
       } catch (error) {
         progress = {
           advanced: false,
@@ -5344,7 +5549,7 @@ Use \`yes\` only when the recorded technical cause is repaired and the cited ver
             ? 'repair report says the cause remains'
             : !evidence
               ? 'repair report omitted structured evidence'
-              : `deterministic_progress_signal=absent (${progress.reason})`,
+              : `deterministic_progress_signal=absent [${progress.code || 'REPAIR_PROGRESS_UNVERIFIABLE'}] (${progress.reason})`,
         ],
         recoveryHint: 'The bounded repair did not clear the recorded cause. The lineage ledger decides whether another successor is allowed; no founder decision is requested.',
         causeFingerprint: cause,
@@ -5352,8 +5557,14 @@ Use \`yes\` only when the recorded technical cause is repaired and the cited ver
       applyTechnicalStop(wf, stop);
       return res.json({ workflow: wf, repairFailed: true, technicalStop: stop });
     }
-    wf.successorRepair.progressSignal.currentHead = progress.currentHead;
-    wf.successorRepair.progressSignal.measuredAt = new Date().toISOString();
+    Object.assign(wf.successorRepair.progressSignal, {
+      currentHead: progress.currentHead,
+      currentRef: progress.currentRef,
+      baseTree: progress.baseTree,
+      currentTree: progress.currentTree,
+      code: progress.code,
+      measuredAt: new Date().toISOString(),
+    });
     const continued = continueSuccessorAfterRepair(wf, feedback);
     return res.json({ workflow: continued, continued: true, needsAdvance: true });
   }

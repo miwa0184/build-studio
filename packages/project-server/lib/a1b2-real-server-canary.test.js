@@ -132,7 +132,13 @@ function httpJson(port, method, urlPath, body) {
   });
 }
 
-async function spawnServer(root, { crashPoint = null, strictCliPath = false } = {}) {
+async function spawnServer(root, {
+  crashPoint = null,
+  strictCliPath = false,
+  receiptFault = null,
+  startConfirmationMs = null,
+  crashAfterReceiptFault = true,
+} = {}) {
   const basePort = 22000 + Math.floor(Math.random() * 18000);
   const tmuxDir = path.join(root, '.tmux');
   fs.mkdirSync(tmuxDir, { recursive: true, mode: 0o700 });
@@ -140,10 +146,27 @@ async function spawnServer(root, { crashPoint = null, strictCliPath = false } = 
     '-e', `
       const fs = require('fs');
       const path = require('path');
+      const { execFileSync } = require('child_process');
       const point = process.argv[4] || '';
+      const receiptFault = process.argv[5] || '';
+      const confirmationMs = Number(process.argv[6] || 0);
+      const crashAfterReceiptFault = process.argv[7] !== 'false';
       const workflowDeps = {};
+      if (confirmationMs > 0) workflowDeps.successorLaunchStartConfirmationMs = confirmationMs;
       if (point === 'before-send') workflowDeps.beforeSuccessorAgentSend = () => process.exit(86);
       if (point === 'after-send') workflowDeps.afterSuccessorAgentSend = () => process.exit(87);
+      if (point === 'branch-drift-before-send') workflowDeps.beforeSuccessorAgentSend = () => {
+        execFileSync('git', ['switch', '-q', '-c', 'send-boundary-drift'], { cwd: process.argv[2] });
+      };
+      if (receiptFault) {
+        workflowDeps.beforeSuccessorAgentSend = ({ workflow }) => {
+          const receiptFile = workflow.successorRepair.launch.receiptFile;
+          if (receiptFault === 'missing') fs.unlinkSync(receiptFile);
+          if (receiptFault === 'unreadable') fs.writeFileSync(receiptFile, '{broken');
+          if (receiptFault === 'unwritable') fs.chmodSync(path.dirname(receiptFile), 0o555);
+        };
+        if (crashAfterReceiptFault) workflowDeps.afterSuccessorAgentSend = () => process.exit(88);
+      }
       if (point === 'barrier') workflowDeps.beforeSuccessorLaunchLock = () => {
         const dir = path.join(process.argv[2], '.build-studio', 'launch-barrier');
         fs.mkdirSync(dir, { recursive: true });
@@ -158,7 +181,7 @@ async function spawnServer(root, { crashPoint = null, strictCliPath = false } = 
         portOverride: Number(process.argv[3]), workflowDeps,
       });
     `,
-    SERVER_JS, root, String(basePort), crashPoint || '',
+    SERVER_JS, root, String(basePort), crashPoint || '', receiptFault || '', String(startConfirmationMs || ''), String(crashAfterReceiptFault),
   ], {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
@@ -281,6 +304,16 @@ async function waitForCondition(predicate, timeoutMs = 15000) {
   throw new Error('condition not reached before timeout');
 }
 
+async function assertLaunchCountStable(root, expected = 1, observationMs = 1200) {
+  const deadline = Date.now() + observationMs;
+  while (Date.now() < deadline) {
+    const actual = fakeLaunchCount(root);
+    assert.equal(actual, expected,
+      `launch count changed inside the bounded observation window: expected ${expected}, observed ${actual}`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 function fakeLaunchCount(root) {
   try {
     return fs.readFileSync(path.join(root, '.build-studio', 'fake-opencode-launches'), 'utf8')
@@ -296,12 +329,16 @@ async function startRoot(srv, fx) {
   return start.body.workflow;
 }
 
-async function reportRepair(srv, wf, repaired, { dirty = null } = {}) {
+async function reportRepair(srv, wf, repaired, { dirty = null, commitType = 'real' } = {}) {
   if (repaired) {
-    const marker = path.join(srv.root, `repair-${wf.lineage.successorOrdinal}.txt`);
-    fs.writeFileSync(marker, `repair candidate for ${wf.id}\n`);
-    execFileSync('git', ['add', path.basename(marker)], { cwd: srv.root });
-    execFileSync('git', ['commit', '-q', '-m', `test: repair candidate ${wf.lineage.successorOrdinal}`], { cwd: srv.root });
+    if (commitType === 'empty') {
+      execFileSync('git', ['commit', '--allow-empty', '-q', '-m', 'test: empty repair candidate'], { cwd: srv.root });
+    } else {
+      const marker = path.join(srv.root, `repair-${wf.lineage.successorOrdinal}.txt`);
+      fs.writeFileSync(marker, `repair candidate for ${wf.id}\n`);
+      execFileSync('git', ['add', path.basename(marker)], { cwd: srv.root });
+      execFileSync('git', ['commit', '-q', '-m', `test: repair candidate ${wf.lineage.successorOrdinal}`], { cwd: srv.root });
+    }
     if (dirty === 'untracked') {
       fs.writeFileSync(path.join(srv.root, 'uncommitted-repair.txt'), 'not committed\n');
     } else if (dirty === 'staged') {
@@ -458,6 +495,44 @@ for (const dirty of ['staged', 'unstaged', 'untracked']) {
   });
 }
 
+test('C3c — real server: an allow-empty forward commit is not repair progress', async (t) => {
+  const fx = makeFixture({ max_successor_runs: 1, max_lineage_recovery_units: 99 });
+  const srv = await spawnServer(fx.root);
+  t.after(async () => { await srv.kill(); fx.clean(); });
+
+  const root = await startRoot(srv, fx);
+  plantTechnicalStop(fx, root.id);
+  const created = await httpJson(srv.port, 'POST', '/api/workflow/successor', {});
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+
+  const reported = await reportRepair(srv, created.body.workflow, true, { commitType: 'empty' });
+  assert.equal(reported.status, 200, JSON.stringify(reported.body));
+  const parked = await waitFor(srv.port, (wf) => wf && wf.id === created.body.workflow.id
+    && wf.technicalStop && wf.lineageRefusal);
+  assert.match(parked.technicalStop.evidence.join('\n'), /REPAIR_EMPTY_TREE_DELTA/);
+});
+
+test('C3d — real server: progress on another checkout branch is refused even when wf.branch is stale', async (t) => {
+  const fx = makeFixture({ max_successor_runs: 1, max_lineage_recovery_units: 99 });
+  const srv = await spawnServer(fx.root);
+  t.after(async () => { await srv.kill(); fx.clean(); });
+
+  const root = await startRoot(srv, fx);
+  plantTechnicalStop(fx, root.id);
+  const created = await httpJson(srv.port, 'POST', '/api/workflow/successor', {});
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  assert.equal(created.body.workflow.successorRepair.progressSignal.baseRef, 'refs/heads/main');
+  assert.notEqual(created.body.workflow.branch, created.body.workflow.successorRepair.progressSignal.baseRef,
+    'the durable measured ref, not the stale optional wf.branch mirror, is authority');
+
+  execFileSync('git', ['switch', '-q', '-c', 'wrong-repair-branch'], { cwd: fx.root });
+  const reported = await reportRepair(srv, created.body.workflow, true);
+  assert.equal(reported.status, 200, JSON.stringify(reported.body));
+  const parked = await waitFor(srv.port, (wf) => wf && wf.id === created.body.workflow.id
+    && wf.technicalStop && wf.lineageRefusal);
+  assert.match(parked.technicalStop.evidence.join('\n'), /REPAIR_BRANCH_DRIFT/);
+});
+
 test('C4 — real server: restart reconciles a durable predecessor stop without a browser request', async (t) => {
   const fx = makeFixture();
   let srv = await spawnServer(fx.root);
@@ -497,6 +572,42 @@ test('C5 — real server: restart launches a committed pending repair without a 
     && wf.type === 'repair' && wf.steps.successor_repair.status === 'running'
     && wf.steps.successor_repair.agents.length === 1);
   assert.equal(launched.lineage.predecessorRunId, root.id);
+});
+
+test('C5b — real server: restart refuses launch after the checkout leaves the durable baseline ref', async (t) => {
+  const fx = makeFixture();
+  let srv = await spawnServer(fx.root, { crashPoint: 'before-send' });
+  t.after(async () => { await srv.kill(); fx.clean(); });
+
+  const root = await startRoot(srv, fx);
+  plantTechnicalStop(fx, root.id);
+  await assert.rejects(httpJson(srv.port, 'POST', '/api/workflow/successor', {}));
+  assert.equal(await srv.waitForExit(), 86, srv.logs());
+  assert.equal(fakeLaunchCount(fx.root), 0);
+
+  execFileSync('git', ['switch', '-q', '-c', 'launch-drift-branch'], { cwd: fx.root });
+  srv = await spawnServer(fx.root);
+  const blocked = await waitFor(srv.port, (wf) => wf && wf.type === 'repair'
+    && wf.steps.successor_repair.status === 'blocked' && wf.successorRepair.launchFailure);
+  assert.equal(blocked.successorRepair.launchFailure.code, 'SUCCESSOR_REPAIR_BRANCH_DRIFT');
+  assert.equal(fakeLaunchCount(fx.root), 0, 'branch drift must refuse before any repair CLI side effect');
+});
+
+test('C5c — real server: a concurrent branch switch at the send boundary is typed and side-effect free', async (t) => {
+  const fx = makeFixture();
+  const srv = await spawnServer(fx.root, { crashPoint: 'branch-drift-before-send' });
+  t.after(async () => { await srv.kill(); fx.clean(); });
+
+  const root = await startRoot(srv, fx);
+  plantTechnicalStop(fx, root.id);
+  const created = await httpJson(srv.port, 'POST', '/api/workflow/successor', {});
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const blocked = await waitFor(srv.port, (wf) => wf && wf.type === 'repair'
+    && wf.steps.successor_repair.status === 'blocked' && wf.successorRepair.launchFailure);
+  assert.equal(blocked.successorRepair.launchFailure.code, 'SUCCESSOR_REPAIR_BRANCH_DRIFT');
+  assert.equal(blocked.successorRepair.launchFailure.expectedRef, 'refs/heads/main');
+  assert.equal(blocked.successorRepair.launchFailure.currentRef, 'refs/heads/send-boundary-drift');
+  assert.equal(fakeLaunchCount(fx.root), 0, 'send-boundary drift refuses before tmux/CLI launch');
 });
 
 test('C6 — real server: transient registry contention is retryable, not a fake terminal cap', async (t) => {
@@ -553,6 +664,50 @@ test('C7 — real server: crash immediately after send-keys adopts the same live
   assert.equal(fakeLaunchCount(fx.root), 1, 'restart must not send the repair assignment twice');
 });
 
+for (const receiptFault of ['missing', 'unreadable', 'unwritable']) {
+  test(`C7b — real server: ${receiptFault} started-receipt fails closed before CLI and remains safe on restart`, async (t) => {
+    const fx = makeFixture();
+    let srv = await spawnServer(fx.root, { receiptFault });
+    t.after(async () => { await srv.kill(); fx.clean(); });
+
+    const root = await startRoot(srv, fx);
+    plantTechnicalStop(fx, root.id);
+    await assert.rejects(httpJson(srv.port, 'POST', '/api/workflow/successor', {}));
+    assert.equal(await srv.waitForExit(), 88, srv.logs());
+    await new Promise((resolve) => setTimeout(resolve, 750));
+    assert.equal(fakeLaunchCount(fx.root), 0,
+      'a CLI process must not start when its durable started receipt cannot be written');
+
+    const receiptDir = path.join(fx.root, '.build-studio', 'successor-launch');
+    if (receiptFault === 'unwritable') fs.chmodSync(receiptDir, 0o755);
+    srv = await spawnServer(fx.root, { startConfirmationMs: 300 });
+    const blocked = await waitFor(srv.port, (wf) => wf && wf.type === 'repair'
+      && wf.steps.successor_repair.status === 'blocked' && wf.successorRepair.launchFailure);
+    assert.match(blocked.successorRepair.launchFailure.code,
+      /^SUCCESSOR_LAUNCH_(STARTED_RECEIPT_UNCONFIRMED|UNREADABLE)$/);
+    await assertLaunchCountStable(fx.root, 0, 700);
+  });
+}
+
+test('C7c — real server: a live server parks an unconfirmed started receipt instead of leaving a phantom running agent', async (t) => {
+  const fx = makeFixture();
+  const srv = await spawnServer(fx.root, {
+    receiptFault: 'missing',
+    startConfirmationMs: 300,
+    crashAfterReceiptFault: false,
+  });
+  t.after(async () => { await srv.kill(); fx.clean(); });
+
+  const root = await startRoot(srv, fx);
+  plantTechnicalStop(fx, root.id);
+  const created = await httpJson(srv.port, 'POST', '/api/workflow/successor', {});
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+  const blocked = await waitFor(srv.port, (wf) => wf && wf.type === 'repair'
+    && wf.steps.successor_repair.status === 'blocked' && wf.successorRepair.launchFailure);
+  assert.equal(blocked.successorRepair.launchFailure.code, 'SUCCESSOR_LAUNCH_STARTED_RECEIPT_UNCONFIRMED');
+  await assertLaunchCountStable(fx.root, 0, 700);
+});
+
 test('C8 — real server: two project-server processes race one pending launch into one external process', async (t) => {
   const fx = makeFixture();
   let creator = await spawnServer(fx.root, { crashPoint: 'before-send' });
@@ -573,13 +728,30 @@ test('C8 — real server: two project-server processes race one pending launch i
     spawnServer(fx.root, { crashPoint: 'barrier' }),
     spawnServer(fx.root, { crashPoint: 'barrier' }),
   ]);
-  const running = await waitFor(a.port, (wf) => wf && wf.type === 'repair'
-    && wf.steps.successor_repair.status === 'running');
+  const [running, reconciledPeer] = await Promise.all([
+    waitFor(a.port, (wf) => wf && wf.type === 'repair'
+      && wf.steps.successor_repair.status === 'running'),
+    waitFor(b.port, (wf) => wf && wf.type === 'repair'
+      && wf.steps.successor_repair.status === 'running'),
+  ]);
   await waitForJsonFile(running.successorRepair.launch.receiptFile, (receipt) => receipt.status === 'started');
   await waitForCondition(() => fakeLaunchCount(fx.root) === 1);
-  assert.equal(fakeLaunchCount(fx.root), 1,
-    'cross-process launch exclusion must emit exactly one repair CLI invocation');
+  assert.equal(reconciledPeer.successorRepair.launch.attemptId, running.successorRepair.launch.attemptId);
+  await assertLaunchCountStable(fx.root, 1, 1500);
   assert.equal(running.steps.successor_repair.agents.length, 1);
+});
+
+test('C8m — the bounded C8 observer catches an intentionally delayed second launch', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bs-a1b2-c8-mutation-'));
+  t.after(() => { try { fs.rmSync(root, { recursive: true, force: true }); } catch (_) {} });
+  const marker = path.join(root, '.build-studio', 'fake-opencode-launches');
+  fs.mkdirSync(path.dirname(marker), { recursive: true });
+  fs.writeFileSync(marker, 'launch\n');
+  const delayedDuplicate = setTimeout(() => fs.appendFileSync(marker, 'launch\n'), 150);
+  t.after(() => clearTimeout(delayedDuplicate));
+
+  await assert.rejects(assertLaunchCountStable(root, 1, 600),
+    /expected 1, observed 2/);
 });
 
 test('C9 — real server: a failed CLI preflight can retry the same durable attempt exactly once', async (t) => {
