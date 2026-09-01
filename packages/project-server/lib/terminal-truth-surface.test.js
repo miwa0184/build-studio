@@ -29,7 +29,7 @@ const path = require('path');
 
 const { createTechnicalStop, refusalPayload, REASON_CODES } = require('./technical-stop');
 const { taskExecutionOutcome } = require('./blocked-tasks');
-const { createRunGuard } = require('./run-guard');
+const { registerTestRoot } = require('./test-support/root-aggregate');
 const runBudgets = require('./run-budgets');
 
 // ---------- R22 — the false Cancel / mark-done surface is gone ----------
@@ -91,7 +91,7 @@ test('R23 — the blocked-tasks stop does not advertise relaunching inside the r
 
 test('R23 — an exhausted task fix-cycle budget does not advertise relaunching the task', () => {
   const statePath = fs.mkdtempSync(path.join(os.tmpdir(), 'terminal-hints-'));
-  const guard = createRunGuard({ statePath });
+  const guard = registerTestRoot({ statePath, runId: 'rn-1' });
   const budgets = { ...runBudgets.resolveBudgets({}), maxTaskFixCycles: 0 };
   const spend = runBudgets.consumeTaskFixCycle(guard, 'rn-1', 1, budgets);
   assert.equal(spend.allowed, false);
@@ -100,7 +100,7 @@ test('R23 — an exhausted task fix-cycle budget does not advertise relaunching 
 
 test('R23 — an exhausted auto-advance refusal budget does not advertise advancing the run', () => {
   const statePath = fs.mkdtempSync(path.join(os.tmpdir(), 'terminal-hints-'));
-  const guard = createRunGuard({ statePath });
+  const guard = registerTestRoot({ statePath, runId: 'rn-1' });
   const budgets = { ...runBudgets.resolveBudgets({}), maxAutoAdvanceRefusals: 1, maxAutoAdvanceRefusalsTotal: 1 };
   let out = runBudgets.noteAutoAdvanceRefusal(guard, 'rn-1', 'merge_for_review', budgets, 'gate said no');
   if (!out.exhausted) out = runBudgets.noteAutoAdvanceRefusal(guard, 'rn-1', 'merge_for_review', budgets, 'gate said no');

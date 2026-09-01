@@ -529,7 +529,7 @@ function createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast, deps = 
     if (!gaps || gaps.length === 0) return;
     wf.acceptanceGaps = gaps;
     try {
-      runGuard.mutate(wf.id, (doc) => { doc.acceptanceGaps = gaps; });
+      runGuard.setAcceptanceGaps(wf.id, gaps);
     } catch (e) {
       // Not silently: an unwritable guard is the same fault recordTechnicalStop
       // fails closed on. The gap still rides the workflow object; transitions
@@ -7498,7 +7498,7 @@ ${EFFICIENCY_INSTRUCTIONS}`,
       if (!planCeiling.ok) {
         const n = planCeiling.count;
         try {
-          runGuard.mutate(wf.id, (doc) => { doc.counters.task_plan_rejections = Number(doc.counters.task_plan_rejections || 0) + 1; });
+          runGuard.bump(wf.id, 'task_plan_rejections');
         } catch (_) {}
         const msg = `Plan rejected — ${n} tasks exceeds ceiling of ${maxTasksPerPlan}. Most common cause: separate test-writing tasks for each AC. Tests for a given surface belong INSIDE the task that implements the surface, not as standalone tasks afterward. Re-run planner with explicit instruction: "Merge each XCUITest-writing task into the task that implements the corresponding view/screen/flow." If the merged plan still exceeds ${maxTasksPerPlan}, the PRD is too large for one workflow — split it.`;
         wf.steps.planning.status = 'blocked';

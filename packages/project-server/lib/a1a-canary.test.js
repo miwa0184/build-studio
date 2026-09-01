@@ -14,6 +14,7 @@ const os = require('os');
 const path = require('path');
 
 const { createRunGuard } = require('./run-guard');
+const { createAdmissionRegistry } = require('./admission-registry');
 const { createOverseer } = require('./overseer');
 const { resolveBudgets, consumeReviewRound, noteAutoAdvanceRefusal } = require('./run-budgets');
 const { taskExecutionOutcome } = require('./blocked-tasks');
@@ -23,6 +24,52 @@ const { countsAsApproval, countsAsAcceptanceEvidence } = require('./feedback-pro
 const { TECHNICAL_STOP, REASON_CODES, canAutoAdvance, isMergeEligible } = require('./technical-stop');
 
 const RUN_ID = 'canary-run-1';
+
+function register(guard, runId) {
+  guard.register(runId, { identity: {
+    runId,
+    lineageId: runId,
+    predecessorRunId: null,
+    successorOrdinal: 0,
+    registeredAt: '2026-09-01T00:00:00.000Z',
+    admissionRequestDigest: 'a'.repeat(64),
+    admittedHead: 'b'.repeat(40),
+    admittedRepo: 'owner/repo',
+    rootRegistry: { runId, requestDigest: 'a'.repeat(64) },
+  } });
+}
+
+function registerProductionRoot(statePath, guard, runId) {
+  const requestDigest = 'c'.repeat(64);
+  const lineage = {
+    runId,
+    lineageId: runId,
+    predecessorRunId: null,
+    successorOrdinal: 0,
+    registeredAt: '2026-09-01T00:00:00.000Z',
+    admissionRequestDigest: requestDigest,
+    admittedHead: 'd'.repeat(40),
+    admittedRepo: 'owner/repo',
+  };
+  guard.register(runId, { identity: {
+    ...lineage,
+    rootRegistry: { runId, requestDigest },
+  } });
+  createAdmissionRegistry({ statePath }).admit({
+    nonce: `canary-${runId}`,
+    runId,
+    verdict: {
+      kind: 'GateVerdict',
+      decision: 'ADMITTED',
+      runId,
+      requestDigest,
+      head: lineage.admittedHead,
+      repo: lineage.admittedRepo,
+    },
+    lineage,
+    claims: [],
+  });
+}
 
 function canaryWorkflow() {
   return {
@@ -76,6 +123,8 @@ test('canary 3 — reload and restart do not restore a spent budget', () => {
   const budgets = resolveBudgets({ max_review_rounds: 3 });
 
   const first = createRunGuard({ statePath });
+  register(first, RUN_ID);
+  register(first, 'other-run');
   for (let i = 0; i < 3; i++) assert.equal(consumeReviewRound(first, RUN_ID, budgets, { step: 'reviewing' }).allowed, true);
 
   // Spend the RUN-wide refusal budget. Note it is not the per-step one: three
@@ -129,7 +178,9 @@ test('canary 5 — force-complete and kill-and-skip cannot become approval', () 
   // Writable statePath: parking a run writes the run guard through the state
   // authority boundary, and an unwritable guard now correctly fails the action.
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bs-canary5-'));
-  const overseer = createOverseer({ projectRoot: root, statePath: path.join(root, '.build-studio'), port: 0 }, state, () => {});
+  const statePath = path.join(root, '.build-studio');
+  const overseer = createOverseer({ projectRoot: root, statePath, port: 0 }, state, () => {});
+  registerProductionRoot(statePath, state.runGuard, RUN_ID);
 
   assert.equal(overseer.forceCompleteTaskAgent('t2-ios').ok, true);
   const agent = wf.taskExecution.taskStates['1'].agents[0];

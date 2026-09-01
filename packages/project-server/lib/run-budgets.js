@@ -226,7 +226,7 @@ function noteAutoAdvanceRefusal(guard, runId, stepKey, budgets, errMsg) {
 
 /** Clear the per-step refusal count. Called only when that step genuinely advanced. */
 function clearStepRefusals(guard, runId, stepKey) {
-  guard.mutate(runId, (doc) => { delete doc.counters[`${COUNTERS.AUTO_ADVANCE_REFUSALS}:${stepKey}`]; });
+  guard.clearCounter(runId, `${COUNTERS.AUTO_ADVANCE_REFUSALS}:${stepKey}`);
 }
 
 /**

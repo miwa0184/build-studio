@@ -2,7 +2,12 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const { createRunGuard, RunGuardCorruptError, RunGuardMissingError } = require('./run-guard');
+const {
+  createRunGuard,
+  RunGuardCorruptError,
+  RunGuardMissingError,
+  RunGuardRegistryMismatchError,
+} = require('./run-guard');
 const { createAdmissionRegistry } = require('./admission-registry');
 const {
   isTechnicalStop,
@@ -107,7 +112,11 @@ function attachStateAuthority(state, config) {
   // brand-new run with fresh budgets. An unregistered (pre-admission) run id
   // with no file keeps the old meaning: an in-memory empty document.
   const admissionRegistry = createAdmissionRegistry({ statePath });
-  const runGuard = createRunGuard({ statePath, isRegistered: admissionRegistry.isRegistered });
+  const runGuard = createRunGuard({
+    statePath,
+    isRegistered: admissionRegistry.isRegistered,
+    getRegistration: admissionRegistry.getRun,
+  });
 
   /** Stops that could not reach the guard yet, keyed by run id. */
   const pendingStops = new Map();
@@ -124,22 +133,31 @@ function attachStateAuthority(state, config) {
       pendingStops.delete(String(runId));
       return doc.technicalStop;
     }
-    return pendingStops.get(String(runId)) || null;
+    const pending = pendingStops.get(String(runId));
+    return pending ? pending.stop : null;
   }
 
   /** Write a stop into the guard; on failure remember it as pending. */
-  function persistStopToGuard(runId, stop) {
+  function persistStopToGuard(runId, stop, workflow) {
     try {
-      runGuard.mutate(runId, (doc) => {
-        doc.technicalStop = stop;
-        if (stop.tasks && stop.tasks.length) doc.blockingTasks = stop.tasks;
-      });
+      runGuard.captureTechnicalStop(runId, { stop, workflow });
       pendingStops.delete(String(runId));
       return null;
     } catch (e) {
-      pendingStops.set(String(runId), stop);
+      pendingStops.set(String(runId), {
+        stop,
+        workflow: JSON.parse(JSON.stringify(workflow)),
+      });
       return e;
     }
+  }
+
+  function preStopWorkflow(wf, stop) {
+    const source = JSON.parse(JSON.stringify(wf));
+    if (source.currentStep === 'technical_stop') source.currentStep = stop.step;
+    source.technicalStop = null;
+    if (source.steps) delete source.steps.technical_stop;
+    return source;
   }
 
   const baseLoad = state.loadWorkflow.bind(state);
@@ -150,7 +168,9 @@ function attachStateAuthority(state, config) {
       const stop = authoritativeStop(wf.id);
       if (stop) applyToWorkflow(wf, stop);
     } catch (e) {
-      if (!(e instanceof RunGuardCorruptError) && !(e instanceof RunGuardMissingError)) throw e;
+      if (!(e instanceof RunGuardCorruptError)
+        && !(e instanceof RunGuardMissingError)
+        && !(e instanceof RunGuardRegistryMismatchError)) throw e;
       // Reads may still render; transitions may not. The advance route and the
       // auto-advance tick refuse on this marker, and every save fails closed.
       // RUN_GUARD_MISSING (a registered run whose guard file is gone) is the
@@ -171,12 +191,14 @@ function attachStateAuthority(state, config) {
       // pre-boundary snapshot, or a run that was in flight when the stop
       // landed. Mirror it into the guard so a later stale copy cannot erase it.
       stop = wf.technicalStop;
-      const err = persistStopToGuard(wf.id, stop);
-      if (err) console.error(`[state] technical stop for run ${wf.id} is not yet durable in the run guard: ${err.message}`);
+      const source = preStopWorkflow(wf, stop);
+      const err = persistStopToGuard(wf.id, stop, source);
+      if (err) throw new TechnicalStopPersistError(stop, err);
     } else if (stop && pendingStops.has(String(wf.id))) {
       // A pending stop rides every save until the guard accepts it.
-      const err = persistStopToGuard(wf.id, stop);
-      if (err) console.error(`[state] technical stop for run ${wf.id} is still not durable in the run guard: ${err.message}`);
+      const pending = pendingStops.get(String(wf.id));
+      const err = persistStopToGuard(wf.id, stop, pending.workflow);
+      if (err) throw new TechnicalStopPersistError(stop, err);
     }
     if (stop) applyToWorkflow(wf, stop);
     // The load-side marker is diagnostic, not state — it must not persist and
@@ -197,14 +219,12 @@ function attachStateAuthority(state, config) {
    * yet durable across a restart.
    */
   state.recordTechnicalStop = function recordTechnicalStop(wf, stop) {
+    const stoppedWorkflow = preStopWorkflow(wf, stop);
+    const guardErr = persistStopToGuard(wf.id, stop, stoppedWorkflow);
     applyToWorkflow(wf, stop);
-    const guardErr = persistStopToGuard(wf.id, stop);
-    try {
-      state.saveWorkflow(wf);
-    } catch (e) {
-      if (!guardErr) throw e;
-    }
     if (guardErr) throw new TechnicalStopPersistError(stop, guardErr);
+    delete wf.guardUnverifiable;
+    baseSave(wf);
     return stop;
   };
 

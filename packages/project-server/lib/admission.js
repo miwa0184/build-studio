@@ -193,7 +193,11 @@ function createAdmission(config) {
   const statePath = config.statePath || path.join(projectRoot || process.cwd(), '.build-studio');
   if (!projectRoot) throw new Error('createAdmission: config.projectRoot is required');
   const registry = createAdmissionRegistry({ statePath });
-  const runGuard = createRunGuard({ statePath, isRegistered: registry.isRegistered });
+  const runGuard = createRunGuard({
+    statePath,
+    isRegistered: registry.isRegistered,
+    getRegistration: registry.getRun,
+  });
 
   /** Every git read used for verification. A failure or timeout REFUSES. */
   function git(args) {
@@ -360,7 +364,12 @@ function createAdmission(config) {
     // Step 2 — the guard file, with identity. Fails: nothing registered,
     // nonce unspent.
     try {
-      runGuard.register(runId, { identity: lineage });
+      runGuard.register(runId, {
+        identity: {
+          ...lineage,
+          rootRegistry: { runId, requestDigest: digest },
+        },
+      });
     } catch (e) {
       refuse('ADMISSION_REGISTRATION_FAILED', `could not create the run guard for ${runId}: ${e.message}`);
     }

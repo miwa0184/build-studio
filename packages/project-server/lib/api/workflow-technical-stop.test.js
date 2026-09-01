@@ -17,6 +17,7 @@ const os = require('os');
 const path = require('path');
 
 const { createWorkflowRouter } = require('./workflow');
+const { registerTestRoot } = require('../test-support/root-aggregate');
 
 function makeApp(wf) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'wf-tstop-test-'));
@@ -40,6 +41,7 @@ function makeApp(wf) {
   const app = express();
   app.use(express.json());
   app.use('/api', createWorkflowRouter(config, state, {}, {}, () => {}));
+  registerTestRoot({ statePath: config.statePath, runId: wf.id, guard: state.runGuard });
   return app;
 }
 

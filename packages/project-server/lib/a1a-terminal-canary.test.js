@@ -24,6 +24,7 @@ const { createRunGuard } = require('./run-guard');
 const { COUNTERS } = require('./run-budgets');
 const { REASON_CODES, isMergeEligible, isAcceptanceEligible, canAutoAdvance } = require('./technical-stop');
 const { deriveNeedsAttention } = require('./needs-attention');
+const { registerTestRoot } = require('./test-support/root-aggregate');
 
 const RUN_ID = 'canary-terminal-run';
 
@@ -88,6 +89,7 @@ function makeApp(wf) {
   const app = express();
   app.use(express.json());
   app.use('/api', createWorkflowRouter(config, state, {}, {}, () => {}));
+  registerTestRoot({ statePath: config.statePath, runId: wf.id, guard: state.runGuard });
   return { app, config };
 }
 

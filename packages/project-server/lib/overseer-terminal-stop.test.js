@@ -22,6 +22,7 @@ const path = require('path');
 const { createOverseer } = require('./overseer');
 const { REASON_CODES } = require('./technical-stop');
 const { createRunGuard } = require('./run-guard');
+const { registerTestRoot } = require('./test-support/root-aggregate');
 
 function harness() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'overseer-terminal-'));
@@ -63,7 +64,9 @@ function harness() {
   const restore = () => { http.request = realRequest; };
 
   const config = { projectRoot: root, statePath, port: 0 };
-  return { wf, statePath, requested, restore, overseer: createOverseer(config, state, () => {}) };
+  const overseer = createOverseer(config, state, () => {});
+  registerTestRoot({ statePath, runId: wf.id, guard: state.runGuard });
+  return { wf, statePath, requested, restore, overseer };
 }
 
 test('R5 — force-complete parks the run with a typed stop', () => {
