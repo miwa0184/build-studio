@@ -1,6 +1,6 @@
 # Plan: A1b.2R-S1 — root-one repair aggregate contract
 
-> **Status: implemented 2026-09-01.** One reversible production slice. The
+> **Status: implemented 2026-09-01; authority repair completed 2026-09-02.** One reversible production slice. The
 > admitted root's schema-2 run guard is the only repair aggregate: it owns root
 > identity, non-renewable counters, terminal cause, repair budget, and one
 > bounded continuation envelope. This slice records no successor run, exposes
@@ -71,6 +71,13 @@ progress, acceptance-gap evidence, incident evidence, and terminal capture.
 A stopped aggregate is immutable; only a byte-equivalent terminal capture is
 idempotent. Every other transition returns `RUN_GUARD_TERMINAL`.
 
+One gate refusal is a compound named transition, not two counter calls. The
+reducer derives exactly `auto_advance_refusals:<step>` and
+`auto_advance_refusals`, increments both while holding the same per-run lease,
+and commits one revision. There is no generic multi-key mutation API. A failed
+atomic replace exposes neither increment; concurrent processes preserve one
+step and one total unit for every acknowledged event.
+
 Writes are serialized across project-server processes by a per-run filesystem
 lease. A writer first publishes an owner receipt containing protocol version,
 random token, pid, hostname, run id, and timestamp. A contender reclaims only
@@ -109,6 +116,24 @@ PIDs, tmux/session/window coordinates, timers, launch receipts, guard markers,
 and successor mechanics. Those are live process details, not continuation
 authority.
 
+## Acceptance-gap authority boundary
+
+Acceptance gaps are monotonic evidence in the same root aggregate. Recording a
+gap merges a previously unseen task index; an empty or stale write cannot clear
+one, and conflicting evidence for an already recorded index refuses. Every
+workflow load, save, and snapshot restore projects the aggregate list and sets
+the corresponding task state's `acceptanceCovered` to `false`. A stale workflow
+that says `merge_to_main`, carries no gaps, or says the task is covered therefore
+loads and persists with the aggregate evidence restored.
+
+Creating new gap authority is guard-first. If the aggregate write fails, the
+state boundary throws `ACCEPTANCE_GAP_PERSIST_FAILED` before it mutates the
+workflow object or writes `workflow-state.json`; task execution cannot be marked
+complete and merge cannot begin. Cancellation remains the escape hatch and does
+not mutate either schema-1 or schema-2 authority. Technical-stop projection and
+gap projection compose: a stopped workflow loads with both the terminal stop and
+its acceptance gap intact.
+
 ## Legacy contract
 
 Schema 1 is not migrated in place. It remains readable so historical runs can
@@ -133,6 +158,18 @@ The separate lock canary pins proved-dead reclamation and the permanent-token
 protection for a new live lock. Existing A1a terminal/state-authority and A1b.1
 admission/identity suites remain part of the mandatory regression matrix.
 
+The post-implementation authority-repair canary is
+`packages/project-server/lib/a1b2r-authority-repair.test.js`, SHA-256
+`5008a88e5308b44ccea645e13323ec99ae2eff01378d2440dcd91b38eb8e772d`.
+The identical file ran at frozen pre-repair SHA
+`07d473106a87dacf8f4efa36501b8bb29041c582`: 7 tests, 0 passed, 7 failed, no
+skip/todo. It reproduced the partial refusal spend (`revision` moved from 1 to
+2 with only the per-step counter), absent compound APIs, stale save/snapshot gap
+loss, and a guard persistence failure that still reached merge. The repaired
+slice runs the same file 7/7, including an atomic-write failure after both
+counter values were reduced in memory and 40 concurrent cross-process refusal
+events with no lost spend.
+
 ## Deliberately not in Slice 1
 
 - no successor id, allocation, registration, state, admission verdict, or
@@ -156,6 +193,16 @@ Newly admitted roots receive schema 2 automatically. Token-specific stale-lock
 claims are intentionally retained; they are tiny proof records and must not be
 pruned until a separately designed retention model can preserve their safety
 property.
+
+Incident projection was re-evaluated during the authority repair and is not
+extended in this slice. The concrete production consumers of
+`wf.overseer.incidents` drive banner selection, deduplication, and explicit
+operational recovery actions; they do not decide merge eligibility or
+acceptance coverage. Incidents therefore remain aggregate evidence rather than
+state-boundary decision authority. If a future consumer gates safety,
+acceptance, or merge on incident absence, it must first gain a named monotonic
+transition and the same projection/fail-closed treatment; a generic incident
+overwrite is not sufficient.
 
 This slice changes project-server JavaScript only. The hub has no changed file,
 so hub typecheck/build is not part of the validation matrix. Rebuild/repackage

@@ -21,6 +21,49 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-09-02 — Root refusal spend and acceptance evidence are now indivisible authority
+
+The A1b.2R-S1 root aggregate has been repaired at the two authority boundaries
+that still admitted partial or stale truth after its first implementation.
+
+### Changed
+
+- **One auto-advance refusal now spends both counters in one transition.** The
+  run guard derives the exact per-step and run-wide keys, updates both under one
+  cross-process lease, and commits one revision. A failed write exposes neither
+  increment; there is no generic multi-key reducer.
+- **Acceptance gaps are monotonic and enforced at the state boundary.** An
+  aggregate gap survives stale workflow saves and snapshot restores, is
+  projected onto `workflow.acceptanceGaps`, and forces the task's
+  `acceptanceCovered` back to `false` before merge or acceptance consumers read
+  it. Empty or stale writes cannot clear recorded evidence.
+- **New gap persistence is guard-first and fail-closed.** A guard write failure
+  returns typed `ACCEPTANCE_GAP_PERSIST_FAILED` before task execution can be
+  completed or merge can start. The workflow file remains unchanged.
+- **Schema-1 cancellation and technical stops retain their contracts.** Legacy
+  authority remains render/cancel-only, and a technical stop composes with the
+  acceptance-gap projection instead of erasing it.
+
+### Upgrade steps
+
+**In Build Studio** — rebuild/repackage the project-server-containing bundle
+and restart running project servers. No hub source changed.
+
+**In each managed project** — no migration. Existing schema-2 aggregates keep
+their fields; recorded gaps become monotonic on the first server read/write.
+Schema-1 runs remain visible and cancelable but cannot gain new authority.
+
+### Verification
+
+The permanent repair canary is byte-identical between frozen pre-repair SHA
+`07d473106a87dacf8f4efa36501b8bb29041c582` (0/7) and the repaired tree (7/7),
+SHA-256 `5008a88e5308b44ccea645e13323ec99ae2eff01378d2440dcd91b38eb8e772d`.
+It covers injected atomic failures, concurrent cross-process spend, stale
+save/load and restore, no-advance-on-persist-failure, technical-stop
+composition, and legacy cancellation.
+
+---
+
 ## 2026-09-01 — A stopped root now carries one strict repair aggregate
 
 The admitted root's run guard is now the sole authority for root identity,

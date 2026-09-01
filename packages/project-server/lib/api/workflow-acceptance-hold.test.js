@@ -29,6 +29,7 @@ const path = require('path');
 const { createWorkflowRouter } = require('./workflow');
 const { createRunGuard } = require('../run-guard');
 const { COUNTERS } = require('../run-budgets');
+const { registerTestRoot } = require('../test-support/root-aggregate');
 
 /**
  * The tick runs 500ms after auto-advance is enabled, then every 8 seconds.
@@ -62,7 +63,11 @@ function makeServer(wf) {
   };
   const app = express();
   app.use(express.json());
-  app.use('/api', createWorkflowRouter(config, state, {}, {}, () => {}));
+  const router = createWorkflowRouter(config, state, {}, {}, () => {});
+  // Acceptance evidence is mutable authority, so this fixture must represent
+  // an admitted schema-2 root. Schema 1 is intentionally render/cancel-only.
+  registerTestRoot({ statePath: config.statePath, runId: wf.id, guard: state.runGuard });
+  app.use('/api', router);
   return { app, config };
 }
 

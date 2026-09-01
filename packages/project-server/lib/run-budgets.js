@@ -186,24 +186,22 @@ function checkFixPlanCeiling(tasks, budgets, ctx = {}) {
  * single step, and neither a restart nor re-enabling auto-advance gives it more.
  */
 function noteAutoAdvanceRefusal(guard, runId, stepKey, budgets, errMsg) {
-  const perStepKey = `${COUNTERS.AUTO_ADVANCE_REFUSALS}:${stepKey}`;
   const totalMax = budgets.maxAutoAdvanceRefusalsTotal;
-  const perStep = guard.bump(runId, perStepKey, budgets.maxAutoAdvanceRefusals);
-  const total = guard.bump(runId, COUNTERS.AUTO_ADVANCE_REFUSALS, totalMax);
+  const spent = guard.noteAutoAdvanceRefusal(runId, stepKey);
 
   // Pausing a step is not the same event as giving up on the run, so the two
   // read different counters against different ceilings. `paused` fires when the
   // step has used its allowance; `exhausted` only when the RUN has used a much
   // larger one. `exceeded` carries the `> max` semantics stated at the top of
   // this file — spending the Nth unit is within budget.
-  const paused = perStep.value >= budgets.maxAutoAdvanceRefusals;
-  const exhausted = total.exceeded;
+  const paused = spent.stepCount >= budgets.maxAutoAdvanceRefusals;
+  const exhausted = spent.totalCount > totalMax;
 
   const out = {
     paused,
     exhausted,
-    stepCount: perStep.value,
-    totalCount: total.value,
+    stepCount: spent.stepCount,
+    totalCount: spent.totalCount,
     max: budgets.maxAutoAdvanceRefusals,
     totalMax,
   };
@@ -214,7 +212,7 @@ function noteAutoAdvanceRefusal(guard, runId, stepKey, budgets, errMsg) {
     runId,
     step: stepKey,
     evidence: [
-      `auto_advance_refusals=${total.value} of ${totalMax} allowed for this run`,
+      `auto_advance_refusals=${spent.totalCount} of ${totalMax} allowed for this run`,
       `last refusal on ${stepKey}: ${errMsg || 'no message'}`,
     ],
     recoveryHint:

@@ -19,7 +19,7 @@ const gateBlocked = require('../gate-blocked');
 const qaSuite = require('../qa-suite-run');
 const { extractFixPlan, checkFeedbackContract, rejectionOutcome, MAX_REJECTIONS } = require('../plan-contract');
 const { RunGuardCorruptError } = require('../run-guard');
-const { attachStateAuthority } = require('../state');
+const { attachStateAuthority, AcceptanceGapPersistError } = require('../state');
 const runBudgets = require('../run-budgets');
 const blockedTasks = require('../blocked-tasks');
 const { isAgentVerdict } = require('../feedback-provenance');
@@ -522,20 +522,12 @@ function createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast, deps = 
 
   /**
    * Record which tasks finished without a verdict, so acceptance cannot claim
-   * them. The caller is responsible for persisting `wf` — this only sets the
-   * field and mirrors it into the guard, which outlives the workflow object.
+   * them. The state boundary writes the aggregate first and projects it onto
+   * `wf` second. The caller persists `wf` only after this succeeds.
    */
   function recordAcceptanceGaps(wf, gaps) {
     if (!gaps || gaps.length === 0) return;
-    wf.acceptanceGaps = gaps;
-    try {
-      runGuard.setAcceptanceGaps(wf.id, gaps);
-    } catch (e) {
-      // Not silently: an unwritable guard is the same fault recordTechnicalStop
-      // fails closed on. The gap still rides the workflow object; transitions
-      // that depend on the guard will fail closed on their own.
-      console.error(`[workflow] could not mirror acceptance gaps into the run guard: ${e.message}`);
-    }
+    state.recordAcceptanceGaps(wf, gaps);
   }
 
   /**
@@ -4848,6 +4840,14 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
       res.status(400).json({ error: `unknown workflow type: ${wf.type}` });
     } catch (e) {
       console.error('[workflow] advance error:', e);
+      // Authority failures must reach the typed router error handler below.
+      // Converting them to a generic 500 here would hide the machine-readable
+      // refusal and make a guard persistence failure look like an ordinary
+      // handler crash.
+      if (e instanceof AcceptanceGapPersistError
+        || e instanceof TechnicalStopPersistError
+        || e instanceof RunGuardCorruptError
+        || e instanceof TerminalRunError) throw e;
       if (!res.headersSent) res.status(500).json({ error: e.message || 'Internal error in advance handler' });
     }
   });
@@ -9855,6 +9855,13 @@ ${FIX_EXECUTION_EFFICIENCY_INSTRUCTIONS}${STRUCTURED_FEEDBACK_INSTRUCTIONS}`,
   // something tried to replace — surface as machine-readable refusals rather
   // than an HTML 500. Failing closed only counts if the caller can tell WHY.
   router.use((err, req, res, next) => {
+    if (err instanceof AcceptanceGapPersistError) {
+      return res.status(503).json({
+        code: err.code,
+        error: err.message,
+        acceptanceGaps: err.acceptanceGaps || [],
+      });
+    }
     if (err instanceof TechnicalStopPersistError) {
       return res.status(503).json({
         code: err.code,

@@ -799,15 +799,45 @@ function createRunGuard({
         doc.counters[action.key] = value;
         return { changed: true, result: value };
       }
+      case 'NOTE_AUTO_ADVANCE_REFUSAL': {
+        // One gate refusal is one authority event. The reducer derives both
+        // exact keys itself so callers cannot turn this into a generic
+        // multi-counter mutation, and writeTransition commits them under the
+        // same lock and revision.
+        assertString(action.stepKey, 'auto-advance refusal step');
+        const stepKey = `auto_advance_refusals:${action.stepKey}`;
+        const stepCount = Number(doc.counters[stepKey] || 0) + 1;
+        const totalCount = Number(doc.counters.auto_advance_refusals || 0) + 1;
+        doc.counters[stepKey] = stepCount;
+        doc.counters.auto_advance_refusals = totalCount;
+        return { changed: true, result: { stepCount, totalCount } };
+      }
       case 'CLEAR_COUNTER':
         assertString(action.key, 'counter key');
         if (!Object.prototype.hasOwnProperty.call(doc.counters, action.key)) return { changed: false, result: 0 };
         delete doc.counters[action.key];
         return { changed: true, result: 0 };
-      case 'SET_ACCEPTANCE_GAPS':
+      case 'RECORD_ACCEPTANCE_GAPS': {
         validateAcceptanceGaps(action.gaps);
-        doc.acceptanceGaps = clone(action.gaps);
-        return { changed: true, result: clone(doc.acceptanceGaps) };
+        const byIndex = new Map(doc.acceptanceGaps.map((gap) => [gap.index, gap]));
+        let changed = false;
+        for (const gap of action.gaps) {
+          const existing = byIndex.get(gap.index);
+          if (existing) {
+            if (digest(existing) !== digest(gap)) {
+              throw new RunGuardConflictError(
+                `acceptance gap ${gap.index} conflicts with the run aggregate`,
+                { runId: doc.runId, taskIndex: gap.index },
+              );
+            }
+            continue;
+          }
+          byIndex.set(gap.index, clone(gap));
+          changed = true;
+        }
+        if (changed) doc.acceptanceGaps = [...byIndex.values()].sort((a, b) => a.index - b.index);
+        return { changed, result: clone(doc.acceptanceGaps) };
+      }
       case 'SET_INCIDENTS':
         validateIncidentList(action.incidents, doc.runId);
         doc.incidents = clone(action.incidents);
@@ -863,12 +893,22 @@ function createRunGuard({
     };
   }
 
+  function noteAutoAdvanceRefusal(runId, stepKey) {
+    return transition(runId, { type: 'NOTE_AUTO_ADVANCE_REFUSAL', stepKey }).result;
+  }
+
   function clearCounter(runId, key) {
     return transition(runId, { type: 'CLEAR_COUNTER', key }).result;
   }
 
+  function recordAcceptanceGaps(runId, gaps) {
+    return transition(runId, { type: 'RECORD_ACCEPTANCE_GAPS', gaps }).result;
+  }
+
+  // Compatibility name for the existing public surface. Gaps are monotonic:
+  // "set []" no longer means "erase authority".
   function setAcceptanceGaps(runId, gaps) {
-    return transition(runId, { type: 'SET_ACCEPTANCE_GAPS', gaps }).result;
+    return recordAcceptanceGaps(runId, gaps);
   }
 
   function setIncidents(runId, incidents) {
@@ -893,8 +933,10 @@ function createRunGuard({
     mutate: namedOnly,
     count,
     bump,
+    noteAutoAdvanceRefusal,
     exceeded: (runId, key, max) => typeof max === 'number' && count(runId, key) > max,
     clearCounter,
+    recordAcceptanceGaps,
     setAcceptanceGaps,
     setIncidents,
     captureTechnicalStop,

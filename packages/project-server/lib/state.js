@@ -16,6 +16,16 @@ const {
   TechnicalStopPersistError,
 } = require('./technical-stop');
 
+class AcceptanceGapPersistError extends Error {
+  constructor(gaps, cause) {
+    super(`acceptance gaps could not be persisted to the run aggregate: ${cause.message}`);
+    this.name = 'AcceptanceGapPersistError';
+    this.code = 'ACCEPTANCE_GAP_PERSIST_FAILED';
+    this.acceptanceGaps = JSON.parse(JSON.stringify(gaps));
+    this.cause = cause;
+  }
+}
+
 function syncAgentStatus(wf, docsPath) {
   const statusFile = path.join(docsPath, 'agent-status.json');
   let existing = { agents: [] };
@@ -71,8 +81,8 @@ function syncAgentStatus(wf, docsPath) {
 const MAX_SNAPSHOTS = 10;
 
 /**
- * The authority seam: make the run guard the source of terminal truth at the
- * point where workflow state is actually read and written.
+ * The authority seam: make the run guard the source of terminal and acceptance
+ * truth at the point where workflow state is actually read and written.
  *
  * Before this existed, terminality depended on every individual caller — each
  * route, the timer, the overseer, the restore path — remembering to consult
@@ -85,12 +95,12 @@ const MAX_SNAPSHOTS = 10;
  * This decorator wraps a persistence implementation so the enforcement is a
  * property of the boundary, for every current and future caller:
  *
- *   - loadWorkflow projects the guard's technicalStop onto whatever the file
- *     says, so a stopped run always LOADS stopped, however stale the file;
- *   - saveWorkflow re-applies the guard's stop before anything is written, so
- *     a stale copy can never persist a transitionable state over a terminal
- *     one — and mirrors a workflow-carried stop INTO the guard so it becomes
- *     durable whichever way the run acquired it;
+ *   - loadWorkflow projects the guard's technicalStop and monotonic
+ *     acceptanceGaps onto whatever the file says, so a stopped run always
+ *     LOADS stopped and an unverified task never loads as covered;
+ *   - saveWorkflow re-applies both authorities before anything is written, so
+ *     a stale copy or snapshot cannot persist a transitionable state over a
+ *     terminal one or clear acceptance evidence;
  *   - a guard that exists but cannot be read fails CLOSED: loads carry a
  *     machine-readable `guardUnverifiable` marker and every save throws
  *     RunGuardCorruptError before touching disk;
@@ -121,20 +131,65 @@ function attachStateAuthority(state, config) {
   /** Stops that could not reach the guard yet, keyed by run id. */
   const pendingStops = new Map();
 
+  function clone(value) {
+    return JSON.parse(JSON.stringify(value));
+  }
+
+  function sameGap(left, right) {
+    return left && right
+      && left.index === right.index
+      && left.name === right.name
+      && left.status === right.status
+      && left.reason === right.reason;
+  }
+
+  function hasNewOrConflictingGaps(authoritative, proposed) {
+    if (!Array.isArray(proposed) || proposed.length === 0) return false;
+    const byIndex = new Map((authoritative || []).map((gap) => [gap.index, gap]));
+    return proposed.some((gap) => !sameGap(byIndex.get(gap && gap.index), gap));
+  }
+
+  /** Project aggregate evidence onto every workflow view that can assert it. */
+  function projectAcceptanceGaps(wf, gaps) {
+    if (!Array.isArray(gaps) || gaps.length === 0) return wf;
+    wf.acceptanceGaps = clone(gaps);
+    if (!wf.taskExecution || typeof wf.taskExecution !== 'object') wf.taskExecution = {};
+    if (!wf.taskExecution.taskStates || typeof wf.taskExecution.taskStates !== 'object') {
+      wf.taskExecution.taskStates = {};
+    }
+    for (const gap of gaps) {
+      const key = String(gap.index);
+      const prior = wf.taskExecution.taskStates[key];
+      wf.taskExecution.taskStates[key] = {
+        ...(prior && typeof prior === 'object' ? prior : { agents: [] }),
+        status: gap.status,
+        acceptanceCovered: false,
+      };
+    }
+    return wf;
+  }
+
   /**
    * The terminal truth for a run: the guard's stop, else a pending one.
    * Throws RunGuardCorruptError when the guard exists but cannot be verified —
    * in that state the answer is not "no stop", it is "unknowable", and
    * everything that transitions state must stay closed.
    */
-  function authoritativeStop(runId) {
+  function authoritativeRun(runId) {
     const doc = runGuard.load(runId);
+    let stop = null;
     if (isTechnicalStop(doc.technicalStop)) {
       pendingStops.delete(String(runId));
-      return doc.technicalStop;
+      stop = doc.technicalStop;
+    } else {
+      const pending = pendingStops.get(String(runId));
+      stop = pending ? pending.stop : null;
     }
-    const pending = pendingStops.get(String(runId));
-    return pending ? pending.stop : null;
+    return { stop, acceptanceGaps: clone(doc.acceptanceGaps || []) };
+  }
+
+  function authoritativeStop(runId) {
+    return authoritativeRun(runId).stop;
   }
 
   /** Write a stop into the guard; on failure remember it as pending. */
@@ -165,8 +220,9 @@ function attachStateAuthority(state, config) {
     const wf = baseLoad();
     if (!wf) return wf;
     try {
-      const stop = authoritativeStop(wf.id);
-      if (stop) applyToWorkflow(wf, stop);
+      const authority = authoritativeRun(wf.id);
+      projectAcceptanceGaps(wf, authority.acceptanceGaps);
+      if (authority.stop) applyToWorkflow(wf, authority.stop);
     } catch (e) {
       if (!(e instanceof RunGuardCorruptError)
         && !(e instanceof RunGuardMissingError)
@@ -185,7 +241,16 @@ function attachStateAuthority(state, config) {
   state.saveWorkflow = function saveWorkflowWithAuthority(wf) {
     // Fail closed BEFORE anything is written: an unverifiable guard means the
     // run's terminal truth is unknowable, and no state may move on top of that.
-    let stop = authoritativeStop(wf.id);
+    const authority = authoritativeRun(wf.id);
+    let stop = authority.stop;
+    let gaps = authority.acceptanceGaps;
+    if (hasNewOrConflictingGaps(gaps, wf.acceptanceGaps)) {
+      try {
+        gaps = runGuard.recordAcceptanceGaps(wf.id, wf.acceptanceGaps);
+      } catch (error) {
+        throw new AcceptanceGapPersistError(wf.acceptanceGaps, error);
+      }
+    }
     if (!stop && isTechnicalStop(wf.technicalStop)) {
       // The workflow carries a stop the guard does not know yet — a restored
       // pre-boundary snapshot, or a run that was in flight when the stop
@@ -200,6 +265,7 @@ function attachStateAuthority(state, config) {
       const err = persistStopToGuard(wf.id, stop, pending.workflow);
       if (err) throw new TechnicalStopPersistError(stop, err);
     }
+    projectAcceptanceGaps(wf, gaps);
     if (stop) applyToWorkflow(wf, stop);
     // The load-side marker is diagnostic, not state — it must not persist and
     // then outlive a repaired guard.
@@ -223,9 +289,29 @@ function attachStateAuthority(state, config) {
     const guardErr = persistStopToGuard(wf.id, stop, stoppedWorkflow);
     applyToWorkflow(wf, stop);
     if (guardErr) throw new TechnicalStopPersistError(stop, guardErr);
+    projectAcceptanceGaps(wf, authoritativeRun(wf.id).acceptanceGaps);
     delete wf.guardUnverifiable;
     baseSave(wf);
     return stop;
+  };
+
+  /**
+   * The one write path for a newly observed acceptance gap: aggregate first,
+   * projection second. A failed aggregate write leaves the workflow object and
+   * workflow-state.json untouched, so callers cannot complete task_execution
+   * or enter merge on the strength of evidence that exists only in memory.
+   */
+  state.recordAcceptanceGaps = function recordAcceptanceGaps(wf, gaps) {
+    if (!Array.isArray(gaps) || gaps.length === 0) return [];
+    let recorded;
+    try {
+      recorded = runGuard.recordAcceptanceGaps(wf.id, gaps);
+    } catch (error) {
+      throw new AcceptanceGapPersistError(gaps, error);
+    }
+    projectAcceptanceGaps(wf, recorded);
+    delete wf.guardUnverifiable;
+    return recorded;
   };
 
   state.authoritativeStop = authoritativeStop;
@@ -382,4 +468,4 @@ function createStateManager(config, broadcast) {
   return attachStateAuthority(manager, config);
 }
 
-module.exports = { createStateManager, attachStateAuthority };
+module.exports = { createStateManager, attachStateAuthority, AcceptanceGapPersistError };
