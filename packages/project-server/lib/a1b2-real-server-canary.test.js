@@ -65,8 +65,13 @@ function makeFixture(overrides = {}) {
       'tmp/',
       '',
     ].join('\n'),
+    'test-bin/zsh': [
+      '#!/usr/bin/env bash',
+      'exec /bin/bash "$@"',
+      '',
+    ].join('\n'),
     'test-bin/opencode': [
-      '#!/bin/zsh',
+      '#!/usr/bin/env bash',
       'mkdir -p .build-studio',
       'printf "launch\\n" >> .build-studio/fake-opencode-launches',
       'sleep 120',
@@ -79,7 +84,7 @@ function makeFixture(overrides = {}) {
     const abs = path.join(root, rel);
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, content);
-    if (rel === 'test-bin/opencode') fs.chmodSync(abs, 0o755);
+    if (['test-bin/zsh', 'test-bin/opencode'].includes(rel)) fs.chmodSync(abs, 0o755);
   }
   git('init', '-q');
   git('config', 'user.email', 'test@example.com');
