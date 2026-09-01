@@ -48,6 +48,7 @@ const path = require('path');
 const { createStateManager } = require('./state');
 const { createWorkflowRouter } = require('./api/workflow');
 const { createRunGuard, GUARD_DIR } = require('./run-guard');
+const { createAdmissionRegistry } = require('./admission-registry');
 const { createTechnicalStop, REASON_CODES, isTechnicalStop } = require('./technical-stop');
 
 // ---------- harness ----------
@@ -136,12 +137,47 @@ function stopFor(runId) {
   });
 }
 
+function registerRoot(config, runId) {
+  const registry = createAdmissionRegistry({ statePath: config.statePath });
+  const guard = createRunGuard({
+    statePath: config.statePath,
+    isRegistered: registry.isRegistered,
+    getRegistration: registry.getRun,
+  });
+  if (!registry.isRegistered(runId)) {
+    const requestDigest = 'a'.repeat(64);
+    const lineage = {
+      runId,
+      lineageId: runId,
+      predecessorRunId: null,
+      successorOrdinal: 0,
+      registeredAt: '2026-09-01T00:00:00.000Z',
+      admissionRequestDigest: requestDigest,
+      admittedHead: 'b'.repeat(40),
+      admittedRepo: 'owner/repo',
+    };
+    guard.register(runId, { identity: {
+      ...lineage,
+      rootRegistry: { runId, requestDigest },
+    } });
+    registry.admit({
+      nonce: `state-authority-${runId}`,
+      runId,
+      verdict: {
+        kind: 'GateVerdict', decision: 'ADMITTED', runId, requestDigest,
+        head: lineage.admittedHead, repo: lineage.admittedRepo,
+      },
+      lineage,
+      claims: [],
+    });
+  }
+  return guard;
+}
+
 /** The stop as the guard holds it — written through the guard's own API. */
 function writeGuardStop(config, runId, stop) {
-  createRunGuard({ statePath: config.statePath }).mutate(runId, (doc) => {
-    doc.technicalStop = stop;
-    doc.blockingTasks = stop.tasks;
-  });
+  const guard = registerRoot(config, runId);
+  guard.captureTechnicalStop(runId, { stop, workflow: activeWf(runId) });
 }
 
 /** Simulate a crash-ordered or stale write: the raw file, no boundary. */
@@ -390,6 +426,7 @@ test('R20 — an injected guard write failure fails closed and cannot be saved o
   const env = makeEnv();
   const wf = activeWf('rn-1');
   wf.taskExecution.taskStates[1] = { status: 'blocked', blockedReason: 'reached max fix cycles (3/3)', acceptanceCovered: false, agents: [] };
+  registerRoot(env.config, 'rn-1');
   env.state.saveWorkflow(wf);
 
   // Make the guard directory unwritable — every attempt to persist terminal
@@ -408,7 +445,8 @@ test('R20 — an injected guard write failure fails closed and cannot be saved o
     'the failure to persist terminal truth must be machine-readable, not logged and swallowed');
 
   // A stale save must still not reopen the run while its stop is undurable.
-  env.state.saveWorkflow(activeWf('rn-1'));
+  assert.throws(() => env.state.saveWorkflow(activeWf('rn-1')),
+    (error) => error.code === 'TECHNICAL_STOP_PERSIST_FAILED');
   const wfAfter = env.state.loadWorkflow();
   assert.ok(isTechnicalStop(wfAfter.technicalStop),
     'a guard write failure followed by a stale save must not leave the run transitionable');

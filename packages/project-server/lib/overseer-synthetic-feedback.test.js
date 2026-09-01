@@ -12,6 +12,7 @@ const os = require('os');
 const path = require('path');
 
 const { createOverseer } = require('./overseer');
+const { registerTestRoot } = require('./test-support/root-aggregate');
 
 // Provenance values are asserted as literals here so this file exercises the
 // real overseer on its own and fails on behaviour, not on a missing module.
@@ -47,7 +48,9 @@ function harness() {
   // test (state-authority.test.js R20); this file tests provenance.
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'overseer-feedback-'));
   const config = { projectRoot: root, statePath: path.join(root, '.build-studio'), port: 0 };
-  return { wf, overseer: createOverseer(config, state, () => {}) };
+  const overseer = createOverseer(config, state, () => {});
+  registerTestRoot({ statePath: config.statePath, runId: wf.id, guard: state.runGuard });
+  return { wf, overseer };
 }
 
 test('force-complete records operator provenance and never writes an approval marker', () => {

@@ -32,7 +32,23 @@ const {
 const { TECHNICAL_STOP, REASON_CODES } = require('./technical-stop');
 
 function guard() {
-  return createRunGuard({ statePath: fs.mkdtempSync(path.join(os.tmpdir(), 'bs-budgets-')) });
+  const value = createRunGuard({ statePath: fs.mkdtempSync(path.join(os.tmpdir(), 'bs-budgets-')) });
+  register(value, 'run-a');
+  return value;
+}
+
+function register(guardStore, runId) {
+  guardStore.register(runId, { identity: {
+    runId,
+    lineageId: runId,
+    predecessorRunId: null,
+    successorOrdinal: 0,
+    registeredAt: '2026-09-01T00:00:00.000Z',
+    admissionRequestDigest: 'a'.repeat(64),
+    admittedHead: 'b'.repeat(40),
+    admittedRepo: 'owner/repo',
+    rootRegistry: { runId, requestDigest: 'a'.repeat(64) },
+  } });
 }
 
 test('budgets come from config, defaulting to the values the engine already ships', () => {
@@ -76,6 +92,7 @@ test('F4 — the review budget survives a project-server restart', () => {
   const statePath = fs.mkdtempSync(path.join(os.tmpdir(), 'bs-budgets-restart-'));
   const b = resolveBudgets({ max_review_rounds: 3 });
   const before = createRunGuard({ statePath });
+  register(before, 'run-a');
   for (let i = 0; i < 3; i++) consumeReviewRound(before, 'run-a', b, { step: 'reviewing' });
 
   const after = createRunGuard({ statePath }); // restart
@@ -128,6 +145,7 @@ test('pausing a step is not the same event as giving up on the run', () => {
   );
 
   const g = createRunGuard({ statePath: fs.mkdtempSync(path.join(os.tmpdir(), 'bs-budgets-pause-')) });
+  register(g, 'run-a');
   let last;
   for (let i = 0; i < b.maxAutoAdvanceRefusals; i++) {
     last = noteAutoAdvanceRefusal(g, 'run-a', 'qa_validation', b, 'gate said no');
@@ -146,6 +164,7 @@ test('F4 — auto-advance refusals are counted on disk and are not renewed by re
   const statePath = fs.mkdtempSync(path.join(os.tmpdir(), 'bs-budgets-aa-'));
   const b = resolveBudgets({});
   const g1 = createRunGuard({ statePath });
+  register(g1, 'run-a');
   let last;
   // Spend the RUN-wide budget across many steps. `> max`, per the semantics
   // stated at the top of run-budgets.js: spending the Nth is within budget.

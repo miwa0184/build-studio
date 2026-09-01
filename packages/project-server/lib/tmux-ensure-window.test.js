@@ -32,8 +32,8 @@ function admittedContext(t) {
   const { createAdmission } = require('./admission');
   const admission = createAdmission({ projectRoot: statePath, statePath });
   const runId = `test-run-${Date.now().toString(36)}`;
-  admission.registry.admit({ nonce: `n-${runId}-0123456789abcdef`, runId, verdict: { kind: 'GateVerdict', runId }, lineage: { runId } });
-  admission.runGuard.register(runId, { identity: { runId } });
+  const { registerTestRoot } = require('./test-support/root-aggregate');
+  registerTestRoot({ statePath, runId, guard: admission.runGuard });
   return admission.contextFor(runId);
 }
 

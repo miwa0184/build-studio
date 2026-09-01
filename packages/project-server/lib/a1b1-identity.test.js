@@ -29,12 +29,50 @@ function tmpState(t) {
 let n = 0;
 const nonce = () => `id-test-nonce-${process.pid}-${++n}-abcdef`;
 
+function identity(runId) {
+  return {
+    runId,
+    lineageId: runId,
+    predecessorRunId: null,
+    successorOrdinal: 0,
+    registeredAt: '2026-09-01T00:00:00.000Z',
+    admissionRequestDigest: 'a'.repeat(64),
+    admittedHead: 'b'.repeat(40),
+    admittedRepo: 'owner/repo',
+    rootRegistry: { runId, requestDigest: 'a'.repeat(64) },
+  };
+}
+
 /** Register a run the way the admission service does: registry entry + guard. */
 function registerRun(statePath, runId) {
   const registry = createAdmissionRegistry({ statePath });
-  const guard = createRunGuard({ statePath, isRegistered: registry.isRegistered });
-  registry.admit({ nonce: nonce(), runId, verdict: { kind: 'GateVerdict', decision: 'ADMITTED', runId }, lineage: { runId, lineageId: runId, predecessorRunId: null, successorOrdinal: 0 } });
-  guard.register(runId, { identity: { runId, lineageId: runId, predecessorRunId: null, successorOrdinal: 0 } });
+  const guard = createRunGuard({
+    statePath,
+    isRegistered: registry.isRegistered,
+    getRegistration: registry.getRun,
+  });
+  const root = identity(runId);
+  guard.register(runId, { identity: root });
+  registry.admit({
+    nonce: nonce(),
+    runId,
+    verdict: {
+      kind: 'GateVerdict', decision: 'ADMITTED', runId,
+      requestDigest: root.admissionRequestDigest,
+      head: root.admittedHead,
+      repo: root.admittedRepo,
+    },
+    lineage: {
+      runId,
+      lineageId: root.lineageId,
+      predecessorRunId: root.predecessorRunId,
+      successorOrdinal: root.successorOrdinal,
+      registeredAt: root.registeredAt,
+      admissionRequestDigest: root.admissionRequestDigest,
+      admittedHead: root.admittedHead,
+      admittedRepo: root.admittedRepo,
+    },
+  });
   return { registry, guard };
 }
 
@@ -52,7 +90,7 @@ test('I1 — plain load never creates a guard file; register does, exactly once'
 
   // register is the explicit creation, with identity, and it is one-shot.
   assert.equal(typeof guard.register, 'function', 'the guard store must expose an explicit register operation');
-  guard.register('run-a', { identity: { runId: 'run-a', lineageId: 'run-a', predecessorRunId: null, successorOrdinal: 0 } });
+  guard.register('run-a', { identity: identity('run-a') });
   assert.equal(fs.existsSync(guard.fileFor('run-a')), true);
   assert.throws(() => guard.register('run-a', {}), (e) => e.code === 'RUN_GUARD_EXISTS');
 });
@@ -106,8 +144,8 @@ test('I3 — creating far more than 40 runs deletes none of them', (t) => {
   const guard = createRunGuard({ statePath });
   const total = 45;
   for (let i = 0; i < total; i++) {
-    const doc = guard.load(`run-${String(i).padStart(3, '0')}`);
-    guard.save(doc); // every save used to prune the oldest beyond 40
+    const runId = `run-${String(i).padStart(3, '0')}`;
+    guard.register(runId, { identity: identity(runId) });
   }
   const files = fs.readdirSync(path.join(statePath, 'run-guard')).filter((f) => f.endsWith('.json'));
   assert.equal(files.length, total,

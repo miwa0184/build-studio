@@ -21,6 +21,105 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-09-02 — Root refusal spend and acceptance evidence are now indivisible authority
+
+The A1b.2R-S1 root aggregate has been repaired at the two authority boundaries
+that still admitted partial or stale truth after its first implementation.
+
+### Changed
+
+- **One auto-advance refusal now spends both counters in one transition.** The
+  run guard derives the exact per-step and run-wide keys, updates both under one
+  cross-process lease, and commits one revision. A failed write exposes neither
+  increment; there is no generic multi-key reducer.
+- **Acceptance gaps are monotonic and enforced at the state boundary.** An
+  aggregate gap survives stale workflow saves and snapshot restores, is
+  projected onto `workflow.acceptanceGaps`, and forces the task's
+  `acceptanceCovered` back to `false` before merge or acceptance consumers read
+  it. Empty or stale writes cannot clear recorded evidence.
+- **New gap persistence is guard-first and fail-closed.** A guard write failure
+  returns typed `ACCEPTANCE_GAP_PERSIST_FAILED` before task execution can be
+  completed or merge can start. The workflow file remains unchanged.
+- **Schema-1 cancellation and technical stops retain their contracts.** Legacy
+  authority remains render/cancel-only, and a technical stop composes with the
+  acceptance-gap projection instead of erasing it.
+
+### Upgrade steps
+
+**In Build Studio** — rebuild/repackage the project-server-containing bundle
+and restart running project servers. No hub source changed.
+
+**In each managed project** — no migration. Existing schema-2 aggregates keep
+their fields; recorded gaps become monotonic on the first server read/write.
+Schema-1 runs remain visible and cancelable but cannot gain new authority.
+
+### Verification
+
+The permanent repair canary is byte-identical between frozen pre-repair SHA
+`07d473106a87dacf8f4efa36501b8bb29041c582` (0/7) and the repaired tree (7/7),
+SHA-256 `5008a88e5308b44ccea645e13323ec99ae2eff01378d2440dcd91b38eb8e772d`.
+It covers injected atomic failures, concurrent cross-process spend, stale
+save/load and restore, no-advance-on-persist-failure, technical-stop
+composition, and legacy cancellation.
+
+---
+
+## 2026-09-01 — A stopped root now carries one strict repair aggregate
+
+The admitted root's run guard is now the sole authority for root identity,
+non-renewable counters, terminal cause, and its one bounded repair allowance.
+The full contract, red-first receipt, rejected alternatives, and scope boundary
+are recorded in `docs/plans/a1b2r-root-one-repair-aggregate.md`.
+
+### Changed
+
+- **New admitted roots use strict run-guard schema 2.** Missing, unknown,
+  mistyped, future, digest-invalid, or root-registry-inconsistent authority
+  fails closed before mutation. The A1b.1 admission registry schema is
+  unchanged and is checked only as the immutable root-registration cross-link.
+- **Terminal capture commits to the root aggregate before workflow projection.**
+  A projection crash can leave a stale workflow file, but restart re-projects
+  the committed stop. A failure before aggregate commit cannot report a durable
+  stop. The aggregate stores a canonical cause and a bounded, digest-bound
+  continuation envelope without agents, PIDs, tmux/session state, timers, or
+  launch coordinates.
+- **All guard authority writes are named and cross-process serialized.** Free
+  `save`/`mutate` authority is rejected. Per-run owner receipts, proved-dead
+  stale reclamation, permanent token claims, atomic replace, and fsync prevent
+  acknowledged counter spend or terminal state from being lost between server
+  processes.
+- **Schema 1 is readable and cancelable, but permanently read-only.** No
+  in-place migration or best-effort rewrite exists; authority mutation returns
+  `LEGACY_READ_ONLY` and preserves the file byte-for-byte.
+- **No successor is created or launched.** This slice has no successor route,
+  id, allocation, registry entry, worktree, tmux/CLI action, launch receipt,
+  outbox, or retry worker. The stored `maxSuccessors: 1` is only the bounded
+  contract for a later founder-approved slice.
+
+### Upgrade steps
+
+**In Build Studio** — rebuild/repackage the project-server-containing bundle
+and restart running project servers. No hub source changed, so no hub typecheck
+or Next build is required for this slice.
+
+**In each managed project** — no file migration. Finish or cancel a schema-1
+run before expecting further authority mutation; it remains visible and
+cancelable. Newly admitted roots receive schema 2 automatically.
+
+### Notes for forks
+
+- Do not add repair lineage fields to the admission registry. Root repair
+  authority belongs to the schema-2 run aggregate; the registry is its checked
+  admission cross-link only.
+- Do not reintroduce callback mutation, implicit schema upgrade, lock stealing
+  without local `ESRCH` proof, or operational process coordinates in the
+  continuation envelope.
+- Treat successor allocation and launch as a later slice with a separate
+  acceptance decision. A terminal root in this version is parked and recorded;
+  it does not autonomously continue.
+
+---
+
 ## 2026-09-01 — Runs are admitted at the door, and a run's history cannot be deleted into a fresh start
 
 Every run start is now admitted server-side against the project's actual git
