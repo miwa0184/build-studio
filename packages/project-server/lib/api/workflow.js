@@ -8368,7 +8368,14 @@ You are QA. **Your job is to RUN the test suite and report test outcomes — not
       const launchUnavailableQa = (error, { preserveExistingRun = false } = {}) => {
         const unavailable = { status: 'unavailable', error };
         if (exactAuthorityRequired) {
-          unavailable.authority = qaSuite.evaluateSuiteAuthority(unavailable, expectedTestCount);
+          // Bind the verdict to the scope it was evaluated for, exactly as a
+          // completed run does, so the gate reads it back as the unavailable
+          // verdict it is rather than as a stale-scope one.
+          unavailable.authority = {
+            ...qaSuite.evaluateSuiteAuthority(unavailable, expectedTestCount),
+            onlyTesting: qaScopeTargets || [],
+            parallelTesting: _pt,
+          };
           wf.steps.qa_validation = {
             ...(wf.steps.qa_validation || {}),
             status: 'running',
@@ -9362,6 +9369,29 @@ Before adding new entries, scan existing files in docs/learnings/:
           wf.steps.fix_plan.error = `Fix planner produced 0 tasks because source step "${sourceStep}" had no feedback. Re-run ${sourceStep} to produce findings, then relaunch fix_plan.`;
           state.saveWorkflow(wf);
           return res.status(400).json({ error: wf.steps.fix_plan.error });
+        }
+
+        // A zero-task plan is the shortcut back to the main line, and it used
+        // to be the one path that walked a run past a BLOCKED server-
+        // authoritative exact-count verdict: the tick sent the blocked
+        // qa_validation to devs, the planner found nothing to fix, and the
+        // QA agent's clean report carried the run on to the next step without
+        // a single fresh server run. Only such a run can replace the verdict.
+        // Refuse here, before the advance target is computed, and accept no
+        // override: an operator override answers the planner's judgement, not
+        // the server's evidence.
+        if (sourceStep === 'qa_validation') {
+          const serverGate = qaServerSuiteGateVerdict(wf.steps.qa_validation, config);
+          if (serverGate.blocked) {
+            wf.steps.fix_plan.status = 'blocked';
+            wf.steps.fix_plan.error = `Fix planner returned 0 tasks, but qa_validation's server-authoritative exact-count gate is blocked (${serverGate.code}): ${serverGate.reason || 'no valid exact-count verdict'}. A zero-task plan cannot advance past a blocked server verdict and no override applies. Fix the cause, then relaunch qa_validation for a fresh server suite.`;
+            state.saveWorkflow(wf);
+            return res.status(400).json({
+              error: wf.steps.fix_plan.error,
+              qaServerAuthority: serverGate,
+              sourceStep,
+            });
+          }
         }
 
         // Generalised strict-mode guard: refuse 0-task fix plans whenever the

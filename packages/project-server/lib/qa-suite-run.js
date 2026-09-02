@@ -119,39 +119,76 @@ function displayCommand(args) {
  * counts but no verdict, and reporting a verdict we did not see would be worse
  * than reporting none.
  */
-function parseTestCounts(text) {
-  const s = String(text || '');
-  let executed = 0;
-  let failures = 0;
-  let sawSummary = false;
-  const summaryCounts = [];
-  const summaryRe = /Executed (\d+) tests?, with (\d+) failures?/g;
-  let m;
-  while ((m = summaryRe.exec(s)) !== null) {
-    sawSummary = true;
-    const summary = { executed: parseInt(m[1], 10), failures: parseInt(m[2], 10) };
-    summaryCounts.push(summary);
-    executed += summary.executed;
-    failures += summary.failures;
+const CASE_LINE = /^Test Case '(.*)' (passed|failed) \(/;
+const SUMMARY_LINE = /Executed (\d+) tests?, with (\d+) failures?/;
+const SUCCESS_BANNER = /\*\* TEST SUCCEEDED \*\*/g;
+const FAILURE_BANNER = /\*\* TEST (?:FAILED|BUILD FAILED) \*\*/g;
+
+/**
+ * The test bundle a per-case line belongs to. xcodebuild prints Swift cases
+ * as `-[Module.Class method]` and Objective-C ones as `-[Class method]`; the
+ * first token is the finest grouping that a native `Executed` summary is
+ * also printed for, so it is what the per-target check groups by.
+ */
+function caseModule(name) {
+  const m = /^-\[([^\s\].]+)/.exec(String(name || ''));
+  return m ? m[1] : 'default';
+}
+
+function createTally() {
+  return {
+    casesPassed: 0, casesFailed: 0, caseTallies: {},
+    summaryCounts: [], successBannerCount: 0, failureBannerCount: 0,
+  };
+}
+
+/** Fold one COMPLETE line of xcodebuild output into the tally. */
+function tallyLine(tally, line) {
+  const kase = CASE_LINE.exec(line);
+  if (kase) {
+    const module = caseModule(kase[1]);
+    const bucket = tally.caseTallies[module] || (tally.caseTallies[module] = { passed: 0, failed: 0 });
+    if (kase[2] === 'passed') { tally.casesPassed++; bucket.passed++; } else { tally.casesFailed++; bucket.failed++; }
+    return;
   }
-  const casesPassed = (s.match(/^Test Case .*' passed \(/gm) || []).length;
-  const casesFailed = (s.match(/^Test Case .*' failed \(/gm) || []).length;
-  const successBannerCount = (s.match(/\*\* TEST SUCCEEDED \*\*/g) || []).length;
-  const failureBannerCount = (s.match(/\*\* TEST (?:FAILED|BUILD FAILED) \*\*/g) || []).length;
-  const succeeded = successBannerCount > 0 && failureBannerCount === 0
+  const summary = SUMMARY_LINE.exec(line);
+  if (summary) {
+    tally.summaryCounts.push({ executed: parseInt(summary[1], 10), failures: parseInt(summary[2], 10) });
+  }
+  tally.successBannerCount += (line.match(SUCCESS_BANNER) || []).length;
+  tally.failureBannerCount += (line.match(FAILURE_BANNER) || []).length;
+}
+
+function tallyText(tally, text) {
+  for (const line of String(text || '').split('\n')) tallyLine(tally, line);
+}
+
+/** The counts object the rest of the server reads, from a finished tally. */
+function finalizeTally(tally) {
+  const sawSummary = tally.summaryCounts.length > 0;
+  const executed = tally.summaryCounts.reduce((n, item) => n + item.executed, 0);
+  const failures = tally.summaryCounts.reduce((n, item) => n + item.failures, 0);
+  const succeeded = tally.successBannerCount > 0 && tally.failureBannerCount === 0
     ? true
-    : (failureBannerCount > 0 && successBannerCount === 0 ? false : null);
+    : (tally.failureBannerCount > 0 && tally.successBannerCount === 0 ? false : null);
   return {
     executed: sawSummary ? executed : null,
     failures: sawSummary ? failures : null,
-    summaryCounts,
-    casesPassed,
-    casesFailed,
+    summaryCounts: tally.summaryCounts.slice(),
+    casesPassed: tally.casesPassed,
+    casesFailed: tally.casesFailed,
+    caseTallies: Object.fromEntries(Object.entries(tally.caseTallies).map(([k, v]) => [k, { ...v }])),
     caseTallyComplete: true,
-    successBannerCount,
-    failureBannerCount,
+    successBannerCount: tally.successBannerCount,
+    failureBannerCount: tally.failureBannerCount,
     succeeded,
   };
+}
+
+function parseTestCounts(text) {
+  const tally = createTally();
+  tallyText(tally, text);
+  return finalizeTally(tally);
 }
 
 /**
@@ -208,15 +245,45 @@ function evaluateSuiteAuthority(run, expectedTestCount) {
   if (caseTotal > 0) {
     actualTestCount = caseTotal;
     actualFailures = counts.casesFailed;
-    const coherentSummary = validSummaries.some((item) => (
-      item.executed === actualTestCount && item.failures === actualFailures
-    ));
-    if (!coherentSummary) {
+    const agrees = (item, executed, failures) => item.executed === executed && item.failures === failures;
+    // One session (one test bundle): a native summary states the whole run.
+    // xcodebuild also prints class- and bundle-level summaries, so "some
+    // summary agrees" is the check, not "every summary agrees".
+    const wholeRunSummary = validSummaries.some((item) => agrees(item, actualTestCount, actualFailures));
+    // Several sessions (several bundles under only_testing): xcodebuild never
+    // prints an aggregate, only one summary per session. The per-case tally is
+    // grouped by bundle and every group must be corroborated by a native
+    // summary of exactly its count; a summary that stands in for a different
+    // bundle, or a bundle nobody summarised, is inconsistent evidence.
+    const tallies = counts.caseTallies && typeof counts.caseTallies === 'object' ? counts.caseTallies : {};
+    const groups = Object.entries(tallies).map(([module, item]) => ({
+      module,
+      executed: (Number.isInteger(item && item.passed) ? item.passed : 0) + (Number.isInteger(item && item.failed) ? item.failed : 0),
+      failures: Number.isInteger(item && item.failed) ? item.failed : 0,
+    }));
+    const groupTotal = groups.reduce((n, group) => n + group.executed, 0);
+    const uncorroborated = groups.filter((group) => !validSummaries.some((item) => agrees(item, group.executed, group.failures)));
+    const perTargetSummaries = groups.length >= 2 && groupTotal === actualTestCount && uncorroborated.length === 0;
+    // No native summary may claim more tests than were seen to run: that is
+    // either a summary from somewhere else or per-case evidence that was lost.
+    const oversized = validSummaries.find((item) => item.executed > actualTestCount);
+    if (oversized) {
       return block(
-        validSummaries.length === 0 ? 'QA_TEST_COUNT_MISSING' : 'QA_TEST_COUNT_INCONSISTENT',
-        validSummaries.length === 0
-          ? `parsed ${actualTestCount} test-case results but no native Executed summary`
-          : `test-case tally parsed ${actualTestCount} tests with ${actualFailures} failures, but no native summary agrees`,
+        'QA_TEST_COUNT_INCONSISTENT',
+        `a native summary reports ${oversized.executed} executed tests but only ${actualTestCount} test-case results were parsed`,
+        actualTestCount,
+      );
+    }
+    if (!wholeRunSummary && !perTargetSummaries) {
+      if (validSummaries.length === 0) {
+        return block('QA_TEST_COUNT_MISSING', `parsed ${actualTestCount} test-case results but no native Executed summary`, actualTestCount);
+      }
+      const detail = groups.length >= 2
+        ? `per-target tally ${groups.map((g) => `${g.module}=${g.executed}/${g.failures}`).join(', ')} is not corroborated by native summaries${uncorroborated.length ? ` (uncorroborated: ${uncorroborated.map((g) => g.module).join(', ')})` : ''}`
+        : 'no native summary agrees';
+      return block(
+        'QA_TEST_COUNT_INCONSISTENT',
+        `test-case tally parsed ${actualTestCount} tests with ${actualFailures} failures, but ${detail}`,
         actualTestCount,
       );
     }
@@ -418,32 +485,30 @@ function startSuiteRun({ cwd, args, logPath, timeoutMs, env, onProgress }) {
   // 15s to answer "how far along is it" would just move the waste from tokens
   // to disk.
   let tail = '';
+  // The tally is folded off the stream, line by line, so a two-target run's
+  // first summary — printed mid-log, easily outside the tail window — counts
+  // exactly like the last one. The tail survives only for the failure excerpt.
   const caseLineBuffers = { stdout: '', stderr: '' };
-  let casesPassed = 0;
-  let casesFailed = 0;
-  const countCaseLines = (text) => {
-    casesPassed += (text.match(/^Test Case .*' passed \(/gm) || []).length;
-    casesFailed += (text.match(/^Test Case .*' failed \(/gm) || []).length;
-  };
+  const tally = createTally();
   const absorb = (source, buf) => {
     const chunk = buf.toString('utf8');
     out.write(chunk);
     const combined = caseLineBuffers[source] + chunk;
     const lastNewline = combined.lastIndexOf('\n');
     if (lastNewline >= 0) {
-      countCaseLines(combined.slice(0, lastNewline + 1));
+      tallyText(tally, combined.slice(0, lastNewline));
       caseLineBuffers[source] = combined.slice(lastNewline + 1);
     } else {
       caseLineBuffers[source] = combined;
     }
-    tail = (tail + chunk).slice(-200000); // enough for the summary + failures
+    tail = (tail + chunk).slice(-200000); // enough for the failure excerpt
   };
   child.stdout.on('data', (buf) => absorb('stdout', buf));
   child.stderr.on('data', (buf) => absorb('stderr', buf));
 
   const progressTimer = onProgress && setInterval(() => {
     try {
-      onProgress({ casesPassed, casesFailed, elapsedMs: Date.now() - startedAt });
+      onProgress({ casesPassed: tally.casesPassed, casesFailed: tally.casesFailed, elapsedMs: Date.now() - startedAt });
     } catch (_) { /* progress is advisory — never let it kill the run */ }
   }, PROGRESS_INTERVAL_MS);
 
@@ -469,18 +534,18 @@ function startSuiteRun({ cwd, args, logPath, timeoutMs, env, onProgress }) {
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (killTimer) clearTimeout(killTimer);
       if (child.pid) activeRuns.delete(child.pid);
-      countCaseLines(caseLineBuffers.stdout);
-      countCaseLines(caseLineBuffers.stderr);
-      caseLineBuffers.stdout = '';
-      caseLineBuffers.stderr = '';
-      const counts = parseTestCounts(tail);
+      for (const source of ['stdout', 'stderr']) {
+        if (caseLineBuffers[source]) tallyLine(tally, caseLineBuffers[source]);
+        caseLineBuffers[source] = '';
+      }
+      const counts = finalizeTally(tally);
       const result = {
         status: timedOut ? 'timeout' : 'completed',
         exitCode: code,
         signal: signal || null,
         durationMs: Date.now() - startedAt,
         logPath,
-        counts: { ...counts, casesPassed, casesFailed, caseTallyComplete: true },
+        counts,
         failureExcerpt: failureExcerpt(tail),
       };
       // The log is the artifact the agent is pointed at, and `** TEST FAILED **`

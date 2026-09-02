@@ -21,6 +21,86 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-09-03 — Exact QA authority and governed inventory repairs
+
+Repairs to the governed-existing adoption and exact serial QA authority that
+shipped on 2026-09-02, after independent review of that change. Nothing here
+changes a project that has not opted into `governed-existing` onboarding or
+`qa_validation.expected_test_count`.
+
+### Changed
+
+- **A Markdown-relevant symlink now fails the governed inventory closed.** A
+  symlink named `*.md`, a symlink to a directory, or a symlink that cannot be
+  resolved used to be skipped silently, so a linked product-law file or a
+  linked folder of specs vanished from the authority map — and owner sign-off,
+  which walks the same way, would accept and commit a corpus it had never fully
+  seen. Both now refuse with `AUTHORITY_INVENTORY_SYMLINK` and the offending
+  path. Nothing is followed, inside or outside the repository. Symlinks to
+  non-Markdown files are still skipped. Standard (`single-prd-mvp`) onboarding
+  is unchanged.
+- **The server-run suite tallies its evidence off the stream, not the tail.**
+  Native `Executed N tests` summaries and success/failure banners are now
+  counted from every line the run emitted. Before, only the last 200 KB were
+  parsed for them, so a two-target run's first summary could scroll out of the
+  window and the exact-count verdict was evaluated on partial evidence.
+
+### Fixed
+
+- **A valid multi-target exact QA run was blocked as
+  `QA_TEST_COUNT_INCONSISTENT`.** With two entries in
+  `qa_validation.only_testing`, xcodebuild prints one native summary per test
+  bundle (30 + 26, say) and no aggregate, and the authority demanded a single
+  summary equal to the whole run. Per-bundle summaries are now corroborated
+  against the per-bundle case tally and summed; a summary that does not match
+  its bundle, a bundle no summary vouches for, a summary larger than the case
+  tally, a replayed run, or a run with no per-case lines still fails closed.
+  Single-target semantics are unchanged.
+- **A server-blocked exact QA verdict could be walked past by the fix loop.**
+  Auto-advance routed the blocked `qa_validation` to devs, the fix planner
+  returned zero tasks, and the QA agent's clean report then carried the run to
+  the next step without a fresh server run. A zero-task fix plan now refuses
+  (`qaServerAuthority` in the response) whenever the QA server gate is blocked,
+  with no override; relaunch `qa_validation` for a fresh server suite instead.
+- **A suite the server could not run was refused for the wrong reason.** The
+  persisted unavailable verdict lacked its scope binding, so approval reported
+  `QA_SERVER_SUITE_SCOPE_STALE` rather than `QA_SERVER_SUITE_UNAVAILABLE`. It
+  was blocked either way; it is now blocked for the stated reason.
+
+### Upgrade steps
+
+**In Build Studio** — rebuild and reinstall the Hub and project-server bundle.
+
+**In each managed project** — nothing to do. A `governed-existing` project
+whose corpus contains a Markdown-relevant symlink will now be refused at
+inventory and at owner sign-off until the symlink is replaced or removed; run
+`find . -type l -not -path './node_modules/*' -not -path './.git/*'` to list
+candidates.
+
+### Known issues
+
+- An `opencode` agent launch fails after the prompt file is written
+  (`ReferenceError: opencodeModel is not defined` in the launcher). This is
+  present on `main` before this change and is outside its scope; the governed
+  role-precedence test drives `claude` and `codex` through the launcher and
+  pins `opencode` at the definition resolver only.
+- A fix loop that DOES produce tasks still returns to `code_review` after the
+  fixes land, as it always has, rather than re-running `qa_validation`. Under
+  exact server authority the last persisted QA verdict therefore stays blocked
+  on the step until an operator relaunches `qa_validation`; the run still
+  parks at the A1c egress hold and cannot ship locally.
+
+### Notes for forks
+
+- `parseTestCounts` now returns `caseTallies` (per test bundle
+  `{ passed, failed }`) alongside the existing fields, and `startSuiteRun`
+  derives every count from the stream; a fork that re-parses the log tail for
+  authority decisions will disagree with the server on long two-target runs.
+- `evaluateSuiteAuthority` accepts a per-bundle corroborated tally only when
+  there are at least two bundles and every bundle has a matching native
+  summary. Keep that "every bundle" requirement: relaxing it to a sum lets one
+  repeated summary vouch for a bundle that never ran.
+
 ## 2026-09-02 — Governed existing-repo adoption and exact serial QA authority
 
 ### Added

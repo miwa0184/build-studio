@@ -259,9 +259,12 @@ function walkMarkdownPaths(projectRoot) {
       );
     }
     for (const entry of entries) {
-      if (entry.isSymbolicLink()) continue;
       const childRel = rel ? path.join(rel, entry.name) : entry.name;
       const childAbs = path.join(abs, entry.name);
+      if (entry.isSymbolicLink()) {
+        refuseMarkdownRelevantSymlink(entry, childAbs, childRel.split(path.sep).join('/'), skipDirs);
+        continue;
+      }
       if (entry.isDirectory()) {
         if (skipDirs.has(entry.name)) continue;
         walk(childAbs, childRel);
@@ -272,6 +275,37 @@ function walkMarkdownPaths(projectRoot) {
   };
   walk(projectRoot, '');
   return out.sort();
+}
+
+/**
+ * A symlink can hide Markdown from the governed inventory, and the inventory
+ * is the authority map's complete evidence base. So a symlink that could
+ * carry Markdown — one named *.md, one that resolves to a directory, or one
+ * that cannot be resolved at all — fails the inventory closed with the path
+ * that needs an owner decision. Nothing is followed: the target's metadata is
+ * examined only to tell a directory from a file, never read or traversed, so
+ * a link pointing outside the repository stays outside it. A link to a
+ * non-Markdown file is not Markdown-relevant and is skipped as before, and a
+ * link named like a skipped directory (node_modules) is skipped like one.
+ * Standard onboarding does not walk the tree and is unaffected.
+ */
+function refuseMarkdownRelevantSymlink(entry, abs, rel, skipDirs) {
+  if (skipDirs.has(entry.name)) return;
+  const isMarkdownName = entry.name.toLowerCase().endsWith('.md');
+  let target = null;
+  if (!isMarkdownName) {
+    try { target = fs.statSync(abs); } catch (_) { target = null; }
+    if (target && target.isFile()) return;
+  }
+  const kind = isMarkdownName ? 'a symlinked Markdown file'
+    : target && target.isDirectory() ? 'a symlinked directory'
+      : target ? 'a symlink to a non-regular file'
+        : 'an unresolvable symlink';
+  throw authorityError(
+    `governed inventory cannot include ${rel}: ${kind} is not inventoried and must not disappear silently — `
+      + 'replace it with a real file or directory, or remove it, then re-run the inventory',
+    'AUTHORITY_INVENTORY_SYMLINK',
+  );
 }
 
 function kindForPath(rel) {
