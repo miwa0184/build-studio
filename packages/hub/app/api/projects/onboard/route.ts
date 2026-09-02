@@ -10,10 +10,16 @@ const ERROR_HTTP_STATUS: Record<string, number> = {
   NAME_REQUIRED: 400,
   PORT_REQUIRED: 400,
   CONFIG_EXISTS: 409,
+  ADOPTION_MODE_INVALID: 400,
+  AUTHORITY_RULES_INVALID: 400,
+  AUTHORITY_CLASSIFICATION_MISSING: 400,
+  AUTHORITY_CLASSIFICATION_AMBIGUOUS: 409,
+  GOVERNED_SOURCE_MUTATION_REFUSED: 409,
+  GOVERNED_ARTIFACT_EXISTS: 409,
 }
 
 export async function POST(req: Request) {
-  const { name, dirPath, port, migrateAgentsMd } = await req.json()
+  const { name, dirPath, port, migrateAgentsMd, mode, authorityRules } = await req.json()
   if (!name || !dirPath) {
     return NextResponse.json({ error: 'name and dirPath required' }, { status: 400 })
   }
@@ -28,7 +34,13 @@ export async function POST(req: Request) {
   const assignedPort = port || registry.nextAvailablePort()
 
   try {
-    const result = await onboardProject(targetPath, { name, port: assignedPort, migrateAgentsMd: !!migrateAgentsMd })
+    const result = await onboardProject(targetPath, {
+      name,
+      port: assignedPort,
+      migrateAgentsMd: !!migrateAgentsMd,
+      mode,
+      authorityRules,
+    })
     registry.add(name, targetPath, assignedPort)
     return NextResponse.json({
       ok: true,
@@ -40,6 +52,7 @@ export async function POST(req: Request) {
       devCommands: result.devCommands,
       written: result.written,
       skipped: result.skipped,
+      adoptionMode: result.adoptionMode,
     })
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : String(e)

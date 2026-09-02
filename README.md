@@ -138,13 +138,15 @@ Then add your inputs to `docs/inputs/` and run the **kickoff** workflow from the
 
 ### Existing codebase — "↪ Onboard project" or `register`
 
-Bring in a project you already have — click **↪ Onboard project** on the home screen (or register it from the terminal), then run the **onboarding** workflow, which reads the existing code instead of `docs/inputs/`:
+Bring in a project you already have — click **↪ Onboard project** on the home screen (or register it from the terminal), choose the adoption mode, then run the **onboarding** workflow, which reads the existing code instead of `docs/inputs/`:
 
 ```bash
 build-studio register ~/projects/existing-project
 ```
 
-The onboarding workflow (`discovery → ceo_synthesis → architect_backfill → pm_synthesis → devops_detect → team_review → pm_revision → owner_signoff`) backfills `project-state.md`, a baseline PRD, and the docs scaffolding so the project can join the normal loop. Your sign-off gates the first commit.
+Standard onboarding (`discovery → ceo_synthesis → architect_backfill → pm_synthesis → devops_detect → team_review → pm_revision → owner_signoff`) backfills `project-state.md`, a baseline PRD, and the docs scaffolding so the project can join the normal loop.
+
+For a mature repo with founder-ratified product law, choose **Mature governed repo**. That mode inventories the complete Markdown corpus into an explicit authority map, preserves governed sources byte-identically, retires legacy task/agent/workflow files from runtime authority, and runs only `discovery → owner_signoff`. It creates no competing vision/ADR/PRD hierarchy. Owner sign-off gates the first, narrowly scoped adoption commit in both modes.
 
 > **AGENTS.md migration (opt-in):** if the repo has a populated `CLAUDE.md`, the Onboard dialog offers a checkbox to move its content into the canonical `AGENTS.md` and leave a stub `CLAUDE.md` (@-import) behind — so OpenCode and Codex read the same instructions Claude Code does. Never automatic: previewed first, and repos with both files populated are left for manual reconciliation.
 
@@ -307,9 +309,12 @@ Key fields in `.build-studio/config.yaml` (not exhaustive — presets set sensib
 | `simulator.project` | No | `ios/<Scheme>.xcodeproj` | (iOS) explicit `.xcodeproj` path when it differs from the scheme convention |
 | `simulator.destination` | No | — | (iOS) stable simulator destination/UDID for `xcodebuild` |
 | `simulator.parallel_testing` | No | `true` | (iOS) `false` = serial, number = capped worker count |
+| `onboarding.mode` | No | `single-prd-mvp` | `governed-existing` adopts an explicit existing authority map without greenfield synthesis |
+| `qa_validation.only_testing` | No | — | Exact server-run xcodebuild target/class list; takes precedence over inferred scope |
+| `qa_validation.expected_test_count` | No | — | Positive exact executable-test count; requires `only_testing` and `parallel_testing: false`; missing, extra, failed, ambiguous, or non-server results block approval without override |
 | `qa_validation.scope` | No | `full` | `new-uitests` runs only this branch's new/changed XCUITest classes |
 | `qa_validation.unit_test_target` | No | `<Scheme>Tests` | (iOS) unit-test target for scoped QA runs |
-| `qa_validation.honor_clean_approval` | No | `false` | Strict gate accepts the QA agent's certified-clean verdict |
+| `qa_validation.honor_clean_approval` | No | `true` | Strict gate accepts the QA agent's certified-clean verdict when exact server authority is not configured |
 
 Each role entry:
 ```yaml

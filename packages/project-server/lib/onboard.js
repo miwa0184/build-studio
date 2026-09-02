@@ -14,6 +14,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const yaml = require('js-yaml');
 const { execFileSync } = require('child_process');
 
@@ -21,6 +22,16 @@ const { detectPreset, globExists } = require('./detect/preset');
 const { detectDeployment } = require('./detect/deployment');
 const { detectDevCommands } = require('./detect/dev-commands');
 const { detectExistingDocs } = require('./detect/existing-docs');
+
+const STANDARD_ADOPTION_MODE = 'single-prd-mvp';
+const GOVERNED_ADOPTION_MODE = 'governed-existing';
+const VALID_ADOPTION_MODES = new Set([STANDARD_ADOPTION_MODE, GOVERNED_ADOPTION_MODE]);
+const GOVERNED_RESERVED_ARTIFACTS = Object.freeze([
+  '.build-studio/agent-instructions.md',
+  'docs/onboarding/authority-map.json',
+  'docs/onboarding/inventory.json',
+  'docs/onboarding/survey.md',
+]);
 
 // Recognizable-code markers. An entry may contain '*': an Xcode project is a
 // DIRECTORY carrying the app's name ('SudokuDaily.xcodeproj'), so an exact-
@@ -39,7 +50,11 @@ const LEARNING_CATEGORIES = ['architecture', 'backend', 'frontend', 'devops', 'q
  * preview endpoint and the full scaffold. Throws with structured `code`
  * fields the API layer maps to HTTP status codes.
  */
-function detectAll(targetPath) {
+function detectAll(targetPath, options = {}) {
+  const adoptionMode = options.mode || STANDARD_ADOPTION_MODE;
+  if (!VALID_ADOPTION_MODES.has(adoptionMode)) {
+    throw makeErr(`Unsupported onboarding mode: ${adoptionMode}`, 'ADOPTION_MODE_INVALID');
+  }
   if (!targetPath || !fs.existsSync(targetPath)) {
     throw makeErr('Target path does not exist', 'PATH_MISSING');
   }
@@ -71,17 +86,20 @@ function detectAll(targetPath) {
 
   const deployment = detectDeployment(targetPath);
   const dev = detectDevCommands(targetPath);
-  const existingDocs = detectExistingDocs(targetPath);
+  const existingDocs = detectExistingDocs(targetPath, {
+    mode: adoptionMode,
+    authorityRules: options.authorityRules || [],
+  });
 
-  return { presetResult, deployment, dev, existingDocs };
+  return { presetResult, deployment, dev, existingDocs, adoptionMode };
 }
 
 /**
  * Dry-run: returns what onboardProject would scaffold without writing anything.
  * Used by POST /api/projects/onboard/preview to populate the dialog's preview pane.
  */
-async function previewOnboard(targetPath) {
-  const { presetResult, deployment, dev, existingDocs } = detectAll(targetPath);
+async function previewOnboard(targetPath, options = {}) {
+  const { presetResult, deployment, dev, existingDocs, adoptionMode } = detectAll(targetPath, options);
   const { planAgentsMdMigration } = require('./agents-md');
   return {
     preset: presetResult.preset,
@@ -93,6 +111,11 @@ async function previewOnboard(targetPath) {
     claudeMdPresent: existingDocs.claudeMdPresent,
     agentsMdPresent: existingDocs.agentsMdPresent,
     specsDirPresent: existingDocs.specsDirPresent,
+    adoptionMode,
+    shape: adoptionMode === GOVERNED_ADOPTION_MODE
+      ? GOVERNED_ADOPTION_MODE
+      : shapeFromExistingDocs(existingDocs, presetResult.preset),
+    ...(existingDocs.authorityMap ? { authorityMap: existingDocs.authorityMap } : {}),
     // What an opt-in AGENTS.md migration would do (action/summary) — the
     // dialog shows this next to its checkbox. Never applied without consent.
     agentsMdMigration: planAgentsMdMigration(targetPath),
@@ -110,6 +133,17 @@ async function onboardProject(targetPath, options = {}) {
   if (!options.name) throw makeErr('options.name is required', 'NAME_REQUIRED');
   if (!options.port) throw makeErr('options.port is required', 'PORT_REQUIRED');
 
+  const adoptionMode = options.mode || STANDARD_ADOPTION_MODE;
+  if (!VALID_ADOPTION_MODES.has(adoptionMode)) {
+    throw makeErr(`Unsupported onboarding mode: ${adoptionMode}`, 'ADOPTION_MODE_INVALID');
+  }
+  if (adoptionMode === GOVERNED_ADOPTION_MODE && options.migrateAgentsMd) {
+    throw makeErr(
+      'governed-existing adoption preserves pre-existing agent and governance files; CLAUDE.md/AGENTS.md migration is refused',
+      'GOVERNED_SOURCE_MUTATION_REFUSED',
+    );
+  }
+
   // Refuse if already initialized — same shape as POST /api/projects/init returns.
   const existingConfig = path.join(targetPath, '.build-studio', 'config.yaml');
   if (fs.existsSync(existingConfig)) {
@@ -119,7 +153,17 @@ async function onboardProject(targetPath, options = {}) {
     );
   }
 
-  const { presetResult, deployment, dev, existingDocs } = detectAll(targetPath);
+  const { presetResult, deployment, dev, existingDocs } = detectAll(targetPath, options);
+
+  if (adoptionMode === GOVERNED_ADOPTION_MODE) {
+    const collisions = GOVERNED_RESERVED_ARTIFACTS.filter(rel => fs.existsSync(path.join(targetPath, rel)));
+    if (collisions.length) {
+      throw makeErr(
+        `Governed adoption reserved artifact already exists; refusing to overwrite: ${collisions.join(', ')}`,
+        'GOVERNED_ARTIFACT_EXISTS',
+      );
+    }
+  }
 
   const written = [];
   const skipped = [];
@@ -133,34 +177,37 @@ async function onboardProject(targetPath, options = {}) {
     preset: presetResult.preset,
     deployment,
     devCommands: dev.devCommands,
+    adoptionMode,
   });
   writeIfAbsent(path.join(configDir, 'config.yaml'), cfgYaml, written, skipped, '.build-studio/config.yaml');
 
-  // ─── 2. .claude/commands/ (per-file skip if present) ──────────────────────
   const templateDir = templateRoot();
-  const cmdSrc = path.join(templateDir, '.claude', 'commands');
-  const cmdDst = path.join(targetPath, '.claude', 'commands');
-  fs.mkdirSync(cmdDst, { recursive: true });
-  if (fs.existsSync(cmdSrc)) {
-    for (const f of fs.readdirSync(cmdSrc)) {
-      copyIfAbsent(path.join(cmdSrc, f), path.join(cmdDst, f), `.claude/commands/${f}`, written, skipped);
+  if (adoptionMode !== GOVERNED_ADOPTION_MODE) {
+    // ─── 2. .claude/commands/ (per-file skip if present) ────────────────────
+    const cmdSrc = path.join(templateDir, '.claude', 'commands');
+    const cmdDst = path.join(targetPath, '.claude', 'commands');
+    fs.mkdirSync(cmdDst, { recursive: true });
+    if (fs.existsSync(cmdSrc)) {
+      for (const f of fs.readdirSync(cmdSrc)) {
+        copyIfAbsent(path.join(cmdSrc, f), path.join(cmdDst, f), `.claude/commands/${f}`, written, skipped);
+      }
     }
-  }
 
-  // ─── 3. .claude/settings.json (only if absent) ────────────────────────────
-  const settingsSrc = path.join(templateDir, '.claude', 'settings.json');
-  if (fs.existsSync(settingsSrc)) {
-    copyIfAbsent(settingsSrc, path.join(targetPath, '.claude', 'settings.json'), '.claude/settings.json', written, skipped);
-  }
+    // ─── 3. .claude/settings.json (only if absent) ──────────────────────────
+    const settingsSrc = path.join(templateDir, '.claude', 'settings.json');
+    if (fs.existsSync(settingsSrc)) {
+      copyIfAbsent(settingsSrc, path.join(targetPath, '.claude', 'settings.json'), '.claude/settings.json', written, skipped);
+    }
 
-  // ─── 4. .claude/skills/ (only if absent — copy whole tree only when none exist) ─
-  const skillsSrc = path.join(templateDir, '.claude', 'skills');
-  const skillsDst = path.join(targetPath, '.claude', 'skills');
-  if (fs.existsSync(skillsSrc) && !fs.existsSync(skillsDst)) {
-    copyDir(skillsSrc, skillsDst);
-    written.push('.claude/skills/');
-  } else if (fs.existsSync(skillsDst)) {
-    skipped.push('.claude/skills/');
+    // ─── 4. .claude/skills/ (only if absent) ────────────────────────────────
+    const skillsSrc = path.join(templateDir, '.claude', 'skills');
+    const skillsDst = path.join(targetPath, '.claude', 'skills');
+    if (fs.existsSync(skillsSrc) && !fs.existsSync(skillsDst)) {
+      copyDir(skillsSrc, skillsDst);
+      written.push('.claude/skills/');
+    } else if (fs.existsSync(skillsDst)) {
+      skipped.push('.claude/skills/');
+    }
   }
 
   // ─── 5a. .gitignore — append runtime patterns (idempotent) ────────────────
@@ -170,25 +217,40 @@ async function onboardProject(targetPath, options = {}) {
   // because this step was missing on first onboards.
   ensureGitignorePatterns(targetPath, written, skipped);
 
-  // ─── 5. Empty workflow scaffolding (.gitkeep'd dirs) ──────────────────────
-  ensureDirWithGitkeep(path.join(targetPath, 'docs', 'prds'), 'docs/prds/.gitkeep', written);
-  copyIfAbsent(path.join(templateDir, 'docs', 'prds', 'TEMPLATE.md'),
-    path.join(targetPath, 'docs', 'prds', 'TEMPLATE.md'), 'docs/prds/TEMPLATE.md', written, skipped);
-  copyIfAbsent(path.join(templateDir, 'docs', 'asset-register.md'),
-    path.join(targetPath, 'docs', 'asset-register.md'), 'docs/asset-register.md', written, skipped);
-  {
-    const { ensureManifest } = require('./knowledge-manifest');
-    const manifestPath = path.join(targetPath, 'docs', 'knowledge.yaml');
-    const existed = fs.existsSync(manifestPath);
-    if (ensureManifest(targetPath, { name: options.name }) && !existed) written.push('docs/knowledge.yaml');
-    else if (existed) skipped.push('docs/knowledge.yaml');
-  }
-  for (const cat of LEARNING_CATEGORIES) {
-    ensureDirWithGitkeep(
-      path.join(targetPath, 'docs', 'learnings', cat),
-      `docs/learnings/${cat}/.gitkeep`,
-      written
+  // ─── 5. Workflow scaffolding ──────────────────────────────────────────────
+  // Governed adoption deliberately does not install a second PRD/ADR/project-
+  // state hierarchy. Build Studio owns execution; the existing corpus keeps
+  // product authority. Standard onboarding keeps its historical scaffold.
+  let agentInstructionText = null;
+  if (adoptionMode === GOVERNED_ADOPTION_MODE) {
+    agentInstructionText = renderGovernedAgentInstructions();
+    writeIfAbsent(
+      path.join(configDir, 'agent-instructions.md'),
+      agentInstructionText,
+      written,
+      skipped,
+      '.build-studio/agent-instructions.md',
     );
+  } else {
+    ensureDirWithGitkeep(path.join(targetPath, 'docs', 'prds'), 'docs/prds/.gitkeep', written);
+    copyIfAbsent(path.join(templateDir, 'docs', 'prds', 'TEMPLATE.md'),
+      path.join(targetPath, 'docs', 'prds', 'TEMPLATE.md'), 'docs/prds/TEMPLATE.md', written, skipped);
+    copyIfAbsent(path.join(templateDir, 'docs', 'asset-register.md'),
+      path.join(targetPath, 'docs', 'asset-register.md'), 'docs/asset-register.md', written, skipped);
+    {
+      const { ensureManifest } = require('./knowledge-manifest');
+      const manifestPath = path.join(targetPath, 'docs', 'knowledge.yaml');
+      const existed = fs.existsSync(manifestPath);
+      if (ensureManifest(targetPath, { name: options.name }) && !existed) written.push('docs/knowledge.yaml');
+      else if (existed) skipped.push('docs/knowledge.yaml');
+    }
+    for (const cat of LEARNING_CATEGORIES) {
+      ensureDirWithGitkeep(
+        path.join(targetPath, 'docs', 'learnings', cat),
+        `docs/learnings/${cat}/.gitkeep`,
+        written
+      );
+    }
   }
   fs.mkdirSync(path.join(targetPath, 'tmp'), { recursive: true });
 
@@ -210,6 +272,14 @@ async function onboardProject(targetPath, options = {}) {
   }
 
   // ─── 6. docs/onboarding/inventory.json (consumed by the discovery agent) ──
+  let authorityMapText = null;
+  if (adoptionMode === GOVERNED_ADOPTION_MODE) {
+    authorityMapText = JSON.stringify(existingDocs.authorityMap, null, 2) + '\n';
+    fs.mkdirSync(path.join(targetPath, 'docs', 'onboarding'), { recursive: true });
+    fs.writeFileSync(path.join(targetPath, 'docs', 'onboarding', 'authority-map.json'), authorityMapText);
+    written.push('docs/onboarding/authority-map.json');
+  }
+
   const inventory = {
     detectedAt: new Date().toISOString(),
     preset: presetResult.preset,
@@ -223,7 +293,16 @@ async function onboardProject(targetPath, options = {}) {
     specsDirPresent: existingDocs.specsDirPresent,
     counts: existingDocs.counts,
     git: gitInventory(targetPath),
-    shape: shapeFromExistingDocs(existingDocs, presetResult.preset),
+    shape: adoptionMode === GOVERNED_ADOPTION_MODE
+      ? GOVERNED_ADOPTION_MODE
+      : shapeFromExistingDocs(existingDocs, presetResult.preset),
+    ...(adoptionMode === GOVERNED_ADOPTION_MODE ? {
+      adoptionMode,
+      authorityMapPath: 'docs/onboarding/authority-map.json',
+      authorityMapSha256: crypto.createHash('sha256').update(authorityMapText).digest('hex'),
+      agentInstructionPath: '.build-studio/agent-instructions.md',
+      agentInstructionSha256: crypto.createHash('sha256').update(agentInstructionText).digest('hex'),
+    } : {}),
   };
   fs.mkdirSync(path.join(targetPath, 'docs', 'onboarding'), { recursive: true });
   fs.writeFileSync(
@@ -247,6 +326,8 @@ async function onboardProject(targetPath, options = {}) {
     deployment,
     devCommands: dev.devCommands,
     inventory,
+    adoptionMode,
+    ...(existingDocs.authorityMap ? { authorityMap: existingDocs.authorityMap } : {}),
     written,
     skipped,
   };
@@ -399,7 +480,7 @@ function ensureGitignorePatterns(targetPath, written, skipped) {
  * `deployedOnPush` choice. Avoid relying on js-yaml comment support (it has none) —
  * concatenate template strings instead.
  */
-function renderConfigYaml({ name, port, preset, deployment, devCommands }) {
+function renderConfigYaml({ name, port, preset, deployment, devCommands, adoptionMode }) {
   const lines = [];
   lines.push(`name: ${name}`);
   lines.push(`port: ${port}`);
@@ -407,6 +488,14 @@ function renderConfigYaml({ name, port, preset, deployment, devCommands }) {
   lines.push('');
   lines.push(`preset: ${preset}`);
   lines.push('');
+
+  if (adoptionMode === GOVERNED_ADOPTION_MODE) {
+    lines.push('onboarding:');
+    lines.push('  mode: governed-existing');
+    lines.push('  authority_map: docs/onboarding/authority-map.json');
+    lines.push('  agent_instruction: .build-studio/agent-instructions.md');
+    lines.push('');
+  }
 
   // Deployment block — always written, even when partial.
   lines.push('deployment:');
@@ -437,6 +526,22 @@ function renderConfigYaml({ name, port, preset, deployment, devCommands }) {
   }
 
   return lines.join('\n');
+}
+
+function renderGovernedAgentInstructions() {
+  return `# Build Studio governed-existing adoption
+
+Build Studio owns the execution pipeline, roles, run-state, QA, acceptance, and egress.
+
+For product decisions, use only files allowlisted as \`product_authority\` in
+\`docs/onboarding/authority-map.json\`. Files classified as \`product_context\`
+may inform background but cannot override that allowlist. Files classified as
+\`legacy_execution_governance\` are retired from runtime authority and must not
+control Build Studio roles, workflow, state, QA, acceptance, or egress.
+
+Do not rewrite founder-ratified product authority during adoption. Do not create
+a competing vision, ADR, PRD, project-state, or task-packet hierarchy.
+`;
 }
 
 function quoteIfNeeded(s) {

@@ -5,10 +5,14 @@ const ERROR_HTTP_STATUS: Record<string, number> = {
   NOT_GIT_REPO: 400,
   NO_CODE: 400,
   MONOREPO_NOT_SUPPORTED: 400,
+  ADOPTION_MODE_INVALID: 400,
+  AUTHORITY_RULES_INVALID: 400,
+  AUTHORITY_CLASSIFICATION_MISSING: 400,
+  AUTHORITY_CLASSIFICATION_AMBIGUOUS: 409,
 }
 
 export async function POST(req: Request) {
-  const { dirPath } = await req.json()
+  const { dirPath, mode, authorityRules } = await req.json()
   if (!dirPath) {
     return NextResponse.json({ error: 'dirPath required' }, { status: 400 })
   }
@@ -20,7 +24,7 @@ export async function POST(req: Request) {
   const { previewOnboard } = require(/* turbopackIgnore: true */ '@build-studio/project-server/lib/onboard')
 
   try {
-    const preview = await previewOnboard(targetPath)
+    const preview = await previewOnboard(targetPath, { mode, authorityRules })
     return NextResponse.json({ ok: true, preview })
   } catch (e: unknown) {
     const message = e instanceof Error ? e.message : String(e)

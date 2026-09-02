@@ -10,7 +10,18 @@ interface DeploymentDetect {
   autoDeployHint: string | null
   deployedOnPush: boolean
 }
-interface DocEntry { path: string; kind: string; bytes: number }
+type AdoptionMode = 'single-prd-mvp' | 'governed-existing'
+interface DocEntry {
+  path: string
+  kind: string
+  bytes: number
+  authorityClass?: string
+  disposition?: string
+}
+interface AuthorityMap {
+  entries: { source: string; class: string; disposition: string; reason: string }[]
+  productAuthorityAllowlist: string[]
+}
 
 interface PreviewResult {
   preset: string
@@ -23,6 +34,9 @@ interface PreviewResult {
   agentsMdPresent: boolean
   specsDirPresent: boolean
   agentsMdMigration?: { action: 'scaffold' | 'migrate' | 'stub-only' | 'none'; summary: string }
+  adoptionMode: AdoptionMode
+  shape: string
+  authorityMap?: AuthorityMap
 }
 
 type Step = 'input' | 'preview' | 'submitting'
@@ -34,6 +48,7 @@ export function OnboardProjectDialog({ onClose }: { onClose: () => void }) {
   const [step, setStep] = useState<Step>('input')
   const [preview, setPreview] = useState<PreviewResult | null>(null)
   const [migrateAgentsMd, setMigrateAgentsMd] = useState(false)
+  const [mode, setMode] = useState<AdoptionMode>('single-prd-mvp')
   const [error, setError] = useState('')
 
   async function handlePreview(e: React.FormEvent) {
@@ -43,7 +58,7 @@ export function OnboardProjectDialog({ onClose }: { onClose: () => void }) {
     const res = await fetch('/api/projects/onboard/preview', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ dirPath: dirPath.trim() }),
+      body: JSON.stringify({ dirPath: dirPath.trim(), mode }),
     })
     const data = await res.json()
     if (!res.ok) { setError(data.error || 'Preview failed'); return }
@@ -57,7 +72,7 @@ export function OnboardProjectDialog({ onClose }: { onClose: () => void }) {
     const res = await fetch('/api/projects/onboard', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: name.trim(), dirPath: dirPath.trim(), migrateAgentsMd }),
+      body: JSON.stringify({ name: name.trim(), dirPath: dirPath.trim(), migrateAgentsMd, mode }),
     })
     const data = await res.json()
     if (!res.ok) { setError(data.error || 'Onboard failed'); setStep('preview'); return }
@@ -106,6 +121,33 @@ export function OnboardProjectDialog({ onClose }: { onClose: () => void }) {
           <form onSubmit={handlePreview} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
             <FormField label="Name" placeholder="my-existing-project" value={name} onChange={setName} autoFocus />
             <FormField label="Directory" placeholder="~/projects/my-project" value={dirPath} onChange={setDirPath} />
+            <label>
+              <span style={{
+                display: 'block', fontFamily: 'var(--mono)', fontSize: 10, color: 'var(--muted)',
+                marginBottom: 6, textTransform: 'uppercase', letterSpacing: '0.06em',
+              }}>Adoption mode</span>
+              <select
+                value={mode}
+                onChange={e => {
+                  const next = e.target.value as AdoptionMode
+                  setMode(next)
+                  if (next === 'governed-existing') setMigrateAgentsMd(false)
+                }}
+                style={{
+                  width: '100%', padding: '8px 12px', borderRadius: 'var(--radius)',
+                  background: 'var(--bg)', border: '1px solid var(--border-subtle)',
+                  color: 'var(--text)', fontFamily: 'var(--mono)', fontSize: 12,
+                }}
+              >
+                <option value="single-prd-mvp">Standard existing project — synthesize Build Studio docs</option>
+                <option value="governed-existing">Mature governed repo — adopt existing product authority</option>
+              </select>
+              <span style={{ display: 'block', marginTop: 4, fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--muted)', lineHeight: 1.45 }}>
+                {mode === 'governed-existing'
+                  ? 'Preserves product law byte-identically, retires legacy execution governance, and creates no competing PRD/ADR hierarchy.'
+                  : 'Keeps the existing single-PRD onboarding workflow and its synthesized vision, ADR, and project-state artifacts.'}
+              </span>
+            </label>
             {error && <ErrorLine>{error}</ErrorLine>}
             <ButtonRow>
               <SecondaryButton onClick={onClose}>Cancel</SecondaryButton>
@@ -116,6 +158,7 @@ export function OnboardProjectDialog({ onClose }: { onClose: () => void }) {
 
         {step === 'preview' && preview && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <PreviewSection label="Adoption mode" value={preview.adoptionMode} hint={`Detected shape: ${preview.shape}`} />
             <PreviewSection label="Preset" value={preview.preset} hint={preview.presetReason} />
             <PreviewSection
               label="Deployment"
@@ -153,7 +196,26 @@ export function OnboardProjectDialog({ onClose }: { onClose: () => void }) {
                 {summariseDocs(preview)}
               </div>
             </div>
-            {preview.agentsMdMigration && preview.agentsMdMigration.action !== 'none' && (
+            {preview.authorityMap && (
+              <div>
+                <PreviewLabel>Authority map ({preview.authorityMap.entries.length})</PreviewLabel>
+                <div style={{
+                  background: 'var(--bg)', border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius)',
+                  padding: '8px 10px', maxHeight: 180, overflow: 'auto', fontFamily: 'var(--mono)', fontSize: 9,
+                }}>
+                  {preview.authorityMap.entries.map(entry => (
+                    <div key={entry.source} style={{ padding: '2px 0', color: 'var(--text-dim)' }}>
+                      <span style={{ color: entry.class === 'product_authority' ? 'var(--accent)' : 'var(--muted)' }}>{entry.class}</span>
+                      {' · '}{entry.source}<span style={{ color: 'var(--muted)' }}> — {entry.disposition}</span>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ marginTop: 4, fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--muted)' }}>
+                  Review this map before confirming. Owner signoff shows it again and can stop before the first commit.
+                </div>
+              </div>
+            )}
+            {preview.adoptionMode !== 'governed-existing' && preview.agentsMdMigration && preview.agentsMdMigration.action !== 'none' && (
               <label style={{
                 display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer',
                 background: 'var(--bg)', border: '1px solid var(--border-subtle)',
@@ -175,7 +237,7 @@ export function OnboardProjectDialog({ onClose }: { onClose: () => void }) {
                 </span>
               </label>
             )}
-            {preview.agentsMdMigration && preview.agentsMdMigration.action === 'none' && preview.agentsMdMigration.summary.startsWith('BOTH') && (
+            {preview.adoptionMode !== 'governed-existing' && preview.agentsMdMigration && preview.agentsMdMigration.action === 'none' && preview.agentsMdMigration.summary.startsWith('BOTH') && (
               <div style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--orange)', lineHeight: 1.5 }}>
                 ⚠ {preview.agentsMdMigration.summary}
               </div>
@@ -200,7 +262,7 @@ export function OnboardProjectDialog({ onClose }: { onClose: () => void }) {
 
 function summariseDocs(p: PreviewResult): React.ReactNode {
   const tags: string[] = []
-  for (const d of p.existingDocs) tags.push(`${d.kind}:${d.path}`)
+  for (const d of p.existingDocs) tags.push(`${d.authorityClass || d.kind}:${d.path}`)
   if (p.existingDocCounts.existingPrds > 0) tags.push(`+${p.existingDocCounts.existingPrds} PRDs`)
   if (p.existingDocCounts.existingAdrs > 0) tags.push(`+${p.existingDocCounts.existingAdrs} ADRs`)
   if (tags.length === 0) return <span>(none)</span>

@@ -28,6 +28,11 @@ test('it finds the command and skill names a prompt refers to', () => {
   assert.deepEqual(skills, ['qa-browser-testing']);
 });
 
+test('it resolves explicit command-file references used by orchestrator prompts', () => {
+  const { commands } = referencedNames('Read .claude/commands/qa.md and .claude/commands/ios_dev.md.');
+  assert.deepEqual(commands, ['qa', 'ios_dev']);
+});
+
 test('path segments are not mistaken for command references', () => {
   // The common false positive, and an expensive one: `docs/qa/QA-105.md` would
   // otherwise inline the whole QA role into a prompt that never asked for it.
@@ -45,6 +50,14 @@ test('a reference resolves only when the file actually exists', () => {
 
 test('claude gets nothing appended — it loads .claude itself', () => {
   assert.equal(inlineReferencedDefinitions(QA_PROMPT, { cli: 'claude', roots: [ROOT], fs: fakeFs }), '');
+});
+
+test('governed mode can force bundled definitions into Claude instead of trusting project-local legacy', () => {
+  const out = inlineReferencedDefinitions(QA_PROMPT, {
+    cli: 'claude', roots: [ROOT], fs: fakeFs, force: true,
+  });
+  assert.match(out, /### \/qa \(command\)/);
+  assert.match(out, /definitive version/i);
 });
 
 test('codex gets the full text of everything its prompt names', () => {

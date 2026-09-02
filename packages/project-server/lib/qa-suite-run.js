@@ -124,24 +124,143 @@ function parseTestCounts(text) {
   let executed = 0;
   let failures = 0;
   let sawSummary = false;
-  const summaryRe = /Executed (\d+) tests?, with (\d+) failure/g;
+  const summaryCounts = [];
+  const summaryRe = /Executed (\d+) tests?, with (\d+) failures?/g;
   let m;
   while ((m = summaryRe.exec(s)) !== null) {
     sawSummary = true;
-    executed += parseInt(m[1], 10);
-    failures += parseInt(m[2], 10);
+    const summary = { executed: parseInt(m[1], 10), failures: parseInt(m[2], 10) };
+    summaryCounts.push(summary);
+    executed += summary.executed;
+    failures += summary.failures;
   }
   const casesPassed = (s.match(/^Test Case .*' passed \(/gm) || []).length;
   const casesFailed = (s.match(/^Test Case .*' failed \(/gm) || []).length;
-  const succeeded = /\*\* TEST SUCCEEDED \*\*/.test(s)
+  const successBannerCount = (s.match(/\*\* TEST SUCCEEDED \*\*/g) || []).length;
+  const failureBannerCount = (s.match(/\*\* TEST (?:FAILED|BUILD FAILED) \*\*/g) || []).length;
+  const succeeded = successBannerCount > 0 && failureBannerCount === 0
     ? true
-    : (/\*\* TEST (FAILED|BUILD FAILED) \*\*/.test(s) ? false : null);
+    : (failureBannerCount > 0 && successBannerCount === 0 ? false : null);
   return {
     executed: sawSummary ? executed : null,
     failures: sawSummary ? failures : null,
+    summaryCounts,
     casesPassed,
     casesFailed,
+    caseTallyComplete: true,
+    successBannerCount,
+    failureBannerCount,
     succeeded,
+  };
+}
+
+/**
+ * Evaluate the immutable server-side authority for an exact-count QA run.
+ *
+ * The agent still explains failures and inspects visual evidence, but it never
+ * decides whether the configured executable test inventory actually ran. Once
+ * `expected_test_count` is present, only a completed xcodebuild process with a
+ * coherent native count, one success verdict, exit 0 and exactly that count can
+ * pass. Missing or contradictory evidence is a block, not an invitation to
+ * infer a result from prose.
+ */
+function evaluateSuiteAuthority(run, expectedTestCount) {
+  if (expectedTestCount === undefined || expectedTestCount === null) {
+    return { configured: false, blocked: false, code: 'QA_EXACT_COUNT_NOT_CONFIGURED' };
+  }
+  const base = { configured: true, expectedTestCount };
+  const block = (code, reason, actualTestCount = null) => ({
+    ...base, blocked: true, code, reason, actualTestCount,
+  });
+
+  if (!Number.isInteger(expectedTestCount) || expectedTestCount <= 0) {
+    return block('QA_EXPECTED_TEST_COUNT_INVALID', 'expected_test_count is not a positive integer');
+  }
+  if (!run || run.status !== 'completed') {
+    const status = (run && run.status) || 'missing';
+    const code = status === 'unavailable' ? 'QA_SERVER_SUITE_UNAVAILABLE'
+      : status === 'timeout' ? 'QA_SERVER_SUITE_TIMEOUT'
+        : 'QA_SUITE_INCOMPLETE';
+    return block(code, `server suite did not complete (status: ${status}${run && run.error ? `; ${run.error}` : ''})`);
+  }
+
+  const counts = run.counts || {};
+  const successBanners = Number.isInteger(counts.successBannerCount)
+    ? counts.successBannerCount
+    : (counts.succeeded === true ? 1 : 0);
+  const failureBanners = Number.isInteger(counts.failureBannerCount)
+    ? counts.failureBannerCount
+    : (counts.succeeded === false ? 1 : 0);
+  if (successBanners > 1 || failureBanners > 1 || (successBanners > 0 && failureBanners > 0)) {
+    return block('QA_TEST_VERDICT_AMBIGUOUS', 'xcodebuild emitted duplicate or contradictory TEST SUCCEEDED/FAILED banners');
+  }
+
+  const summaries = Array.isArray(counts.summaryCounts) ? counts.summaryCounts : [];
+  const validSummaries = summaries.filter((item) => item
+    && Number.isInteger(item.executed) && item.executed >= 0
+    && Number.isInteger(item.failures) && item.failures >= 0);
+  const caseTotal = Number.isInteger(counts.casesPassed) && Number.isInteger(counts.casesFailed)
+    ? counts.casesPassed + counts.casesFailed
+    : 0;
+  let actualTestCount = null;
+  let actualFailures = null;
+
+  if (caseTotal > 0) {
+    actualTestCount = caseTotal;
+    actualFailures = counts.casesFailed;
+    const coherentSummary = validSummaries.some((item) => (
+      item.executed === actualTestCount && item.failures === actualFailures
+    ));
+    if (!coherentSummary) {
+      return block(
+        validSummaries.length === 0 ? 'QA_TEST_COUNT_MISSING' : 'QA_TEST_COUNT_INCONSISTENT',
+        validSummaries.length === 0
+          ? `parsed ${actualTestCount} test-case results but no native Executed summary`
+          : `test-case tally parsed ${actualTestCount} tests with ${actualFailures} failures, but no native summary agrees`,
+        actualTestCount,
+      );
+    }
+  } else {
+    const unique = new Map(validSummaries.map((item) => [`${item.executed}:${item.failures}`, item]));
+    if (unique.size === 0) {
+      return block('QA_TEST_COUNT_MISSING', 'no native Executed test-count summary was parsed');
+    }
+    if (unique.size > 1) {
+      return block('QA_TEST_COUNT_AMBIGUOUS', 'multiple different native Executed summaries were parsed and no per-case tally disambiguates them');
+    }
+    const only = [...unique.values()][0];
+    actualTestCount = only.executed;
+    actualFailures = only.failures;
+  }
+
+  if (successBanners !== 1 || failureBanners !== 0 || counts.succeeded !== true) {
+    return block(
+      failureBanners > 0 || counts.succeeded === false ? 'QA_TESTS_FAILED' : 'QA_TEST_VERDICT_MISSING',
+      failureBanners > 0 || counts.succeeded === false
+        ? 'xcodebuild reported TEST FAILED'
+        : 'xcodebuild did not emit exactly one uncontradicted TEST SUCCEEDED banner',
+      actualTestCount,
+    );
+  }
+  if (run.exitCode !== 0) {
+    return block('QA_XCODEBUILD_EXIT_NONZERO', `xcodebuild exited ${run.exitCode}`, actualTestCount);
+  }
+  if (actualFailures !== 0) {
+    return block('QA_TESTS_FAILED', `parsed ${actualFailures} failing tests`, actualTestCount);
+  }
+  if (actualTestCount !== expectedTestCount) {
+    return block(
+      'QA_EXPECTED_TEST_COUNT_MISMATCH',
+      `expected ${expectedTestCount} executable tests but parsed ${actualTestCount}`,
+      actualTestCount,
+    );
+  }
+  return {
+    ...base,
+    blocked: false,
+    code: 'QA_EXACT_COUNT_VERIFIED',
+    reason: `expected ${expectedTestCount} executable tests and parsed exactly ${actualTestCount}; zero failures; TEST SUCCEEDED; exit 0`,
+    actualTestCount,
   };
 }
 
@@ -299,17 +418,28 @@ function startSuiteRun({ cwd, args, logPath, timeoutMs, env, onProgress }) {
   // 15s to answer "how far along is it" would just move the waste from tokens
   // to disk.
   let tail = '';
+  const caseLineBuffers = { stdout: '', stderr: '' };
   let casesPassed = 0;
   let casesFailed = 0;
-  const absorb = (buf) => {
+  const countCaseLines = (text) => {
+    casesPassed += (text.match(/^Test Case .*' passed \(/gm) || []).length;
+    casesFailed += (text.match(/^Test Case .*' failed \(/gm) || []).length;
+  };
+  const absorb = (source, buf) => {
     const chunk = buf.toString('utf8');
     out.write(chunk);
-    casesPassed += (chunk.match(/Test Case .*' passed \(/g) || []).length;
-    casesFailed += (chunk.match(/Test Case .*' failed \(/g) || []).length;
+    const combined = caseLineBuffers[source] + chunk;
+    const lastNewline = combined.lastIndexOf('\n');
+    if (lastNewline >= 0) {
+      countCaseLines(combined.slice(0, lastNewline + 1));
+      caseLineBuffers[source] = combined.slice(lastNewline + 1);
+    } else {
+      caseLineBuffers[source] = combined;
+    }
     tail = (tail + chunk).slice(-200000); // enough for the summary + failures
   };
-  child.stdout.on('data', absorb);
-  child.stderr.on('data', absorb);
+  child.stdout.on('data', (buf) => absorb('stdout', buf));
+  child.stderr.on('data', (buf) => absorb('stderr', buf));
 
   const progressTimer = onProgress && setInterval(() => {
     try {
@@ -339,6 +469,10 @@ function startSuiteRun({ cwd, args, logPath, timeoutMs, env, onProgress }) {
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (killTimer) clearTimeout(killTimer);
       if (child.pid) activeRuns.delete(child.pid);
+      countCaseLines(caseLineBuffers.stdout);
+      countCaseLines(caseLineBuffers.stderr);
+      caseLineBuffers.stdout = '';
+      caseLineBuffers.stderr = '';
       const counts = parseTestCounts(tail);
       const result = {
         status: timedOut ? 'timeout' : 'completed',
@@ -346,7 +480,7 @@ function startSuiteRun({ cwd, args, logPath, timeoutMs, env, onProgress }) {
         signal: signal || null,
         durationMs: Date.now() - startedAt,
         logPath,
-        counts: { ...counts, casesPassed, casesFailed },
+        counts: { ...counts, casesPassed, casesFailed, caseTallyComplete: true },
         failureExcerpt: failureExcerpt(tail),
       };
       // The log is the artifact the agent is pointed at, and `** TEST FAILED **`
@@ -385,14 +519,32 @@ function resolveTimeoutMs(qaConfig) {
  * at all in the common case.
  */
 function formatSuiteSection(run) {
-  const lines = ['\n\n## THE TEST SUITE HAS ALREADY BEEN RUN — DO NOT RUN IT AGAIN'];
+  const exactUnavailable = run.status === 'unavailable' && run.authority && run.authority.configured;
+  const lines = [exactUnavailable
+    ? '\n\n## THE SERVER QA SUITE DID NOT COMPLETE — DO NOT SUBSTITUTE AN AGENT RUN'
+    : '\n\n## THE TEST SUITE HAS ALREADY BEEN RUN — DO NOT RUN IT AGAIN'];
+
+  if (run.authority && run.authority.configured) {
+    const authority = run.authority;
+    lines.push(
+      '',
+      `## SERVER-AUTHORITATIVE QA VERDICT: ${authority.blocked ? 'BLOCKED' : 'PASS'}`,
+      '',
+      `Authority code: \`${authority.code}\`.`,
+      `Reason: ${authority.reason || 'No reason recorded.'}`,
+      '',
+      '**This verdict is immutable for this run. The QA agent cannot override it, and neither can an operator override.**',
+    );
+  }
 
   if (run.status === 'unavailable') {
     lines.push(
       '',
       `The workflow tried to run the suite for you and could not: ${run.error}`,
       '',
-      'Run it yourself using the iOS guidance below, and report the result as usual.',
+      run.authority && run.authority.configured
+        ? 'Do not substitute an agent-run suite for this server-authoritative run. Report the blocked authority and stop.'
+        : 'Run it yourself using the iOS guidance below, and report the result as usual.',
     );
     return lines.join('\n');
   }
@@ -438,11 +590,10 @@ function formatSuiteSection(run) {
     lines.push('', '### Failure lines from the log', '', '```', run.failureExcerpt.slice(0, 6000), '```');
   }
 
-  lines.push(
-    '',
-    'Use these counts in your report — they satisfy the approval gate. Open the log only for detail you actually need',
-    '(a specific failure, a stack trace). Re-running the suite duplicates 20-40 minutes of work and is never required.',
-  );
+  lines.push('', run.authority && run.authority.configured && run.authority.blocked
+    ? 'Use these counts in your report as the reason the server-authoritative gate is blocked. Open the log only for failure detail you actually need.'
+    : 'Use these counts in your report — they satisfy the approval gate. Open the log only for detail you actually need');
+  lines.push('(a specific failure, a stack trace). Re-running the suite duplicates 20-40 minutes of work and is never required.');
   return lines.join('\n');
 }
 
@@ -454,6 +605,7 @@ module.exports = {
   buildXcodebuildArgs,
   displayCommand,
   parseTestCounts,
+  evaluateSuiteAuthority,
   failureExcerpt,
   isPidAlive,
   killGroup,

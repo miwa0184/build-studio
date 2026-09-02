@@ -26,6 +26,24 @@ function clean(root) {
   try { fs.rmSync(root, { recursive: true, force: true }); } catch {}
 }
 
+const GOVERNED_FIXTURE = path.resolve(__dirname, '..', 'test', 'fixtures', 'governed-existing-mobile');
+
+function makeGovernedRepo(extraFiles = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'governed-onboard-test-'));
+  fs.cpSync(GOVERNED_FIXTURE, root, { recursive: true });
+  for (const [rel, content] of Object.entries(extraFiles)) {
+    const abs = path.join(root, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, content);
+  }
+  execFileSync('git', ['init'], { cwd: root, stdio: 'ignore' });
+  return root;
+}
+
+function fileBytes(root, rels) {
+  return Object.fromEntries(rels.map(rel => [rel, fs.readFileSync(path.join(root, rel))]));
+}
+
 const EXAMPLE_APP_SHAPE = {
   'package.json': JSON.stringify({
     name: 'fixture',
@@ -91,6 +109,144 @@ test('previewOnboard: accepts an Xcode/XcodeGen app and reaches preset detection
   try {
     const preview = await previewOnboard(root);
     assert.equal(preview.preset, 'mobile-app');
+  } finally { clean(root); }
+});
+
+// ─── Mature governed-existing adoption ─────────────────────────────────────
+
+const GOVERNED_PRODUCT_AUTHORITY = [
+  'BASELINE_LOCK.md',
+  'CURRENT_STATE.md',
+  'FOUNDER_DECISION_REGISTER.md',
+  'PRODUCT_CONTROL.md',
+  'PRODUCT_NORTH_STAR.md',
+  'SPEC-001-CORE.md',
+  'SPEC-002-REWARD.md',
+];
+
+test('previewOnboard: governed-existing inventories the whole flat mature corpus and routes mobile-app', async () => {
+  const root = makeGovernedRepo();
+  try {
+    const preview = await previewOnboard(root, { mode: 'governed-existing' });
+    assert.equal(preview.preset, 'mobile-app');
+    assert.equal(preview.adoptionMode, 'governed-existing');
+    const paths = preview.existingDocs.map(d => d.path).sort();
+    for (const rel of [
+      'README.md', 'PRODUCT_CONTROL.md', 'CURRENT_STATE.md', 'BASELINE_LOCK.md',
+      'PRODUCT_NORTH_STAR.md', 'FOUNDER_DECISION_REGISTER.md', 'BACKLOG.md',
+      'ROADMAP.md', 'SPEC-001-CORE.md', 'SPEC-002-REWARD.md',
+      'TASK_PACKET_ARCHIVE.md', 'AGENT_ROUTING_LEGACY.md',
+      'WORKFLOW_STATE_ARCHIVE.md', '.claude/commands/legacy-builder.md',
+      'generated/API_REFERENCE.md',
+    ]) assert.ok(paths.includes(rel), `inventory omitted ${rel}`);
+    assert.equal(preview.shape, 'governed-existing');
+  } finally { clean(root); }
+});
+
+test('onboardProject: governed-existing writes an explicit authority map and retires legacy execution governance', async () => {
+  const root = makeGovernedRepo();
+  try {
+    const result = await onboardProject(root, {
+      name: 'atlas-mobile', port: 3097, mode: 'governed-existing',
+    });
+    const mapPath = path.join(root, 'docs', 'onboarding', 'authority-map.json');
+    const map = JSON.parse(fs.readFileSync(mapPath, 'utf8'));
+    assert.equal(map.mode, 'governed-existing');
+    assert.ok(Array.isArray(map.rules) && map.rules.every(rule => Number.isInteger(rule.priority)));
+    assert.deepEqual(map.productAuthorityAllowlist.slice().sort(), GOVERNED_PRODUCT_AUTHORITY);
+    for (const entry of map.entries) {
+      assert.ok(entry.source && entry.class && entry.disposition && entry.reason, JSON.stringify(entry));
+      assert.ok(entry.matchedRule, `missing explicit rule provenance for ${entry.source}`);
+      assert.match(entry.sha256, /^[a-f0-9]{64}$/);
+    }
+    for (const rel of [
+      'TASK_PACKET_ARCHIVE.md', 'AGENT_ROUTING_LEGACY.md', 'WORKFLOW_STATE_ARCHIVE.md',
+      '.claude/commands/legacy-builder.md',
+    ]) {
+      const entry = map.entries.find(item => item.source === rel);
+      assert.equal(entry.class, 'legacy_execution_governance');
+      assert.equal(entry.disposition, 'retired-from-build-studio-runtime-authority');
+    }
+    assert.equal(map.entries.find(item => item.source === 'generated/API_REFERENCE.md').class, 'ignored/generated/runtime');
+    assert.equal(result.authorityMap.entries.length, map.entries.length);
+  } finally { clean(root); }
+});
+
+test('onboardProject: governed-existing preserves product law byte-identically and creates no competing hierarchy', async () => {
+  const root = makeGovernedRepo();
+  const before = fileBytes(root, GOVERNED_PRODUCT_AUTHORITY);
+  const legacyCommand = '.claude/commands/legacy-builder.md';
+  const legacyCommandBefore = fs.readFileSync(path.join(root, legacyCommand));
+  try {
+    await onboardProject(root, { name: 'atlas-mobile', port: 3097, mode: 'governed-existing' });
+    for (const rel of GOVERNED_PRODUCT_AUTHORITY) {
+      assert.deepEqual(fs.readFileSync(path.join(root, rel)), before[rel], `${rel} changed`);
+    }
+    assert.deepEqual(
+      fs.readFileSync(path.join(root, legacyCommand)),
+      legacyCommandBefore,
+      'legacy execution history must be preserved byte-identically even though it is retired from runtime authority',
+    );
+    for (const rel of [
+      'docs/vision.md', 'docs/project-state.md', 'docs/adrs', 'docs/prds',
+      'docs/backlog', 'docs/asset-register.md', 'docs/knowledge.yaml', '.claude/skills',
+    ]) assert.equal(fs.existsSync(path.join(root, rel)), false, `governed adoption created ${rel}`);
+    const cfg = yaml.load(fs.readFileSync(path.join(root, '.build-studio', 'config.yaml'), 'utf8'));
+    assert.equal(cfg.onboarding.mode, 'governed-existing');
+    assert.equal(cfg.onboarding.authority_map, 'docs/onboarding/authority-map.json');
+    const agentInstruction = fs.readFileSync(path.join(root, '.build-studio', 'agent-instructions.md'), 'utf8');
+    assert.match(agentInstruction, /Build Studio owns.*pipeline.*roles.*run-state.*QA.*acceptance.*egress/is);
+    assert.match(agentInstruction, /product_authority/);
+    assert.match(agentInstruction, /legacy_execution_governance.*retired/is);
+  } finally { clean(root); }
+});
+
+test('governed-existing classification is configurable and rejects ambiguous equal-priority authority', async () => {
+  const root = makeGovernedRepo({ 'CANON.md': '# Canon\nA deliberately non-standard product-law filename.\n' });
+  try {
+    const customRule = {
+      id: 'owner-configured-canon', priority: 15, class: 'product_authority',
+      patterns: ['**/CANON.md'], disposition: 'preserve-byte-identical-product-authority',
+      reason: 'Owner configured this corpus as product law.',
+    };
+    const preview = await previewOnboard(root, { mode: 'governed-existing', authorityRules: [customRule] });
+    assert.equal(preview.authorityMap.entries.find(entry => entry.source === 'CANON.md').class, 'product_authority');
+
+    await assert.rejects(
+      previewOnboard(root, {
+        mode: 'governed-existing',
+        authorityRules: [
+          customRule,
+          { ...customRule, id: 'conflicting-canon', class: 'product_context' },
+        ],
+      }),
+      (error) => error.code === 'AUTHORITY_CLASSIFICATION_AMBIGUOUS' && /CANON\.md/.test(error.message),
+    );
+  } finally { clean(root); }
+});
+
+test('governed-existing refuses the opt-in CLAUDE/AGENTS migration because source governance is immutable', async () => {
+  const root = makeGovernedRepo({ 'CLAUDE.md': '# Legacy execution instructions\n' });
+  try {
+    await assert.rejects(
+      onboardProject(root, { name: 'atlas-mobile', port: 3097, mode: 'governed-existing', migrateAgentsMd: true }),
+      (error) => error.code === 'GOVERNED_SOURCE_MUTATION_REFUSED',
+    );
+  } finally { clean(root); }
+});
+
+test('governed-existing refuses reserved artifact collisions without overwriting source files', async () => {
+  const existing = '{"owner":"existing"}\n';
+  const root = makeGovernedRepo({ 'docs/onboarding/authority-map.json': existing });
+  try {
+    await assert.rejects(
+      onboardProject(root, {
+        name: 'atlas-mobile', port: 3097, mode: 'governed-existing',
+      }),
+      (error) => error.code === 'GOVERNED_ARTIFACT_EXISTS' && /authority-map\.json/.test(error.message),
+    );
+    assert.equal(fs.readFileSync(path.join(root, 'docs/onboarding/authority-map.json'), 'utf8'), existing);
+    assert.equal(fs.existsSync(path.join(root, '.build-studio', 'config.yaml')), false);
   } finally { clean(root); }
 });
 

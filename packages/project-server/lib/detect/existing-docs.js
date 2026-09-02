@@ -2,6 +2,64 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+
+const AUTHORITY_CLASSES = new Set([
+  'product_authority',
+  'product_context',
+  'legacy_execution_governance',
+  'ignored/generated/runtime',
+]);
+
+// Lower number = earlier, explicit authority classification. These are glob
+// families, not an exact filename allowlist: established projects use wildly
+// different separators and prefixes. Callers may prepend project-specific
+// rules; every selected rule and priority is copied into authority-map.json.
+const DEFAULT_AUTHORITY_RULES = Object.freeze([
+  Object.freeze({
+    id: 'generated-runtime', priority: 10, class: 'ignored/generated/runtime',
+    patterns: ['**/.build-studio/**', '**/tmp/**', '**/generated/**', '**/DerivedData/**', '**/*.xcresult/**'],
+    disposition: 'ignored-generated-or-runtime-input',
+    reason: 'Generated output and machine-local runtime state cannot supply adoption authority.',
+  }),
+  Object.freeze({
+    id: 'legacy-execution-governance', priority: 20, class: 'legacy_execution_governance',
+    patterns: [
+      '**/*TASK*PACKET*.md', '**/*AGENT*ROUT*.md', '**/*WORKFLOW*STATE*.md',
+      '**/*FACTORY*ROUTINE*.md', '**/*EXECUTION*GOVERNANCE*.md', '**/CLAUDE.md', '**/AGENTS.md',
+      '**/.claude/**', '**/.codex/**', '**/.github/copilot-instructions.md',
+    ],
+    disposition: 'retired-from-build-studio-runtime-authority',
+    reason: 'Pre-adoption task routing, agent policy, workflow state, and factory routines are historical; Build Studio owns execution.',
+  }),
+  Object.freeze({
+    id: 'founder-product-law', priority: 30, class: 'product_authority',
+    patterns: [
+      '**/*PRODUCT*CONTROL*.md', '**/*CURRENT*STATE*.md', '**/*BASELINE*LOCK*.md',
+      '**/*NORTH*STAR*.md', '**/*FOUNDER*DECISION*.md', '**/*PRODUCT*LAW*.md',
+    ],
+    disposition: 'preserve-byte-identical-product-authority',
+    reason: 'Founder decisions, current-state locks, baselines, and product direction remain product authority.',
+  }),
+  Object.freeze({
+    id: 'approved-product-specification', priority: 31, class: 'product_authority',
+    patterns: ['**/SPEC*.md', '**/*SPECIFICATION*.md', '**/docs/prds/*.md'],
+    disposition: 'preserve-byte-identical-product-authority',
+    reason: 'Existing approved product specifications remain decision inputs and are not synthesized or rewritten.',
+  }),
+  Object.freeze({
+    id: 'product-context', priority: 100, class: 'product_context',
+    patterns: ['**/README.md', '**/*BACKLOG*.md', '**/*ROADMAP*.md', '**/*HISTORY*.md', '**/*CONTEXT*.md', '**/CHANGELOG.md'],
+    disposition: 'preserve-as-product-context',
+    reason: 'Background, history, backlog, and roadmap material informs adoption but does not outrank product authority.',
+  }),
+  Object.freeze({
+    id: 'unclassified-document-context', priority: 1000, class: 'product_context',
+    patterns: ['**/*.md'],
+    disposition: 'preserve-as-product-context',
+    reason: 'Unclassified source documents are retained as context and never gain implicit product or execution authority.',
+  }),
+]);
 
 /**
  * Inventory the project's existing onboarding-relevant docs so the discovery
@@ -15,7 +73,10 @@ const path = require('path');
  * Only inventories shallow paths — README at root, single-PRD-MVP files, the
  * /specs/ and /docs/strategy/ folders. Doesn't walk arbitrary subtrees.
  */
-function detectExistingDocs(projectRoot) {
+function detectExistingDocs(projectRoot, options = {}) {
+  if (options.mode === 'governed-existing') {
+    return detectGovernedExistingDocs(projectRoot, options.authorityRules || []);
+  }
   const out = [];
   const claudeMdPresent = exists(projectRoot, 'CLAUDE.md');
   const agentsMdPresent = exists(projectRoot, 'AGENTS.md');
@@ -74,6 +135,189 @@ function detectExistingDocs(projectRoot) {
   };
 }
 
+function detectGovernedExistingDocs(projectRoot, customRules) {
+  const rules = normalizeAuthorityRules(customRules);
+  const markdownPaths = walkMarkdownPaths(projectRoot);
+  const docs = markdownPaths.map((rel) => {
+    const abs = path.join(projectRoot, rel);
+    const stat = fs.statSync(abs);
+    const classification = classifyAuthoritySource(rel, rules);
+    return {
+      path: rel,
+      kind: kindForPath(rel),
+      bytes: stat.size,
+      authorityClass: classification.class,
+      disposition: classification.disposition,
+      reason: classification.reason,
+      matchedRule: classification.id,
+      sha256: sha256File(abs),
+    };
+  });
+  const authorityMap = {
+    schemaVersion: 1,
+    mode: 'governed-existing',
+    generatedAt: new Date().toISOString(),
+    precedence: 'lowest-explicit-rule-priority; equal-priority multi-class matches fail closed',
+    rules,
+    entries: docs.map(doc => ({
+      source: doc.path,
+      class: doc.authorityClass,
+      disposition: doc.disposition,
+      reason: doc.reason,
+      matchedRule: doc.matchedRule,
+      bytes: doc.bytes,
+      sha256: doc.sha256,
+    })),
+    productAuthorityAllowlist: docs
+      .filter(doc => doc.authorityClass === 'product_authority')
+      .map(doc => doc.path)
+      .sort(),
+  };
+
+  return {
+    docs,
+    authorityMap,
+    claudeMdPresent: exists(projectRoot, 'CLAUDE.md'),
+    agentsMdPresent: exists(projectRoot, 'AGENTS.md'),
+    specsDirPresent: isDir(projectRoot, 'specs'),
+    counts: {
+      existingPrds: countMdFiles(path.join(projectRoot, 'docs', 'prds')),
+      existingAdrs: countMdFiles(path.join(projectRoot, 'docs', 'adrs')),
+      existingContracts: countMdFiles(path.join(projectRoot, 'docs', 'contracts')),
+    },
+  };
+}
+
+function normalizeAuthorityRules(customRules) {
+  if (!Array.isArray(customRules)) {
+    throw authorityError('authorityRules must be an array', 'AUTHORITY_RULES_INVALID');
+  }
+  const rules = [...customRules, ...DEFAULT_AUTHORITY_RULES].map((rule) => ({
+    id: rule && rule.id,
+    priority: rule && rule.priority,
+    class: rule && rule.class,
+    patterns: rule && Array.isArray(rule.patterns) ? [...rule.patterns] : rule && rule.patterns,
+    disposition: rule && rule.disposition,
+    reason: rule && rule.reason,
+  }));
+  const ids = new Set();
+  for (const rule of rules) {
+    if (!rule || !/^[a-z0-9][a-z0-9-]*$/.test(String(rule.id || ''))) {
+      throw authorityError('every authority rule needs a stable lowercase id', 'AUTHORITY_RULES_INVALID');
+    }
+    if (ids.has(rule.id)) throw authorityError(`duplicate authority rule id: ${rule.id}`, 'AUTHORITY_RULES_INVALID');
+    ids.add(rule.id);
+    if (!Number.isInteger(rule.priority) || rule.priority < 0) {
+      throw authorityError(`authority rule ${rule.id} needs a non-negative integer priority`, 'AUTHORITY_RULES_INVALID');
+    }
+    if (!AUTHORITY_CLASSES.has(rule.class)) {
+      throw authorityError(`authority rule ${rule.id} has invalid class: ${rule.class}`, 'AUTHORITY_RULES_INVALID');
+    }
+    if (!Array.isArray(rule.patterns) || rule.patterns.length === 0
+        || rule.patterns.some(pattern => typeof pattern !== 'string' || !pattern.trim())) {
+      throw authorityError(`authority rule ${rule.id} needs non-empty glob patterns`, 'AUTHORITY_RULES_INVALID');
+    }
+    if (typeof rule.disposition !== 'string' || !rule.disposition.trim()
+        || typeof rule.reason !== 'string' || !rule.reason.trim()) {
+      throw authorityError(`authority rule ${rule.id} needs disposition and reason`, 'AUTHORITY_RULES_INVALID');
+    }
+  }
+  return rules;
+}
+
+function classifyAuthoritySource(relPath, rules) {
+  const normalized = relPath.split(path.sep).join('/');
+  const matches = rules.filter(rule => rule.patterns.some(pattern => globMatches(normalized, pattern)));
+  if (matches.length === 0) {
+    throw authorityError(`no authority rule classified ${normalized}`, 'AUTHORITY_CLASSIFICATION_MISSING');
+  }
+  const priority = Math.min(...matches.map(rule => rule.priority));
+  const winners = matches.filter(rule => rule.priority === priority);
+  const classes = new Set(winners.map(rule => rule.class));
+  if (classes.size > 1) {
+    throw authorityError(
+      `ambiguous authority classification for ${normalized}: ${winners.map(rule => `${rule.id}=${rule.class}`).join(', ')}`,
+      'AUTHORITY_CLASSIFICATION_AMBIGUOUS',
+    );
+  }
+  // Same-class, same-priority matches do not change authority. Choose the
+  // stable lexical id so the map remains reproducible and explicit.
+  return winners.slice().sort((a, b) => a.id.localeCompare(b.id))[0];
+}
+
+function walkMarkdownPaths(projectRoot) {
+  const out = [];
+  const skipDirs = new Set(['.git', 'node_modules', '.swiftpm', '.build']);
+  const walk = (abs, rel) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(abs, { withFileTypes: true });
+    } catch (error) {
+      throw authorityError(
+        `could not inventory governed source directory ${rel || '.'}: ${error.message}`,
+        'AUTHORITY_INVENTORY_UNREADABLE',
+      );
+    }
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      const childRel = rel ? path.join(rel, entry.name) : entry.name;
+      const childAbs = path.join(abs, entry.name);
+      if (entry.isDirectory()) {
+        if (skipDirs.has(entry.name)) continue;
+        walk(childAbs, childRel);
+      } else if (entry.isFile() && entry.name.toLowerCase().endsWith('.md')) {
+        out.push(childRel.split(path.sep).join('/'));
+      }
+    }
+  };
+  walk(projectRoot, '');
+  return out.sort();
+}
+
+function kindForPath(rel) {
+  const base = path.basename(rel).toLowerCase();
+  if (base === 'readme.md') return 'readme';
+  if (base === 'claude.md') return 'claude-md';
+  if (base === 'agents.md') return 'agents-md';
+  if (/spec/.test(base)) return 'spec';
+  if (/roadmap/.test(base)) return 'roadmap';
+  if (/backlog/.test(base)) return 'action-plan';
+  if (/architecture|adr/.test(base)) return 'architecture';
+  return 'other';
+}
+
+function globMatches(rel, pattern) {
+  let source = '^';
+  const p = pattern.split(path.sep).join('/');
+  for (let i = 0; i < p.length; i++) {
+    const ch = p[i];
+    if (ch === '*' && p[i + 1] === '*' && p[i + 2] === '/') {
+      source += '(?:.*/)?';
+      i += 2;
+    } else if (ch === '*' && p[i + 1] === '*') {
+      source += '.*';
+      i += 1;
+    } else if (ch === '*') {
+      source += '[^/]*';
+    } else if (ch === '?') {
+      source += '[^/]';
+    } else {
+      source += ch.replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
+    }
+  }
+  return new RegExp(`${source}$`, 'i').test(rel);
+}
+
+function sha256File(abs) {
+  return crypto.createHash('sha256').update(fs.readFileSync(abs)).digest('hex');
+}
+
+function authorityError(message, code) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 function exists(root, rel) {
@@ -106,4 +350,12 @@ function pushIfFile(out, root, rel, kind) {
   out.push({ path: rel, kind, bytes: stat.size });
 }
 
-module.exports = { detectExistingDocs };
+module.exports = {
+  AUTHORITY_CLASSES,
+  DEFAULT_AUTHORITY_RULES,
+  detectExistingDocs,
+  normalizeAuthorityRules,
+  classifyAuthoritySource,
+  walkMarkdownPaths,
+  sha256File,
+};

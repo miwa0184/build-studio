@@ -9,7 +9,7 @@ const path = require('path');
 const {
   parallelArgs, buildXcodebuildArgs, displayCommand, parseTestCounts,
   failureExcerpt, resolveTimeoutMs, formatSuiteSection, startSuiteRun,
-  DEFAULT_TIMEOUT_MINUTES,
+  evaluateSuiteAuthority, DEFAULT_TIMEOUT_MINUTES,
 } = require('./qa-suite-run');
 
 // ── argv construction ────────────────────────────────────────────────────────
@@ -38,6 +38,20 @@ test('only-testing scopes are appended one flag per target', () => {
   });
   assert.ok(args.includes('-only-testing:STests'));
   assert.ok(args.includes('-only-testing:SUITests/TrendCardTests'));
+});
+
+test('exact serial UI-only QA emits no unit target, clone, or worker flags', () => {
+  const args = buildXcodebuildArgs({
+    project: 'SudokuDaily.xcodeproj', scheme: 'SudokuDaily', destination: 'platform=iOS Simulator,id=DEVICE',
+    parallelTesting: false, onlyTesting: ['SudokuDailyUITests'],
+  });
+  assert.ok(args.includes('-only-testing:SudokuDailyUITests'));
+  assert.ok(!args.some(arg => /SudokuDailyTests/.test(arg)));
+  assert.deepEqual(args.slice(args.indexOf('-parallel-testing-enabled'), args.indexOf('-parallel-testing-enabled') + 2), [
+    '-parallel-testing-enabled', 'NO',
+  ]);
+  assert.ok(!args.includes('-parallel-testing-worker-count'));
+  assert.ok(!args.some(arg => /clone/i.test(arg)));
 });
 
 test('empty scope entries are dropped rather than emitting a bare flag', () => {
@@ -100,6 +114,88 @@ test('a log with no summary reports null counts rather than zero', () => {
   const c = parseTestCounts('some unrelated build chatter');
   assert.equal(c.executed, null);
   assert.equal(c.failures, null);
+});
+
+function xcodeResult(executed, { failures = 0, banner = 'SUCCEEDED', caseCount = executed } = {}) {
+  const lines = [];
+  for (let i = 1; i <= caseCount; i++) {
+    const outcome = i <= failures ? 'failed' : 'passed';
+    lines.push(`Test Case '-[SudokuDailyUITests Case${i} test]' ${outcome} (0.1 seconds).`);
+  }
+  lines.push(`Executed ${executed} tests, with ${failures} failures (0 unexpected) in 1.0 (1.1) seconds`);
+  if (banner) lines.push(`** TEST ${banner} **`);
+  const counts = parseTestCounts(lines.join('\n'));
+  return { status: 'completed', exitCode: failures ? 65 : 0, counts };
+}
+
+test('expected_test_count authority passes only exact 56 + zero failures + TEST SUCCEEDED', () => {
+  const verdict = evaluateSuiteAuthority(xcodeResult(56), 56);
+  assert.equal(verdict.blocked, false);
+  assert.equal(verdict.actualTestCount, 56);
+  assert.equal(verdict.code, 'QA_EXACT_COUNT_VERIFIED');
+});
+
+for (const actual of [55, 57]) {
+  test(`expected_test_count=56 blocks ${actual} even with TEST SUCCEEDED`, () => {
+    const verdict = evaluateSuiteAuthority(xcodeResult(actual), 56);
+    assert.equal(verdict.blocked, true);
+    assert.equal(verdict.actualTestCount, actual);
+    assert.equal(verdict.code, 'QA_EXPECTED_TEST_COUNT_MISMATCH');
+  });
+}
+
+test('expected count blocks missing, ambiguous, and internally inconsistent counts', () => {
+  const missing = evaluateSuiteAuthority({
+    status: 'completed', exitCode: 0,
+    counts: parseTestCounts('** TEST SUCCEEDED **'),
+  }, 56);
+  assert.equal(missing.blocked, true);
+  assert.equal(missing.code, 'QA_TEST_COUNT_MISSING');
+
+  const ambiguousCounts = parseTestCounts([
+    'Executed 55 tests, with 0 failures (0 unexpected)',
+    'Executed 56 tests, with 0 failures (0 unexpected)',
+    '** TEST SUCCEEDED **',
+  ].join('\n'));
+  const ambiguous = evaluateSuiteAuthority({ status: 'completed', exitCode: 0, counts: ambiguousCounts }, 56);
+  assert.equal(ambiguous.blocked, true);
+  assert.equal(ambiguous.code, 'QA_TEST_COUNT_AMBIGUOUS');
+
+  const inconsistent = evaluateSuiteAuthority(xcodeResult(56, { caseCount: 55 }), 56);
+  assert.equal(inconsistent.blocked, true);
+  assert.equal(inconsistent.code, 'QA_TEST_COUNT_INCONSISTENT');
+});
+
+test('expected count blocks failures, absent verdict, and contradictory banners', () => {
+  assert.equal(evaluateSuiteAuthority(xcodeResult(56, { failures: 1, banner: 'FAILED' }), 56).blocked, true);
+  assert.equal(evaluateSuiteAuthority(xcodeResult(56, { banner: null }), 56).blocked, true);
+  const counts = parseTestCounts([
+    "Test Case '-[T t]' passed (0.1 seconds).",
+    'Executed 1 test, with 0 failures (0 unexpected)',
+    '** TEST SUCCEEDED **',
+    '** TEST FAILED **',
+  ].join('\n'));
+  assert.equal(evaluateSuiteAuthority({ status: 'completed', exitCode: 0, counts }, 1).code, 'QA_TEST_VERDICT_AMBIGUOUS');
+
+  const duplicateSuccess = parseTestCounts([
+    "Test Case '-[T t]' passed (0.1 seconds).",
+    'Executed 1 test, with 0 failures (0 unexpected)',
+    '** TEST SUCCEEDED **',
+    '** TEST SUCCEEDED **',
+  ].join('\n'));
+  assert.equal(evaluateSuiteAuthority({ status: 'completed', exitCode: 0, counts: duplicateSuccess }, 1).code, 'QA_TEST_VERDICT_AMBIGUOUS');
+});
+
+test('agent-facing suite section exposes immutable server authority before QA reports', () => {
+  const run = xcodeResult(55);
+  run.command = 'xcodebuild test -only-testing:SudokuDailyUITests';
+  run.logPath = '/tmp/qa.log';
+  run.durationMs = 1000;
+  run.authority = evaluateSuiteAuthority(run, 56);
+  const section = formatSuiteSection(run);
+  assert.match(section, /SERVER-AUTHORITATIVE QA VERDICT: BLOCKED/);
+  assert.match(section, /expected 56.*parsed 55/is);
+  assert.match(section, /cannot override/i);
 });
 
 test('failureExcerpt keeps the failing lines and drops the noise', () => {

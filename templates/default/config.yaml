@@ -229,9 +229,21 @@ worktree_env_files: []
 #     flakes. Real regressions still block (the agent reports Approved: no /
 #     Blocking > 0, or failures with no certification). Set to false if you
 #     want a human to consciously accept every failure.
+#   only_testing (optional): an explicit xcodebuild target/class allowlist used
+#     by the server-run suite. When set, it takes precedence over `scope` and no
+#     unit or regression target is inferred.
+#   expected_test_count (optional): makes the completed server suite immutable
+#     QA authority and requires both only_testing and parallel_testing: false.
+#     Approval requires exactly this many executable tests, zero
+#     failures, one TEST SUCCEEDED banner, and exit 0. Missing/extra/ambiguous
+#     counts and unavailable/timeout runs fail closed; agent or operator
+#     overrides cannot bypass the verdict.
 # qa_validation:
 #   strict: true
 #   honor_clean_approval: true
+#   only_testing:
+#     - ExampleUITests
+#   expected_test_count: 56
 #
 # hygiene — mechanical pre-merge grep gate for test scaffolding leaked into
 #   production source. Runs at merge_for_review. BLOCKS the merge only on actual

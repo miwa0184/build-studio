@@ -97,6 +97,23 @@ interface WorkflowStep {
   strategy?: string
   completedTasks?: { id?: number; name: string; status: string }[]
   currentTask?: { id?: number; name: string; description: string; roles: string[] }
+  suiteRun?: {
+    status: string
+    command?: string
+    logPath?: string
+    expectedTestCount?: number
+    progress?: { casesPassed?: number; casesFailed?: number; elapsedMs?: number }
+    authority?: {
+      configured: boolean
+      blocked: boolean
+      code: string
+      reason?: string
+      expectedTestCount?: number
+      actualTestCount?: number | null
+      onlyTesting?: string[]
+      parallelTesting?: boolean | number
+    }
+  }
 }
 
 /** A run the engine parked. Terminal — see project-server/lib/technical-stop.js.
@@ -188,6 +205,11 @@ interface Workflow {
   technicalStop?: TechnicalStop | null
   /** ISO time the run was created (server-set). */
   createdAt?: string
+  onboardingMode?: 'single-prd-mvp' | 'governed-existing'
+  onboardingAuthorityMap?: {
+    entries: { source: string; class: string; disposition: string; reason: string }[]
+    productAuthorityAllowlist: string[]
+  }
 }
 
 const WF_STEPS: Record<string, { key: string; name: string; loopHint?: string }[]> = {
@@ -1544,6 +1566,11 @@ function StepDetail({
         </div>
       )}
 
+      {activeKey === 'qa_validation' && step.suiteRun
+        && (step.suiteRun.expectedTestCount || step.suiteRun.authority?.configured) && (
+        <QaServerAuthorityPanel suiteRun={step.suiteRun} />
+      )}
+
       {/* Review cap — blocked, needs human decision to force-continue */}
       {isCurrentStep && activeKey === 'review_cap_reached' && (() => {
         // Two loops reach this step and they offer different ways out. A PRD
@@ -1634,7 +1661,7 @@ function StepDetail({
                 <DemoReviewContext wf={wf} />
               )}
               {activeKey === 'owner_signoff' && (
-                <OwnerSignoffContext />
+                <OwnerSignoffContext wf={wf} />
               )}
               {isOwnerConsult && (
                 <OwnerConsultationContext wf={wf} />
@@ -1765,6 +1792,7 @@ function StepDetail({
           wfType={wf.type}
           allDone={allDone}
           hasBlockingIssues={hasBlockingIssues}
+          qaServerAuthorityConfigured={Boolean(step.suiteRun?.expectedTestCount || step.suiteRun?.authority?.configured)}
           notes={notes}
           setNotes={setNotes}
           onAdvance={onAdvance}
@@ -2108,13 +2136,44 @@ function TaskBoard({ wf, onSkipBlocked, onViewLog }: { wf: Workflow; onSkipBlock
   )
 }
 
+function QaServerAuthorityPanel({ suiteRun }: { suiteRun: NonNullable<WorkflowStep['suiteRun']> }) {
+  const authority = suiteRun.authority
+  const running = !authority && suiteRun.status === 'running'
+  const blocked = Boolean(authority?.blocked)
+  const color = running ? 'var(--yellow)' : blocked ? 'var(--red)' : 'var(--green)'
+  const expected = authority?.expectedTestCount ?? suiteRun.expectedTestCount
+  const actual = authority?.actualTestCount
+  return (
+    <div style={{
+      marginBottom: 16, padding: '10px 14px', borderRadius: 6,
+      background: `color-mix(in srgb, ${color} 9%, transparent)`,
+      border: `1px solid ${color}`, fontFamily: 'var(--mono)', fontSize: 11,
+    }}>
+      <div style={{ color, fontWeight: 700, marginBottom: 4 }}>
+        Server-authoritative exact QA: {running ? 'RUNNING' : blocked ? 'BLOCKED' : 'PASS'}
+      </div>
+      <div style={{ color: 'var(--text-dim)', lineHeight: 1.5 }}>
+        {running
+          ? `Waiting for the server-run suite; expected exactly ${expected} executable tests.`
+          : `${authority?.code}: ${authority?.reason || `expected ${expected}, parsed ${actual ?? 'unknown'}`}`}
+      </div>
+      {!running && (
+        <div style={{ color: 'var(--muted)', marginTop: 4 }}>
+          QA-agent feedback and operator override cannot replace this verdict. Only a fresh server suite can.
+        </div>
+      )}
+    </div>
+  )
+}
+
 function StepActions({
-  activeKey, wfType: _wfType, allDone, hasBlockingIssues, notes, setNotes, onAdvance,
+  activeKey, wfType: _wfType, allDone, hasBlockingIssues, qaServerAuthorityConfigured = false, notes, setNotes, onAdvance,
 }: {
   activeKey: string
   wfType: string
   allDone: boolean
   hasBlockingIssues: boolean
+  qaServerAuthorityConfigured?: boolean
   notes: string
   setNotes: (v: string) => void
   onAdvance: (action?: string, extra?: Record<string, unknown>) => void
@@ -2209,7 +2268,7 @@ function StepActions({
             </button>
             {/* Override — bypasses the strict failing-tests gate. Use for known
                 flakes / failures confirmed unrelated to this change. Logged on the step. */}
-            <button
+            {!qaServerAuthorityConfigured && <button
               onClick={() => {
                 if (confirm('Force-approve QA despite failing tests?\n\nThe strict gate (zero failing tests on the run branch) will be bypassed. Use only for known flakes or failures you have confirmed are unrelated to this change. The override is recorded on the step.')) {
                   onAdvance('approve', { override: true, note: notes.trim() || 'operator force-approve (strict QA gate)' })
@@ -2220,7 +2279,7 @@ function StepActions({
               title="Bypass the strict failing-tests gate (e.g. known flakes)"
             >
               Force approve (override)
-            </button>
+            </button>}
           </>
         )}
 
@@ -2614,10 +2673,10 @@ function LearningsCategoryGroup({ category, entries }: { category: string; entri
   )
 }
 
-function OwnerSignoffContext() {
+function OwnerSignoffContext({ wf }: { wf: Workflow }) {
   // Reuses the /api/deployment endpoint (already polled by the CI/CD tab) so
-  // we don't add a new API surface for v1. The file list shown here is
-  // EXACTLY what `git add -A && git commit` will capture on Approve.
+  // we don't add a new API surface for v1. Governed adoption narrows this list
+  // to its explicit commit allowlist and surfaces unrelated changes separately.
   const [info, setInfo] = useState<{ stagedFiles?: string[]; unstagedFiles?: string[]; untrackedFiles?: string[] } | null>(null)
   const { baseUrl } = useProject()
   useEffect(() => {
@@ -2625,10 +2684,24 @@ function OwnerSignoffContext() {
   }, [baseUrl])
 
   if (!info) return null
-  const staged = info.stagedFiles || []
-  const unstaged = info.unstagedFiles || []
-  const untracked = info.untrackedFiles || []
+  const governedAllowlist = new Set([
+    '.build-studio/config.yaml', '.build-studio/agent-instructions.md', '.gitignore',
+    'docs/onboarding/inventory.json', 'docs/onboarding/authority-map.json', 'docs/onboarding/survey.md',
+  ])
+  const allStaged = info.stagedFiles || []
+  const allUnstaged = info.unstagedFiles || []
+  const allUntracked = info.untrackedFiles || []
+  const filter = (files: string[]) => wf.onboardingMode === 'governed-existing'
+    ? files.filter(file => governedAllowlist.has(file))
+    : files
+  const staged = filter(allStaged)
+  const unstaged = filter(allUnstaged)
+  const untracked = filter(allUntracked)
+  const unrelated = wf.onboardingMode === 'governed-existing'
+    ? [...allStaged, ...allUnstaged, ...allUntracked].filter(file => !governedAllowlist.has(file))
+    : []
   const total = staged.length + unstaged.length + untracked.length
+  const authorityMap = wf.onboardingAuthorityMap
 
   return (
     <div style={{
@@ -2636,6 +2709,29 @@ function OwnerSignoffContext() {
       borderRadius: 'var(--radius)', padding: '12px 16px', marginBottom: 10,
       fontFamily: 'var(--mono)', fontSize: 11,
     }}>
+      {authorityMap && (
+        <div style={{ marginBottom: 12 }}>
+          <div style={{
+            fontSize: 10, fontWeight: 600, textTransform: 'uppercase',
+            letterSpacing: '0.06em', color: 'var(--muted)', marginBottom: 6,
+          }}>
+            Governed authority map ({authorityMap.entries.length})
+          </div>
+          <div style={{ color: 'var(--text-dim)', maxHeight: 200, overflow: 'auto' }}>
+            {authorityMap.entries.map(entry => (
+              <div key={entry.source} style={{ padding: '2px 0' }}>
+                <span style={{ color: entry.class === 'product_authority' ? 'var(--accent)' : 'var(--muted)' }}>
+                  {entry.class}
+                </span>
+                {' · '}{entry.source} — {entry.disposition}
+              </div>
+            ))}
+          </div>
+          <div style={{ marginTop: 6, fontSize: 9, color: 'var(--orange)' }}>
+            Approve only if the map is correct. Send back stops adoption before any onboarding commit.
+          </div>
+        </div>
+      )}
       <div style={{
         fontSize: 10, fontWeight: 600, textTransform: 'uppercase',
         letterSpacing: '0.06em', color: 'var(--muted)', marginBottom: 8,
@@ -2653,8 +2749,20 @@ function OwnerSignoffContext() {
           ))}
         </div>
       )}
+      {unrelated.length > 0 && (
+        <div style={{ marginTop: 8, color: 'var(--muted)' }}>
+          {unrelated.length} unrelated working-tree file(s) are outside the governed commit allowlist and will not be committed.
+          {allStaged.some(file => !governedAllowlist.has(file)) && (
+            <span style={{ color: 'var(--red)' }}> Pre-staged files outside the allowlist must be unstaged before approval.</span>
+          )}
+        </div>
+      )}
       <div style={{ marginTop: 8, fontSize: 9, color: 'var(--muted)' }}>
-        Approve runs <code style={{ color: 'var(--accent)' }}>git add -A &amp;&amp; git commit -m &quot;chore: onboard to build-studio via PRD-001&quot;</code>.
+        Approve runs <code style={{ color: 'var(--accent)' }}>
+          {wf.onboardingMode === 'governed-existing'
+            ? 'git add -- <adoption allowlist> && git commit -m "chore: adopt governed project into build-studio"'
+            : 'git add -A && git commit -m "chore: onboard to build-studio via PRD-001"'}
+        </code>.
         No tag, no push.
       </div>
     </div>

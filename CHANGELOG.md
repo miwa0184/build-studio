@@ -21,6 +21,19 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-09-02 — Governed existing-repo adoption and exact serial QA authority
+
+### Added
+
+- **Mature governed repositories can be adopted without greenfield synthesis.** The explicit `governed-existing` mode inventories the existing Markdown corpus into a reviewable authority map, keeps product and governance sources byte-identical, retires legacy execution files from Build Studio runtime authority, and routes directly from discovery to owner sign-off. The only commit is scoped to Build Studio metadata, the authority map, inventory, and adoption survey.
+- **iOS QA can declare exact server authority.** `qa_validation.only_testing` supplies the exact xcodebuild target list and `qa_validation.expected_test_count` requires a coherent, completed server-run suite with exactly that count, zero failures, one success banner, and exit 0. `simulator.parallel_testing: false` emits the serial xcodebuild flag with no worker/clone flags. Missing, extra, ambiguous, inconsistent, timed-out, or unavailable results block approval and cannot be overridden by QA-agent prose or an operator override.
+
+### Upgrade steps
+
+**In Build Studio** — rebuild and reinstall the Hub and project-server bundle.
+
+**In each managed project** — nothing changes unless the project opts into `governed-existing` onboarding or the new exact QA fields.
+
 ## 2026-09-02 — A1c Commit 1 parks candidates at a hard egress boundary
 
 Build Studio no longer has a local ship path while the reviewed A1c PR-egress

@@ -10,7 +10,8 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 
-const { qaStrictGateVerdict } = require('./workflow');
+const { qaStrictGateVerdict, qaServerSuiteGateVerdict } = require('./workflow');
+const { parseTestCounts } = require('../qa-suite-run');
 
 const CERTIFIED_WITH_FLAKE = [
   '**Tests passed:** 1305/1305 (unit) + 143/143 stable + 1 flaky-confirmed (E2E)',
@@ -92,4 +93,89 @@ test('failure count parsed from "(N failed" parenthetical form', () => {
   const v = qaStrictGateVerdict('suite red (4 failed, 139 passed)', {}, false);
   assert.equal(v.failingCount, 4);
   assert.equal(v.blocked, true);
+});
+
+test('server exact-count authority blocks before and regardless of an agent clean verdict or operator override', () => {
+  const config = { qa_validation: { expected_test_count: 56 } };
+  const counts = parseTestCounts([
+    ...Array.from({ length: 55 }, (_, i) => `Test Case '-[SudokuDailyUITests Case${i} test]' passed (0.1 seconds).`),
+    'Executed 55 tests, with 0 failures (0 unexpected)',
+    '** TEST SUCCEEDED **',
+  ].join('\n'));
+  const step = {
+    suiteRun: {
+      status: 'completed',
+      exitCode: 0,
+      counts,
+      authority: {
+        configured: true, blocked: true, code: 'QA_EXPECTED_TEST_COUNT_MISMATCH',
+        expectedTestCount: 56, actualTestCount: 55,
+      },
+    },
+    agents: [{ feedback: '**Approved:** yes\n**Blocking:** 0\n55 passed' }],
+  };
+  const verdict = qaServerSuiteGateVerdict(step, config);
+  assert.equal(verdict.blocked, true);
+  assert.equal(verdict.code, 'QA_EXPECTED_TEST_COUNT_MISMATCH');
+});
+
+test('server exact-count authority passes only its persisted exact verdict; legacy projects are unaffected', () => {
+  const config = {
+    qa_validation: { expected_test_count: 56, only_testing: ['SudokuDailyUITests'] },
+    simulator: { parallel_testing: false },
+  };
+  const counts = parseTestCounts([
+    ...Array.from({ length: 56 }, (_, i) => `Test Case '-[SudokuDailyUITests Case${i} test]' passed (0.1 seconds).`),
+    'Executed 56 tests, with 0 failures (0 unexpected)',
+    '** TEST SUCCEEDED **',
+  ].join('\n'));
+  assert.equal(qaServerSuiteGateVerdict({
+    suiteRun: { status: 'completed', exitCode: 0, counts, authority: {
+      configured: true, blocked: false, code: 'QA_EXACT_COUNT_VERIFIED',
+      expectedTestCount: 56, actualTestCount: 56,
+      onlyTesting: ['SudokuDailyUITests'], parallelTesting: false,
+    } },
+  }, config).blocked, false);
+  assert.equal(qaServerSuiteGateVerdict({}, {}).blocked, false);
+  assert.equal(qaServerSuiteGateVerdict({}, config).code, 'QA_SERVER_SUITE_AUTHORITY_MISSING');
+});
+
+test('persisted exact authority is bound to current target scope and serial setting', () => {
+  const config = {
+    qa_validation: { expected_test_count: 56, only_testing: ['SudokuDailyUITests'] },
+    simulator: { parallel_testing: false },
+  };
+  const authority = {
+    configured: true, blocked: false, code: 'QA_EXACT_COUNT_VERIFIED',
+    expectedTestCount: 56, actualTestCount: 56,
+    onlyTesting: ['OtherUITests'], parallelTesting: false,
+  };
+  const counts = parseTestCounts([
+    ...Array.from({ length: 56 }, (_, i) => `Test Case '-[SudokuDailyUITests Case${i} test]' passed (0.1 seconds).`),
+    'Executed 56 tests, with 0 failures (0 unexpected)',
+    '** TEST SUCCEEDED **',
+  ].join('\n'));
+  const suiteRun = { status: 'completed', exitCode: 0, counts, authority };
+  assert.equal(qaServerSuiteGateVerdict({ suiteRun }, config).code, 'QA_SERVER_SUITE_SCOPE_STALE');
+  authority.onlyTesting = ['SudokuDailyUITests'];
+  authority.parallelTesting = true;
+  assert.equal(qaServerSuiteGateVerdict({ suiteRun }, config).code, 'QA_SERVER_SUITE_PARALLELISM_STALE');
+});
+
+test('persisted pass cannot disagree with the raw server result', () => {
+  const config = { qa_validation: { expected_test_count: 56 } };
+  const counts = parseTestCounts([
+    ...Array.from({ length: 55 }, (_, i) => `Test Case '-[T Case${i} test]' passed (0.1 seconds).`),
+    'Executed 55 tests, with 0 failures (0 unexpected)',
+    '** TEST SUCCEEDED **',
+  ].join('\n'));
+  const verdict = qaServerSuiteGateVerdict({ suiteRun: {
+    status: 'completed', exitCode: 0, counts,
+    authority: {
+      configured: true, blocked: false, code: 'QA_EXACT_COUNT_VERIFIED',
+      expectedTestCount: 56, actualTestCount: 56,
+    },
+  } }, config);
+  assert.equal(verdict.code, 'QA_SERVER_SUITE_AUTHORITY_DRIFT');
+  assert.equal(verdict.blocked, true);
 });
