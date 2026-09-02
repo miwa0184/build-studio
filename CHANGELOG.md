@@ -21,6 +21,56 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-09-02 — A1c Commit 1 parks candidates at a hard egress boundary
+
+Build Studio no longer has a local ship path while the reviewed A1c PR-egress
+transaction is still unimplemented. Execution and bugfix work remains on its
+candidate branch instead of being made to look released.
+
+### Changed
+
+- **`merge_to_main` is now an Egress Hold, not a merge step.** A direct advance
+  returns a typed refusal and parks the workflow with the candidate branch
+  intact. It does not check out or merge the default branch, mark the work
+  `Implemented`/`Done`, create a tag, push, or delete the candidate branch.
+- **Autonomous configuration cannot cross the hold.** Auto-advance never acts
+  on `merge_to_main`; the legacy `bugfix.auto_merge`,
+  `deployment.auto_tag`, and `deployment.auto_deploy` settings are retained for
+  compatibility but are inert for workflow egress.
+- **The CI/CD Git egress helpers are inert too.** Direct deployment push cannot
+  publish either a default or candidate branch or any tags. Accepting a CI-fix
+  proposal cannot commit, create a branch, push, or open a PR. The Hub keeps the
+  boundary visible but offers no working Push or Accept-fix action.
+- **Internal integration still works.** Worker branches may still merge into a
+  named candidate/review branch. That local integration is not permission to
+  land on the default branch or mutate a remote.
+
+### Upgrade steps
+
+**In Build Studio** — rebuild and reinstall the bundle because both the Hub and
+project server changed: `cd packages/hub && npm run build`, then `cd
+packages/desktop && node inject-resources.js`, then restart the Electron app
+and every running project server.
+
+**In each managed project** — take these operational steps after the updated
+project server is running:
+
+1. Treat every execution or bugfix workflow that reaches **Egress Hold** as an
+   unshipped candidate. Record and preserve the candidate branch shown in the
+   Hub.
+2. Do not expect Build Studio to perform an automatic local merge, tag, push,
+   PR creation, default-branch update, status transition to `Implemented` or
+   `Done`, or candidate-branch deletion. `auto_merge`, `auto_tag`, and
+   `auto_deploy` do not opt a project out of this boundary.
+3. Until a separately reviewed A1c PR-egress transaction is installed, handle
+   any authorized landing outside Build Studio and leave the parked workflow
+   and candidate intact. If the candidate is intentionally abandoned, use the
+   explicit cancel/delete choice with the normal destructive-action care.
+
+No managed-project file migration is required.
+
+---
+
 ## 2026-09-02 — Root refusal spend and acceptance evidence are now indivisible authority
 
 The A1b.2R-S1 root aggregate has been repaired at the two authority boundaries

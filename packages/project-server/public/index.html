@@ -1316,7 +1316,7 @@ const WF_STEPS = {
     { key: 'ac_verification', name: 'AC Verification' },
     { key: 'security_audit', name: 'Security Audit' },
     { key: 'demo_review', name: 'Demo Review' },
-    { key: 'merge_to_main', name: 'Merge to Main' },
+    { key: 'merge_to_main', name: 'Egress Hold' },
     { key: 'capture_learnings', name: 'Capture Learnings' },
   ],
   kickoff: [
@@ -1545,10 +1545,10 @@ function renderWorkflowDetail(stepKey) {
 
   const activeKey = stepKey || wf.currentStep;
   if (activeKey === 'completed') {
-    const completeMsg = wf.type === 'execution' ? 'The review branch is ready to merge to main.'
+    const completeMsg = wf.type === 'execution' ? 'This historical workflow is complete.'
       : wf.type === 'kickoff' ? 'Kickoff complete — project is ready for PRD iterations.'
       : 'PRD has been approved.';
-    detail.innerHTML = `<div style="font-size:16px;font-weight:600;margin-bottom:8px;">Workflow Complete</div><div style="font-size:13px;color:var(--text-dim);margin-bottom:16px;">${completeMsg}</div>${wf.reviewBranch ? `<div style="font-family:var(--mono);font-size:12px;color:var(--accent);background:var(--surface2);padding:8px 12px;border-radius:6px;display:inline-block;margin-bottom:16px;">Branch: ${wf.reviewBranch}</div>` : ''}<div class="wf-action-area"><div class="wf-action-label">Merge review branch to main, remove worktrees and branches:</div><div class="wf-action-row"><button class="primary-btn green" onclick="finishWorkflow()">Merge &amp; Clean Up</button></div></div>`;
+    detail.innerHTML = `<div style="font-size:16px;font-weight:600;margin-bottom:8px;">Workflow Complete</div><div style="font-size:13px;color:var(--text-dim);margin-bottom:16px;">${completeMsg}</div>${wf.reviewBranch ? `<div style="font-family:var(--mono);font-size:12px;color:var(--accent);background:var(--surface2);padding:8px 12px;border-radius:6px;display:inline-block;margin-bottom:16px;">Branch: ${wf.reviewBranch}</div>` : ''}<div class="wf-action-area"><div class="wf-action-label">Clear the completed workflow record:</div><div class="wf-action-row"><button class="primary-btn green" onclick="finishWorkflow()">Clear Completed Workflow</button></div></div>`;
     return;
   }
 
@@ -1705,13 +1705,10 @@ function renderWorkflowActions(stepKey, allDone, step) {
       return `<div class="wf-action-area ${dis ? 'disabled' : ''}"><div class="wf-action-label">${allDone ? 'Security audit complete:' : 'Security reviewing...'}</div><div class="wf-action-row"><textarea class="wf-notes" id="wf-notes" placeholder="Notes for devs (optional)..."></textarea><button class="primary-btn orange" onclick="advanceWorkflow('send_to_devs')" ${dis}>Send to Devs</button><button class="primary-btn green" onclick="advanceWorkflow('approve')" ${dis}>Continue</button></div></div>`;
     }
     if (stepKey === 'demo_review') {
-      return `<div class="wf-action-area"><div class="wf-action-label">Review the running app before merging:</div><div class="wf-action-row"><button class="primary-btn orange" onclick="advanceWorkflow('skip')">Skip Demo</button><button class="primary-btn green" onclick="advanceWorkflow('approve')">Approve & Merge</button></div></div>`;
+      return `<div class="wf-action-area"><div class="wf-action-label">Review the running app before the egress hold:</div><div class="wf-action-row"><button class="primary-btn orange" onclick="advanceWorkflow('skip')">Skip Demo</button><button class="primary-btn green" onclick="advanceWorkflow('approve')">Approve Demo</button></div></div>`;
     }
     if (stepKey === 'merge_to_main') {
-      if (step.status === 'error') {
-        return `<div class="wf-action-area"><div class="wf-action-label" style="color:var(--red);">Merge failed — resolve conflicts manually then retry:</div><div class="wf-action-row"><button class="primary-btn orange" onclick="advanceWorkflow()">Retry Merge</button></div></div>`;
-      }
-      return `<div class="wf-action-area"><div class="wf-action-label">Merging to main...</div></div>`;
+      return `<div class="wf-action-area"><div class="wf-action-label" style="color:var(--orange);">Egress not installed — ${wf.branch ? `candidate ${wf.branch}` : 'candidate branch'} is preserved. Build Studio will not merge, push, tag, or delete it until A1c installs reviewed PR egress.</div></div>`;
     }
     if (stepKey === 'capture_learnings') {
       return `<div class="wf-action-area ${dis ? 'disabled' : ''}"><div class="wf-action-label">${allDone ? 'Learnings captured:' : 'Extracting learnings from workflow...'}</div><div class="wf-action-row"><button class="primary-btn orange" onclick="advanceWorkflow('skip')" ${dis}>Skip</button><button class="primary-btn green" onclick="advanceWorkflow('approve')" ${dis}>Done</button></div></div>`;
@@ -1769,7 +1766,6 @@ async function cancelWorkflow() {
 }
 
 async function finishWorkflow() {
-  if (!confirm('Merge review branch to main, remove worktrees and branches?')) return;
   const res = await fetch('/api/workflow/finish', { method: 'POST' });
   const data = await res.json();
   if (!res.ok) return alert(data.error || 'Failed to finish workflow');
@@ -1900,8 +1896,8 @@ const WORKFLOWS = {
       { num: '5', roles: ['Code Reviewer'], desc: 'Code review — review all changes, check quality, correctness, adherence to standards' },
       { num: '6', roles: ['QA'], desc: 'Run PRD-scoped tests (new spec + directly affected existing tests); failures → send to devs' },
       { num: '7', roles: ['Security'], desc: 'Code-level security audit scoped to PRD changes only; blocking findings → send to devs' },
-      { num: '8', roles: ['Owner'], desc: 'Demo review — owner reviews the running app before merge. Optional, skippable.' },
-      { num: '9', desc: 'Merge to main — review branch merged, branches cleaned up' },
+      { num: '8', roles: ['Owner'], desc: 'Demo review — owner reviews the running app before egress. Optional, skippable.' },
+      { num: '9', desc: 'Egress hold — candidate branch preserved; reviewed PR egress arrives in A1c' },
       { num: '10', roles: ['Knowledge Curator'], desc: 'Capture learnings — extract reusable patterns from workflow feedback into docs/learnings/. Auto-runs, skippable.' },
     ]
   },

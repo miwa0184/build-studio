@@ -83,6 +83,10 @@ interface RecoverableAgent {
 interface WorkflowStep {
   status: string
   error?: string
+  code?: string
+  egress?: string
+  candidateBranch?: string | null
+  defaultBranch?: string
   /** Stashed by server-side auto-advance when a gate repeatedly rejects this step
    *  (e.g. qa_tests with no committed tests) — surfaced so a stall is never silent. */
   autoAdvanceError?: string
@@ -206,7 +210,7 @@ const WF_STEPS: Record<string, { key: string; name: string; loopHint?: string }[
     { key: 'security_audit', name: 'Security Audit' },
     { key: 'final_review', name: 'Final Review' },
     { key: 'demo_review', name: 'Demo Review' },
-    { key: 'merge_to_main', name: 'Merge to Main' },
+    { key: 'merge_to_main', name: 'Egress Hold' },
     { key: 'capture_learnings', name: 'Capture Learnings' },
   ],
   kickoff: [
@@ -225,7 +229,7 @@ const WF_STEPS: Record<string, { key: string; name: string; loopHint?: string }[
     { key: 'task_execution', name: 'Fix Task' },
     { key: 'qa_validation', name: 'QA Validation' },
     { key: 'code_review', name: 'Code Review' },
-    { key: 'merge_to_main', name: 'Merge to Main' },
+    { key: 'merge_to_main', name: 'Egress Hold' },
     { key: 'capture_learnings', name: 'Capture Learnings' },
   ],
   // PRD-001 v1: onboarding workflow for existing projects.
@@ -1302,8 +1306,8 @@ function StepDetail({
   }
 
   if (activeKey === 'completed') {
-    const msg = wf.type === 'execution' ? 'The review branch is ready to merge to main.'
-      : wf.type === 'bugfix' ? 'Bug fixed and merged — the fix branch is cleaned up.'
+    const msg = wf.type === 'execution' ? 'This historical workflow is complete.'
+      : wf.type === 'bugfix' ? 'This historical bugfix workflow is complete.'
       : wf.type === 'kickoff' ? 'Kickoff complete — project is ready for PRD iterations.'
       : 'PRD has been approved.'
     return (
@@ -1321,7 +1325,7 @@ function StepDetail({
             background: 'var(--green)', color: '#0d0f14',
             fontFamily: 'var(--mono)', fontWeight: 700, fontSize: 12, cursor: 'pointer',
           }}>
-            Merge &amp; Clean Up
+            Clear Completed Workflow
           </button>
         </div>
       </div>
@@ -1580,8 +1584,22 @@ function StepDetail({
         )
       })()}
 
-      {/* Error state — show retry for merge steps */}
-      {isCurrentStep && step.status === 'error' && (activeKey === 'merge_for_review' || activeKey === 'merge_to_main') && (
+      {/* A1c Commit 1: visible, non-actionable egress boundary. */}
+      {isCurrentStep && activeKey === 'merge_to_main' && (
+        <ActionArea label="Egress not installed — candidate preserved:">
+          <div style={{ marginBottom: 8, fontSize: 12, color: 'var(--text-dim)', fontFamily: 'var(--mono)', lineHeight: 1.5 }}>
+            Build Studio cannot merge, push, tag, or delete this run&apos;s branch. The candidate
+            {wf.branch ? <> <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{wf.branch}</span></> : null}
+            {' '}is parked intact until A1c installs reviewed PR egress.
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--orange)', fontFamily: 'var(--mono)' }}>
+            {step.code || 'EGRESS_NOT_INSTALLED'}
+          </div>
+        </ActionArea>
+      )}
+
+      {/* Error state — retry remains valid for internal review-branch integration only. */}
+      {isCurrentStep && step.status === 'error' && activeKey === 'merge_for_review' && (
         <ActionArea label="Merge failed:">
           <div style={{ marginBottom: 8, fontSize: 12, color: 'var(--red)', fontFamily: 'var(--mono)' }}>
             {step.error || 'Unknown error'}
@@ -1595,7 +1613,7 @@ function StepDetail({
       {/* Actions */}
       {isCurrentStep && step.status === 'pending' && agents.length === 0 && (() => {
         // Manual steps that don't launch agents — show approve/skip instead
-        const manualSteps = ['demo_review', 'device_testing', 'merge_to_main', 'merge_for_review', 'owner_signoff', 'owner_consultations']
+        const manualSteps = ['demo_review', 'device_testing', 'merge_for_review', 'owner_signoff', 'owner_consultations']
         if (manualSteps.includes(activeKey)) {
           const isOwnerConsult = activeKey === 'owner_consultations'
           const isDeviceTest = activeKey === 'device_testing'
@@ -1741,7 +1759,7 @@ function StepDetail({
       {/* A parked run gets a status surface instead of controls. */}
       {wf.technicalStop && <TechnicalStopPanel stop={wf.technicalStop} />}
 
-      {!wf.technicalStop && isCurrentStep && (step.status !== 'pending' || agents.length > 0) && !(step.status === 'error' && agents.length === 0) && (
+      {!wf.technicalStop && isCurrentStep && activeKey !== 'merge_to_main' && (step.status !== 'pending' || agents.length > 0) && !(step.status === 'error' && agents.length === 0) && (
         <StepActions
           activeKey={activeKey}
           wfType={wf.type}

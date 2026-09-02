@@ -227,7 +227,7 @@ test('an interrupted rebase is reported, not papered over as success', async () 
   fs.rmSync(path.join(local, '.git', 'rebase-merge'), { recursive: true, force: true });
 });
 
-test('a detached HEAD is named, not turned into "invalid refspec"', async () => {
+test('a detached HEAD gets the A1c remote-egress refusal, never "invalid refspec"', async () => {
   // Reported from a real project: `git branch --show-current` is empty when
   // detached, so `git push origin ''` reached git and came back with a refspec
   // error that named neither the cause nor the fix.
@@ -236,11 +236,11 @@ test('a detached HEAD is named, not turned into "invalid refspec"', async () => 
 
   const push = await fetch(`${baseUrl}/api/deployment/push`, { method: 'POST' });
   const pushBody = await push.json();
-  assert.strictEqual(push.status, 400);
-  assert.strictEqual(pushBody.detachedHead, true);
-  assert.match(pushBody.error, /detached/i);
+  assert.strictEqual(push.status, 409);
+  assert.strictEqual(pushBody.code, 'REMOTE_MUTATION_REMOVED');
+  assert.strictEqual(pushBody.egress, 'not_installed');
   assert.doesNotMatch(pushBody.error, /refspec/i);
-  assert.match(pushBody.error, /git branch/, 'tells you how to save a detached commit');
+  assert.match(pushBody.error, /remote mutation/i);
 
   const rb = await rebase();
   assert.strictEqual(rb.status, 400);

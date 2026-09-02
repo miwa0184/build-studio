@@ -233,21 +233,6 @@ export function CicdTab() {
     }
   }, [api, startInvestigatePolling])
 
-  const handleAcceptFix = useCallback(async (summary: string) => {
-    setInvestigate({ phase: 'accepting' })
-    const data = await api.post('/deployment/ci-fix-accept', { summary })
-    if (data.ok) {
-      const msg = data.mode === 'pr'
-        ? (data.prUrl ? `PR opened: ${data.prUrl}` : `Pushed fix branch ${data.branch}`)
-        : `Pushed ${data.hash} — CI re-running`
-      setInvestigate({ phase: 'accepted', message: msg })
-      load()
-      loadCiStatus()
-    } else {
-      setInvestigate({ phase: 'error', message: data.error || 'Accept failed.' })
-    }
-  }, [api, load, loadCiStatus])
-
   const handleDismissFix = useCallback(async () => {
     await api.post('/deployment/ci-fix-dismiss')
     setInvestigate({ phase: 'idle' })
@@ -363,9 +348,9 @@ export function CicdTab() {
 
   const devOpsCfg = roleConfig('DevOps')
   const devOpsAvatar = avatarSrc('DevOps', 88)
-  // A detached HEAD has no branch to push, and pushing was producing git's
-  // "invalid refspec ''" rather than saying so.
-  const canPush = info.hasRemote && info.deployCommits.length > 0 && !info.detachedHead
+  // A1c Commit 1: Git egress is deliberately unavailable. Keep the control
+  // visible as a boundary marker, but never make it actionable.
+  const canPush = false
   // Strictly the server's verdict, and deliberately not inferred from `behind`.
   // A project-server still running an older bundle sends neither `canRebase` nor
   // `compareRef` and has no /deployment/rebase route — inferring the button into
@@ -541,6 +526,7 @@ export function CicdTab() {
             <button
               onClick={handlePush}
               disabled={!canPush || pushing}
+              title="Git egress is not installed — candidate and default branches are preserved"
               style={{
                 padding: '6px 16px', borderRadius: 6,
                 border: 'none',
@@ -552,7 +538,7 @@ export function CicdTab() {
                 transition: 'all 0.15s',
               }}
             >
-              {pushing ? 'Pushing...' : 'Push to GitHub'}
+              Git egress not installed
             </button>
             {pushResult && (
               <span style={{
@@ -814,7 +800,6 @@ export function CicdTab() {
             <InvestigationPanel
               state={investigate}
               strategy={info.ciFixStrategy}
-              onAccept={handleAcceptFix}
               onDismiss={handleDismissFix}
               onReset={() => setInvestigate({ phase: 'idle' })}
             />
@@ -888,10 +873,6 @@ export function CicdTab() {
   )
 }
 
-const ciBtnPrimary: React.CSSProperties = {
-  padding: '5px 14px', borderRadius: 4, border: 'none', background: 'var(--green)', color: '#000',
-  fontFamily: 'var(--mono)', fontSize: 11, fontWeight: 600, cursor: 'pointer',
-}
 const ciBtnGhost: React.CSSProperties = {
   padding: '5px 12px', borderRadius: 4, border: '1px solid var(--border)', background: 'transparent',
   color: 'var(--muted)', fontFamily: 'var(--mono)', fontSize: 11, cursor: 'pointer',
@@ -909,11 +890,10 @@ function CiField({ label, value }: { label: string; value: string }) {
 }
 
 function InvestigationPanel({
-  state, strategy, onAccept, onDismiss, onReset,
+  state, strategy, onDismiss, onReset,
 }: {
   state: InvestigatePhase
   strategy?: string
-  onAccept: (summary: string) => void
   onDismiss: () => void
   onReset: () => void
 }) {
@@ -948,7 +928,6 @@ function InvestigationPanel({
 
   // proposal
   const p = state.proposal
-  const willText = strategy === 'pr' ? 'open a pull request' : 'commit + push to main (re-runs CI)'
   return (
     <div style={card}>
       <div style={{ fontFamily: 'var(--mono)', fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--text-dim)', marginBottom: 10 }}>
@@ -980,11 +959,11 @@ function InvestigationPanel({
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 10, flexWrap: 'wrap' }}>
         {p.hasChanges ? (
           <>
-            <button onClick={() => onAccept(p.summary)} style={ciBtnPrimary} title={`Accept will ${willText}`}>
-              Accept — {strategy === 'pr' ? 'open PR' : 'commit & push'}
-            </button>
             <button onClick={onDismiss} style={ciBtnGhost}>Dismiss</button>
-            <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--muted)' }}>Accept will {willText}.</span>
+            <span style={{ fontFamily: 'var(--mono)', fontSize: 9, color: 'var(--orange)' }}>
+              Egress not installed — this proposal cannot commit, push, or open a PR from Build Studio.
+              Strategy {strategy || 'unknown'} remains informational only.
+            </span>
           </>
         ) : (
           <button onClick={onDismiss} style={ciBtnGhost}>Close</button>

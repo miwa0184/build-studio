@@ -284,24 +284,24 @@ test('GET /workflow exposes the resolved bugfix sequence for the hub timeline', 
   }
 });
 
-// ─── 4. Pre-merge scan wiring (bugfix-only LLM + hygiene gates) ───────────────
+// ─── 4. Candidate approval scan wiring (bugfix-only LLM + hygiene gates) ─────
 
-test('bugfix merge: LLM scan blocks a regression test with a real LLM API URL', async () => {
+test('bugfix approval: LLM scan blocks a regression test with a real LLM API URL', async () => {
   const fx = makeFixtureRepo();
   const srv = await mountRouter(fx.root);
   try {
-    stageBugfixAtMerge(fx, srv, 'src/regression/ls-001.test.js',
+    stageBugfixAtApproval(fx, srv, 'src/regression/ls-001.test.js',
       `test('rejects empty', () => {\n  const url = 'https://api.anthropic.com/v1/messages';\n  expect(url).toBeTruthy();\n});\n`);
     const mainBefore = gitRev(fx.root, 'main');
 
-    const res = await srv.post('/api/workflow/advance', {});
+    const res = await srv.post('/api/workflow/advance', { action: 'approve' });
     assert.equal(res.status, 400, JSON.stringify(res.body));
     assert.ok((res.body.violations || []).some(v => /ls-001\.test\.js/.test(v)), JSON.stringify(res.body));
 
-    // Merge blocked — step errored, still on merge_to_main, main untouched.
+    // Approval is blocked before the A1c egress hold; main stays untouched.
     const wf = srv.state.loadWorkflow();
-    assert.equal(wf.currentStep, 'merge_to_main');
-    assert.equal(wf.steps.merge_to_main.status, 'error');
+    assert.equal(wf.currentStep, 'code_review');
+    assert.equal(wf.steps.code_review.status, 'error');
     assert.equal(gitRev(fx.root, 'main'), mainBefore);
   } finally {
     await srv.close();
@@ -309,7 +309,7 @@ test('bugfix merge: LLM scan blocks a regression test with a real LLM API URL', 
   }
 });
 
-test('bugfix merge: LLM scan blocks an OpenRouter call', async () => {
+test('bugfix approval: LLM scan blocks an OpenRouter call', async () => {
   // OpenRouter is a GATEWAY: one key fronts every model behind it, so a test
   // calling it bills exactly like a direct provider call while naming none of
   // the providers the list originally knew about. Missing until 2026-08-02,
@@ -318,11 +318,11 @@ test('bugfix merge: LLM scan blocks an OpenRouter call', async () => {
   const fx = makeFixtureRepo();
   const srv = await mountRouter(fx.root);
   try {
-    stageBugfixAtMerge(fx, srv, 'src/regression/ls-001.test.js',
+    stageBugfixAtApproval(fx, srv, 'src/regression/ls-001.test.js',
       `test('lists models', async () => {\n  const r = await fetch('https://openrouter.ai/api/v1/models');\n  expect(r.ok).toBe(true);\n});\n`);
     const mainBefore = gitRev(fx.root, 'main');
 
-    const res = await srv.post('/api/workflow/advance', {});
+    const res = await srv.post('/api/workflow/advance', { action: 'approve' });
     assert.equal(res.status, 400, JSON.stringify(res.body));
     assert.ok((res.body.violations || []).some(v => /ls-001\.test\.js/.test(v)), JSON.stringify(res.body));
     assert.equal(gitRev(fx.root, 'main'), mainBefore);
@@ -332,24 +332,25 @@ test('bugfix merge: LLM scan blocks an OpenRouter call', async () => {
   }
 });
 
-test('bugfix merge: @llm-url-fixture waiver passes the scan and the merge proceeds', async () => {
+test('bugfix approval: @llm-url-fixture waiver passes the scan and parks at egress', async () => {
   const fx = makeFixtureRepo();
   const srv = await mountRouter(fx.root);
   try {
-    stageBugfixAtMerge(fx, srv, 'src/regression/ls-001.test.js',
+    stageBugfixAtApproval(fx, srv, 'src/regression/ls-001.test.js',
       `// @llm-url-fixture — asserts the endpoint is REJECTED by the guard, never called\n` +
       `test('rejects prod endpoint', () => {\n  const url = 'https://api.anthropic.com/v1/messages';\n  expect(() => guard(url)).toThrow();\n});\n`);
 
-    const res = await srv.post('/api/workflow/advance', {});
+    const res = await srv.post('/api/workflow/advance', { action: 'approve' });
     assert.equal(res.status, 200, JSON.stringify(res.body));
 
     const wf = srv.state.loadWorkflow();
-    assert.equal(wf.steps.merge_to_main.status, 'completed');
-    assert.equal(wf.currentStep, 'capture_learnings');
-    // Bug finalized: Done + fixed_in stamped with the merge sha.
+    assert.equal(wf.steps.code_review.status, 'completed');
+    assert.equal(wf.steps.merge_to_main.status, 'pending');
+    assert.equal(wf.currentStep, 'merge_to_main');
+    // Acceptance/fixed_in is deferred to reviewed A1c egress.
     const bug = readItem(fx.root, './docs', 'LS-001');
-    assert.equal(bug.status, 'Done');
-    assert.match(String(bug.fixed_in || ''), /^[0-9a-f]{7,40}$/);
+    assert.equal(bug.status, 'Backlog');
+    assert.equal(bug.fixed_in, undefined);
   } finally {
     await srv.close();
     fx.clean();
@@ -362,10 +363,9 @@ function gitRev(root, ref) {
   return execFileSync('git', ['rev-parse', ref], { cwd: root, encoding: 'utf8' }).trim();
 }
 
-// Put the fixture repo into the state a bugfix run is in when it reaches
-// merge_to_main: a committed fix/ls-001 branch (carrying `testRelPath`) and a
-// persisted workflow at currentStep=merge_to_main.
-function stageBugfixAtMerge(fx, srv, testRelPath, testContent) {
+// Put the fixture repo into the state a bugfix run is in at its last candidate
+// approval gate: a committed fix/ls-001 branch carrying `testRelPath`.
+function stageBugfixAtApproval(fx, srv, testRelPath, testContent) {
   execFileSync('git', ['checkout', '-q', '-b', 'fix/ls-001'], { cwd: fx.root });
   const abs = path.join(fx.root, testRelPath);
   fs.mkdirSync(path.dirname(abs), { recursive: true });
@@ -375,13 +375,13 @@ function stageBugfixAtMerge(fx, srv, testRelPath, testContent) {
 
   srv.state.saveWorkflow({
     id: 'bugfix-merge-test', type: 'bugfix', input: 'LS-001', itemId: 'LS-001',
-    prdPath: 'docs/backlog/LS-001.md', currentStep: 'merge_to_main',
+    prdPath: 'docs/backlog/LS-001.md', currentStep: 'code_review',
     branch: 'fix/ls-001', defaultBranch: 'main', reviewBranch: 'fix/ls-001',
     round: 1, feedback: [], sessionName: 'wf-merge-test',
     steps: {
       task_execution: { status: 'completed', agents: [] },
       qa_validation: { status: 'completed', agents: [] },
-      code_review: { status: 'completed', agents: [] },
+      code_review: { status: 'running', agents: [] },
       merge_to_main: { status: 'pending' },
       capture_learnings: { status: 'pending', agents: [] },
     },
