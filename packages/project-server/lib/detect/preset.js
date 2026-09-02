@@ -146,4 +146,4 @@ function globExists(projectRoot, pattern) {
   } catch { return false; }
 }
 
-module.exports = { detectPreset };
+module.exports = { detectPreset, globExists };

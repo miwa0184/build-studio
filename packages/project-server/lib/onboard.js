@@ -17,13 +17,19 @@ const path = require('path');
 const yaml = require('js-yaml');
 const { execFileSync } = require('child_process');
 
-const { detectPreset } = require('./detect/preset');
+const { detectPreset, globExists } = require('./detect/preset');
 const { detectDeployment } = require('./detect/deployment');
 const { detectDevCommands } = require('./detect/dev-commands');
 const { detectExistingDocs } = require('./detect/existing-docs');
 
+// Recognizable-code markers. An entry may contain '*': an Xcode project is a
+// DIRECTORY carrying the app's name ('SudokuDaily.xcodeproj'), so an exact-
+// filename check can never match it. This gate runs BEFORE detectPreset, so a
+// shape missing here is unreachable to preset detection however well
+// detect/preset.js recognizes it.
 const PROJECT_FILE_MARKERS = [
   'package.json', 'Podfile', 'Cargo.toml', 'go.mod', 'pyproject.toml', 'Gemfile', 'composer.json',
+  '*.xcodeproj', '*.xcworkspace', 'project.yml', 'Package.swift',
 ];
 
 const LEARNING_CATEGORIES = ['architecture', 'backend', 'frontend', 'devops', 'qa', 'security', 'workflow'];
@@ -46,10 +52,11 @@ function detectAll(targetPath) {
   }
 
   // recognizable code
-  const hasCode = PROJECT_FILE_MARKERS.some((f) => fs.existsSync(path.join(targetPath, f)));
+  const hasCode = PROJECT_FILE_MARKERS.some((f) => globExists(targetPath, f));
   if (!hasCode) {
+    const listed = PROJECT_FILE_MARKERS.slice(0, -1).join(', ') + ', or ' + PROJECT_FILE_MARKERS.at(-1);
     throw makeErr(
-      'No recognizable project file found (package.json, Podfile, Cargo.toml, go.mod, pyproject.toml, Gemfile, or composer.json). Use New Project for empty directories.',
+      `No recognizable project file found (${listed}). Use New Project for empty directories.`,
       'NO_CODE'
     );
   }
