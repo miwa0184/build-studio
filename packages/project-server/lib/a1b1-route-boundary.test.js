@@ -363,6 +363,8 @@ test('R17 — injected ADMISSION_BACKSTOP is typed JSON without stacktrace', asy
   };
   const state = { loadRun: () => runState, saveRun() {} };
   const gitOps = {
+    getCurrentBranch() { return 'exec/injected-run'; },
+    getDefaultBranch() { return 'main'; },
     commitsAhead() { throw backstop; },
     abortMerge() { throw new Error('admission error must not enter conflict cleanup'); },
   };

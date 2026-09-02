@@ -155,11 +155,10 @@ test('R9 — the real tick holds an acceptance-sensitive step and spends no budg
   });
 });
 
-test('R9 — holding repeatedly across ticks still spends nothing', async () => {
-  // The failure mode was cumulative: one refusal per 8-second tick against a
-  // condition that never clears. A single tick catches it — the spend happened
-  // on the first one — and the assertion that the hold was recorded proves the
-  // tick actually ran.
+test('R9 — the A1c merge boundary is autonomous-inert and spends nothing', async () => {
+  // merge_to_main is now categorically outside auto-advance. A task acceptance
+  // gap therefore needs no per-step hold record here: the stronger egress
+  // boundary leaves the pending step untouched and spends no refusal budget.
   const wf = runWithGap('merge_to_main');
 
   await withServer(wf, async (base, config) => {
@@ -170,7 +169,8 @@ test('R9 — holding repeatedly across ticks still spends nothing', async () => 
     await new Promise((r) => setTimeout(r, TICK_SETTLE_MS));
 
     const guard = createRunGuard({ statePath: config.statePath });
-    assert.ok(wf.steps.merge_to_main.acceptanceHold, 'the tick must have run');
+    assert.equal(wf.steps.merge_to_main.acceptanceHold, undefined);
+    assert.equal(wf.steps.merge_to_main.status, 'pending');
     assert.equal(guard.count(wf.id, COUNTERS.AUTO_ADVANCE_REFUSALS), 0);
     assert.equal(wf.currentStep, 'merge_to_main', 'the run must not have merged');
   });

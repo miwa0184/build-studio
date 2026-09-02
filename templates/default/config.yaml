@@ -118,12 +118,13 @@ agent_defaults:
 #   reviewer_effort: null
 
 # Deployment and versioning strategy (optional):
-# Defaults: trunk-based, semver tags, auto-tag + auto-push on merge-to-main.
+# Defaults retained for future deployment policy. Workflow egress does not tag
+# or push the default branch until A1c installs reviewed PR egress.
 # deployment:
 #   strategy: trunk           # trunk | gitflow (default: trunk)
 #   versioning: semver        # semver | calver | none (default: semver)
-#   auto_tag: true            # create git tag on merge-to-main
-#   auto_deploy: true         # push to remote after merge (triggers CD pipeline)
+#   auto_tag: true            # legacy preference; inert in workflow egress before A1c
+#   auto_deploy: true         # retained preference; workflow egress ignores it before A1c
 #   tag_prefix: v             # tag format: v1.2.3
 #   initial_version: 0.1.0   # first tag if no tags exist yet
 #   # Optional: multiple, clearly-labelled deploy targets (e.g. a monorepo with a

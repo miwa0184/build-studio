@@ -152,6 +152,18 @@ function createGitOps(config) {
       try { execGit(['rev-parse', '--verify', branch]); return true; } catch (_) { return false; }
     },
 
+    getCurrentBranch() {
+      try { return execGit(['branch', '--show-current']); } catch (_) { return ''; }
+    },
+
+    getDefaultBranch() {
+      try {
+        return execGit(['rev-parse', '--abbrev-ref', 'origin/HEAD']).replace(/^origin\//, '') || 'main';
+      } catch (_) {
+        return config.default_branch || 'main';
+      }
+    },
+
     commitsAhead(branch, base = 'main') {
       try { return parseInt(execGit(['rev-list', '--count', `${base}..${branch}`])) || 0; } catch (_) { return 0; }
     },

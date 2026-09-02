@@ -25,6 +25,7 @@ const blockedTasks = require('../blocked-tasks');
 const { isAgentVerdict } = require('../feedback-provenance');
 const { isTechnicalStop, refusalPayload, TerminalRunError, TechnicalStopPersistError } = require('../technical-stop');
 const { assertInside } = require('../path-guard');
+const { LOCAL_MERGE_REMOVED, egressRefusal } = require('../egress-boundary');
 
 // Common instruction fragments injected into all agent prompts.
 // Placeholders {{CONTEXT_BUDGET}} and {{SOFT_THRESHOLD}} are replaced
@@ -531,6 +532,31 @@ function createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast, deps = 
   }
 
   /**
+   * A1c Commit 1: there is deliberately no local ship path behind
+   * `merge_to_main`. Park the durable workflow at the boundary and preserve
+   * every candidate ref for the later PR-egress slice.
+   */
+  function parkAtEgressBoundary(wf) {
+    const prior = (wf.steps && wf.steps.merge_to_main) || {};
+    wf.steps.merge_to_main = {
+      ...prior,
+      status: 'blocked',
+      code: LOCAL_MERGE_REMOVED,
+      egress: 'not_installed',
+      error: egressRefusal(LOCAL_MERGE_REMOVED).error,
+      candidateBranch: wf.branch || wf.reviewBranch || null,
+      defaultBranch: wf.defaultBranch || 'main',
+    };
+    wf.currentStep = 'merge_to_main';
+    // A persisted autonomous policy must not retry a boundary that cannot
+    // advance until A1c exists.
+    wf.autoAdvance = false;
+    wf.autoAdvanceSkipDemoReview = false;
+    state.saveWorkflow(wf);
+    return egressRefusal(LOCAL_MERGE_REMOVED, { workflow: wf });
+  }
+
+  /**
    * Advance any backlog items (Feature, Bug, or Task) linked to this PRD to
    * `targetStatus`, then re-render the BACKLOG section in project-state.md so
    * the display lines reflect the new statuses. Safe to call when there's no
@@ -601,8 +627,8 @@ function createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast, deps = 
    * Commit uncommitted docs changes (backlog item status, project-state.md,
    * worklog) on the CURRENT branch. The server writes these status transitions
    * directly to the working tree; without this they'd be left dirty (review:
-   * stranded on the default branch; execution: dirty after merge, blocking the
-   * next run's clean-tree guardrail). No-op when nothing under docs/ is dirty.
+   * stranded on the default branch; execution: an ambiguous candidate at the
+   * egress boundary). No-op when nothing under docs/ is dirty.
    */
   function commitWorkflowDocs(message) {
     try {
@@ -781,135 +807,6 @@ function createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast, deps = 
       console.log(`[workflow] Worklog written to ${OBSIDIAN_VAULT}/${dailyPath} for ${projectName}`);
     } catch (e) {
       console.warn(`[workflow] Failed to write worklog: ${e.message}`);
-    }
-  }
-
-  /**
-   * Auto-tag and push to remote after merge-to-main, based on deployment config.
-   */
-  function tagAndPush(wf) {
-    const dep = config.deployment || {};
-    const { execFileSync } = require('child_process');
-    const execGit = (args) => execFileSync('git', args, { cwd: projectRoot, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-
-    // Auto-tag (skip if HEAD already has a tag — allows manual major/minor tags)
-    if (dep.auto_tag && dep.versioning !== 'none') {
-      try {
-        const prefix = dep.tag_prefix || 'v';
-
-        // Check if HEAD already has a tag (manual tag takes precedence)
-        try {
-          const existing = execGit(['tag', '--points-at', 'HEAD']);
-          if (existing) {
-            wf.releaseTag = existing.split('\n')[0];
-            console.log(`[workflow] HEAD already tagged ${wf.releaseTag} — skipping auto-tag`);
-            // Skip to auto-push
-            if (dep.auto_deploy) {
-              try {
-                execGit(['remote', 'get-url', 'origin']);
-                execGit(['push', 'origin', 'main']);
-                execGit(['push', 'origin', wf.releaseTag]);
-                console.log(`[workflow] Pushed to origin/main with tag ${wf.releaseTag}`);
-                writeChangelog(wf);
-              } catch (e) {
-                console.warn(`[workflow] Auto-push failed: ${e.message}`);
-              }
-            }
-            return;
-          }
-        } catch {}
-
-        let nextVersion;
-
-        if (dep.versioning === 'calver') {
-          const now = new Date();
-          const datePart = `${now.getFullYear()}.${String(now.getMonth() + 1).padStart(2, '0')}.${String(now.getDate()).padStart(2, '0')}`;
-          // Find existing tags for today, increment build number
-          let build = 0;
-          try {
-            const tags = execGit(['tag', '-l', `${prefix}${datePart}*`]);
-            if (tags) build = tags.split('\n').length;
-          } catch {}
-          nextVersion = build > 0 ? `${datePart}.${build}` : datePart;
-        } else {
-          // semver: find latest tag, bump patch
-          let latest = dep.initial_version || '0.1.0';
-          try {
-            const tag = execGit(['describe', '--tags', '--abbrev=0', '--match', `${prefix}*`]);
-            if (tag) latest = tag.replace(new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`), '');
-          } catch {} // no tags yet
-          const parts = latest.split('.').map(Number);
-          parts[2] = (parts[2] || 0) + 1;
-          nextVersion = parts.join('.');
-        }
-
-        const tag = `${prefix}${nextVersion}`;
-        const prdMatch = (wf.input || '').match(/PRD-\d+[a-z]*/i);
-        const message = prdMatch ? `${prdMatch[0]}: ${wf.input}` : wf.input || 'release';
-        execGit(['tag', '-a', tag, '-m', message]);
-        wf.releaseTag = tag;
-        console.log(`[workflow] Tagged ${tag}`);
-      } catch (e) {
-        console.warn(`[workflow] Auto-tag failed: ${e.message}`);
-      }
-    }
-
-    // Auto-push (push commits + tags to remote, triggering CD)
-    if (dep.auto_deploy) {
-      try {
-        // Check if remote exists
-        execGit(['remote', 'get-url', 'origin']);
-        execGit(['push', 'origin', 'main']);
-        if (wf.releaseTag) execGit(['push', 'origin', wf.releaseTag]);
-        console.log(`[workflow] Pushed to origin/main${wf.releaseTag ? ` with tag ${wf.releaseTag}` : ''}`);
-        writeChangelog(wf);
-      } catch (e) {
-        // No remote or push failed — not fatal, log and continue
-        console.warn(`[workflow] Auto-push failed (no remote or auth issue): ${e.message}`);
-      }
-    }
-  }
-
-  /**
-   * Write a deploy changelog entry to the Obsidian daily note after pushing to production.
-   */
-  function writeChangelog(wf) {
-    try {
-      const { execFileSync } = require('child_process');
-      const projectName = config.name || path.basename(projectRoot);
-      const execGit = (args) => execFileSync('git', args, { cwd: projectRoot, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-
-      const { path: dailyPath, yyyy, mm, dd, hhmm } = obsidianDailyPath();
-
-      // Get commits between previous tag and current tag (or HEAD)
-      const tag = wf.releaseTag;
-      let commits = [];
-      try {
-        const prefix = (config.deployment || {}).tag_prefix || 'v';
-        let range = tag;
-        try {
-          const prevTag = execGit(['describe', '--tags', '--abbrev=0', `${tag}^`, '--match', `${prefix}*`]);
-          if (prevTag) range = `${prevTag}..${tag}`;
-        } catch {}
-        const log = execGit(['log', range, '--oneline', '--no-decorate']);
-        if (log) commits = log.split('\n').slice(0, 10);
-      } catch {}
-
-      if (commits.length === 0) {
-        commits = [wf.input || 'release'];
-      }
-
-      const lines = [`\\n### ${hhmm} — ${projectName} deployed ${tag || ''}`];
-      for (const c of commits) {
-        const sp = c.indexOf(' ');
-        const msg = sp > 0 ? c.slice(sp + 1) : c;
-        lines.push(`- ${msg}`);
-      }
-      const content = lines.join('\\n');
-      obsidianAppend(dailyPath, content, yyyy, mm, dd);
-      console.log(`[workflow] Changelog written to ${OBSIDIAN_VAULT}/${dailyPath} for ${projectName} ${tag || ''}`);
-    } catch (e) {
-      console.warn(`[workflow] Failed to write changelog: ${e.message}`);
     }
   }
 
@@ -1561,8 +1458,8 @@ function createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast, deps = 
       // tree dirty (deletions + untracked _archive files) — it accumulates run
       // over run and reads as "learnings not getting checked in". The
       // cross-project LEARNINGS_DIR is not a git repo, so nothing to commit there.
-      // Runs post-merge (capture_learnings is after merge_to_main), so the
-      // checkout is on the default branch — the right place for these doc moves.
+      // This legacy post-egress path is unreachable for new runs until A1c
+      // installs PR egress; historical workflows may still contain the step.
       if (movedInProject) {
         try {
           const { execFileSync } = require('child_process');
@@ -2400,35 +2297,6 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     }
   }
 
-  function markPrdDone(prdInput) {
-    const psFile = path.join(docsPath, 'project-state.md');
-    if (!fs.existsSync(psFile)) return;
-    const original = fs.readFileSync(psFile, 'utf8');
-    const prdId = prdInput.replace(/\s+/g, '-');
-    const today = new Date().toISOString().slice(0, 10);
-    const { content, backlogRowChanged } = markPrdDoneContent(original, prdId, today);
-
-    if (content === original) {
-      console.log(`[workflow] markPrdDone(${prdId}): no changes to project-state.md (no active row matched + no Active PRD/Phase update applied)`);
-      return;
-    }
-    fs.writeFileSync(psFile, content);
-
-    // Commit the change so it lands on main alongside the merge.
-    try {
-      const { execFileSync } = require('child_process');
-      execFileSync('git', ['add', psFile], { cwd: projectRoot });
-      execFileSync('git', [
-        'commit',
-        '-m',
-        `chore(${prdId.toLowerCase()}): mark ${prdId} done in project-state.md`,
-      ], { cwd: projectRoot });
-      console.log(`[workflow] markPrdDone(${prdId}): backlog${backlogRowChanged ? ' row updated' : ' row unchanged'}, project-state.md committed`);
-    } catch (e) {
-      console.log(`[workflow] markPrdDone(${prdId}): wrote project-state.md but commit failed: ${e.message}`);
-    }
-  }
-
   // --- Orchestrator/Sequential review mode ---
   function launchOrchestratorReview(wf, reviewRoles, prdPath, feedbackDir, closureBlock = '') {
     const mode = wf.reviewMode || config.review_mode || 'parallel';
@@ -2671,7 +2539,8 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     state.deleteWorkflow();
   }
 
-  // Full cleanup: remove worktrees and branches — only safe after merge to main
+  // Explicit destructive cleanup used only when the operator chooses
+  // Cancel + Delete Branches. It is never part of the A1c egress boundary.
   function cleanupBranches(wf) {
     const branches = new Set();
     for (const step of Object.values(wf.steps || {})) {
@@ -3580,15 +3449,12 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     // only start from a clean default branch. This alone prevents a new run from
     // stacking on a previous run's leftover branch (the PRD-025-on-PRD-024 failure)
     // or sweeping unrelated uncommitted work into the run. Deterministic per-run
-    // branch CREATION + merge/delete lifecycle is staged separately — it requires
-    // rewiring merge_for_review (which builds its integration branch from main and
-    // is entangled with the worktree flow), so it must be validated on both an iOS
-    // and a web run before shipping.
+    // branch CREATION is installed; reviewed PR egress is a separate A1c slice.
     // PRD branching strategy (2026-06-03): every review/execution run works on its
     // OWN branch (review/<id> or exec/<id>), created fresh from the default branch,
-    // surfaced in the UI, and merged + deleted + returned-to-default when the run
-    // ends. Deterministic — no agent-freelanced branches, and the guardrail blocks
-    // a run from stacking on a previous run's leftover branch / a dirty tree.
+    // surfaced in the UI, and preserved when the run reaches egress.
+    // Deterministic — no agent-freelanced branches, and the guardrail blocks a
+    // run from stacking on a previous run's candidate branch / a dirty tree.
     let runBranch = null;
     let runDefaultBranch = 'main';
     if (type === 'review' || type === 'execution' || type === 'bugfix') {
@@ -3598,28 +3464,28 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
       let curBranch = '';
       try { curBranch = g(['branch', '--show-current']); } catch {}
       if (curBranch !== runDefaultBranch) {
-        return res.status(409).json({ error: `Cannot start a ${type} run: the working tree is on "${curBranch || '(detached HEAD)'}", not ${runDefaultBranch}. Finish, merge, or abort that branch first so the run starts from a clean ${runDefaultBranch}.`, currentBranch: curBranch });
+        return res.status(409).json({ error: `Cannot start a ${type} run: the working tree is on "${curBranch || '(detached HEAD)'}", not ${runDefaultBranch}. Complete the candidate's reviewed egress or cancel that run before starting another from clean ${runDefaultBranch}.`, currentBranch: curBranch });
       }
       // Dirty-tree check applies to branch-creating runs (execution + bugfix):
       // both do `checkout -b <run>/<id>`, which carries uncommitted changes onto
-      // the run branch and would block the final merge_to_main (which refuses a
-      // dirty tree). Review creates no branch and commits to the default branch
+      // the run branch and would make the preserved candidate ambiguous at the
+      // egress boundary. Review creates no branch and commits to the default branch
       // directly, so working with uncommitted drafts present is fine (and matches
       // how the owner works — parallel PRD drafting).
       if (type === 'execution' || type === 'bugfix') {
         let dirty = '';
         try { dirty = g(['status', '--porcelain']); } catch {}
         if (dirty) {
-          return res.status(409).json({ error: `Cannot start a ${type} run: ${runDefaultBranch} has uncommitted changes — they'd be carried onto the run branch and block the final merge. Commit, stash, or discard them first.` });
+          return res.status(409).json({ error: `Cannot start a ${type} run: ${runDefaultBranch} has uncommitted changes — they'd be carried onto the candidate branch. Commit, stash, or discard them first.` });
         }
       }
-      // Branch CREATION is scoped to execution + bugfix (the runs whose code lands
-      // on the default branch). The review WF only refines docs and has multiple
+      // Branch CREATION is scoped to execution + bugfix (the runs that produce
+      // code candidates). The review WF only refines docs and has multiple
       // completion points, so its branch+merge lifecycle is a separate follow-up;
       // for now it commits to the (guardrail-clean) default branch directly.
       if (type === 'execution' || type === 'bugfix') {
         runBranch = type === 'bugfix' ? `fix/${itemId.toLowerCase()}` : `exec/${input.replace(/\s+/g, '-')}`;
-        try { g(['rev-parse', '--verify', runBranch]); return res.status(409).json({ error: `Branch ${runBranch} already exists from a previous run. Merge or delete it first.` }); } catch (_) { /* good — does not exist */ }
+        try { g(['rev-parse', '--verify', runBranch]); return res.status(409).json({ error: `Branch ${runBranch} already exists from a previous run. Complete its reviewed egress or cancel it first.` }); } catch (_) { /* good — does not exist */ }
         try {
           g(['checkout', '-b', runBranch, runDefaultBranch]);
         } catch (e) {
@@ -3659,8 +3525,8 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
       ...(taskPlan ? { taskPlan } : {}),
       round: 1, feedback: [],
       sessionName: `wf-${timestamp}`,
-      // The run's working branch (checked out in the main dir). Everything commits
-      // here; merge_to_main / review-end merges it to `defaultBranch` then deletes it.
+      // The run's working branch (checked out in the main dir). Everything
+      // commits here and the branch remains intact at the A1c egress boundary.
       branch: runBranch,
       defaultBranch: runDefaultBranch,
       reviewBranch: (type === 'execution' || type === 'bugfix') ? runBranch : null,
@@ -3880,7 +3746,8 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     const wf = state.loadWorkflow();
     if (!wf) return res.status(404).json({ error: 'no active workflow' });
     if (wf.currentStep !== 'completed') return res.status(400).json({ error: 'workflow not completed yet' });
-    // Branches already cleaned by merge_to_main — just stop tmux and clear state
+    // Historical completed workflows may predate A1c Commit 1. Finishing only
+    // clears workflow state; it never merges, pushes, tags, or deletes refs.
     stopWorkflow(wf);
     broadcast('worktrees-updated', {});
     res.json({ ok: true });
@@ -4365,8 +4232,9 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     // the manual gate where the owner reviews PM output and provides notes;
     // demo_review and device_testing need a human in front of the device
     // UNLESS the owner opted into Skip Demo Review (auto-advance then skips
-    // demo_review with action=skip).
-    const alwaysManual = ['device_testing', 'owner_consultations'];
+    // demo_review with action=skip). merge_to_main is now an A1c boundary,
+    // never an autonomous action.
+    const alwaysManual = ['device_testing', 'owner_consultations', 'merge_to_main'];
     if (!wf.autoAdvanceSkipDemoReview) alwaysManual.push('demo_review');
     if (alwaysManual.includes(wf.currentStep)) return;
 
@@ -4437,8 +4305,7 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     if (wf.currentStep === 'demo_review' && wf.autoAdvanceSkipDemoReview) {
       action = 'skip';
     } else if (isPending) {
-      const manualSteps = ['merge_to_main', 'capture_learnings'];
-      action = manualSteps.includes(wf.currentStep) ? 'approve' : 'launch';
+      action = wf.currentStep === 'capture_learnings' ? 'approve' : 'launch';
     } else if (allDone) {
       // Detect verdict from agent feedback (server-side detectVerdict)
       const qaStrict = (config.qa_validation && config.qa_validation.strict) !== false;
@@ -4826,7 +4693,7 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
 
       // --- Execution + bugfix workflow transitions ---
       // Bugfix reuses the execution engine (task_execution → qa_validation →
-      // code_review → merge_to_main → capture_learnings); the handler branches on
+      // code_review → merge_to_main egress hold); the handler branches on
       // wf.type where the bugfix step sequence diverges from execution's.
       if (wf.type === 'execution' || wf.type === 'bugfix') {
         return handleExecutionAdvance(wf, effectiveAction, notes, res, req.body);
@@ -5045,7 +4912,7 @@ If you have been compacted and lost this prompt, the original is in your current
 You are a ${role.role}. Read your role definition at .claude/commands/${role.command} first.
 ${archNote}
 Implement TASK ${taskIdx + 1} of ${n} for this PRD.
-${wf.branch ? `\n**Branch discipline:** the workflow has already checked out this run's branch (\`${wf.branch}\`) in your working directory. Commit your work directly on the CURRENT branch — do NOT create, switch, or rename branches, and do NOT open a PR. The workflow merges \`${wf.branch}\` into \`${wf.defaultBranch || 'main'}\` and deletes it when the run ends.\n` : ''}
+${wf.branch ? `\n**Branch discipline:** the workflow has already checked out this run's candidate branch (\`${wf.branch}\`) in your working directory. Commit your work directly on the CURRENT branch — do NOT create, switch, rename, merge, push, delete branches, or open a PR from this builder task. Build Studio preserves \`${wf.branch}\` at the A1c egress boundary; reviewed PR creation and landing are deliberately handled by a later egress stage, not by this agent.\n` : ''}
 PRD path: ${prdPath}
 
 ## YOUR TASK (${taskIdx + 1}/${n})
@@ -7848,21 +7715,55 @@ ${EFFICIENCY_INSTRUCTIONS}`,
     }
 
     if (wf.currentStep === 'code_review' && action === 'approve') {
+      // Bugfix historically deferred these mechanical scans until the local
+      // merge handler. With that handler removed, keep the checks on the last
+      // candidate-quality gate instead of losing them or making egress return
+      // an unrelated error before its typed A1c refusal.
+      if (wf.type === 'bugfix') {
+        const def = wf.defaultBranch || 'main';
+        const llmScan = scanTestFilesForLlmViolations(projectRoot, def);
+        if (llmScan.violations.length > 0) {
+          wf.steps.code_review = {
+            ...(wf.steps.code_review || {}),
+            status: 'error',
+            error: `${llmScan.violations.length} test file(s) on ${wf.branch} would call real LLM APIs. Fix them (or, for a URL asserted as REJECTED, tag the file @llm-url-fixture), commit, and retry approval.\n\n${llmScan.violations.join('\n')}`,
+            violations: llmScan.violations,
+          };
+          state.saveWorkflow(wf);
+          return res.status(400).json({
+            workflow: wf,
+            error: `bugfix approval blocked: ${llmScan.violations.length} LLM test violation(s)`,
+            violations: llmScan.violations,
+          });
+        }
+        const hygieneScan = scanSourceForTestScaffolding(projectRoot, def, config.hygiene || {});
+        if (hygieneScan.violations.length > 0) {
+          wf.steps.code_review = {
+            ...(wf.steps.code_review || {}),
+            status: 'error',
+            error: `${hygieneScan.violations.length} production source file(s) on ${wf.branch} contain test scaffolding that must not ship. Remove it (or exempt via config.hygiene.allow), commit, and retry approval.\n\n${hygieneScan.violations.join('\n')}`,
+            violations: hygieneScan.violations,
+            advisories: hygieneScan.advisories || [],
+          };
+          state.saveWorkflow(wf);
+          return res.status(400).json({
+            workflow: wf,
+            error: `bugfix approval blocked: ${hygieneScan.violations.length} hygiene violation(s)`,
+            violations: hygieneScan.violations,
+            advisories: hygieneScan.advisories || [],
+          });
+        }
+      }
       wf.steps.code_review.status = 'completed';
       // Bugfix runs code_review AFTER qa_validation, as the last gate before the
-      // merge — advance FORWARD in its own sequence (→ merge_to_main), never back
-      // into the execution review→qa fix loop below. When config.bugfix.auto_merge
-      // is true, proceed straight into the merge via the same code path the manual
-      // merge action runs (on any gate failure it surfaces the error identically);
-      // default false stops at the manual merge_to_main gate, exactly like execution.
+      // A1c egress boundary. Advance FORWARD in its own sequence
+      // (→ merge_to_main), never back into the execution review→qa fix loop.
+      // The legacy bugfix.auto_merge setting is intentionally ignored: no
+      // approval may jump directly into an egress implementation.
       if (wf.type === 'bugfix') {
         const next = nextStepInSequence(wf, config, 'code_review') || 'merge_to_main';
         wf.currentStep = next;
         if (!wf.steps[next]) wf.steps[next] = { status: 'pending' };
-        if (next === 'merge_to_main' && config.bugfix && config.bugfix.auto_merge === true) {
-          state.saveWorkflow(wf);
-          return handleExecutionAdvance(wf, action, notes, res, body);
-        }
         state.saveWorkflow(wf);
         return res.json({ workflow: wf, needsAdvance: true });
       }
@@ -8424,7 +8325,7 @@ You are QA. **Your job is to RUN the test suite and report test outcomes — not
       const gate = qaStrictGateVerdict(qaFeedback, config, operatorOverride);
       if (gate.blocked) {
         return res.status(400).json({
-          error: `Cannot approve QA: ${gate.failingCount} test(s) failed and the QA agent did not certify a clean verdict (Approved: yes + Blocking: 0). Project is configured with qa_validation.strict=true and \`main\` is the precondition baseline (zero failing tests on main). All test failures must be addressed before merge. To bypass for this specific approval (e.g. known flake), use {"action":"approve","override":true}. To permanently relax, set qa_validation.strict: false in .build-studio/config.yaml.`,
+          error: `Cannot approve QA: ${gate.failingCount} test(s) failed and the QA agent did not certify a clean verdict (Approved: yes + Blocking: 0). Project is configured with qa_validation.strict=true and \`main\` is the precondition baseline (zero failing tests on main). All test failures must be addressed before egress. To bypass for this specific approval (e.g. known flake), use {"action":"approve","override":true}. To permanently relax, set qa_validation.strict: false in .build-studio/config.yaml.`,
           failingCount: gate.failingCount,
           strict: true,
         });
@@ -8638,7 +8539,7 @@ This is round ${wf.round}.`,
       const skill = secRole ? secRole.skill : 'security';
       const secAgent = [{
         role: 'Security', window: 'security', status: 'pending', reportFeedback: true,
-        instruction: `You are a Security Reviewer. Perform a code-level security audit of the implementation.\n\nPRD path: ${wf.prdPath}\nUse the /${skill} skill.\n\n## AUDIT SCOPE RULES\n1. **Only audit code changes for this PRD** — do not review pre-existing code or raise issues outside the PRD scope.\n2. **Focus on:** injection vulnerabilities, auth/authz gaps, data exposure, input validation, XSS, CSRF, and OWASP Top 10.\n3. **Classify findings** as BLOCKING (must fix before merge) or NON-BLOCKING (track for later).\n4. **If no issues found, say "APPROVE — no security issues found."**`,
+        instruction: `You are a Security Reviewer. Perform a code-level security audit of the implementation.\n\nPRD path: ${wf.prdPath}\nUse the /${skill} skill.\n\n## AUDIT SCOPE RULES\n1. **Only audit code changes for this PRD** — do not review pre-existing code or raise issues outside the PRD scope.\n2. **Focus on:** injection vulnerabilities, auth/authz gaps, data exposure, input validation, XSS, CSRF, and OWASP Top 10.\n3. **Classify findings** as BLOCKING (must fix before egress) or NON-BLOCKING (track for later).\n4. **If no issues found, say "APPROVE — no security issues found."**`,
       }];
       wf.steps.security_audit = { status: 'running', agents: launchWorkflowAgents(wf, secAgent, { useWorktrees: false, cwd: projectRoot }) };
       state.saveWorkflow(wf);
@@ -8689,7 +8590,8 @@ This is round ${wf.round}.`,
       return res.json({ workflow: wf });
     }
 
-    // Demo review step — owner reviews the running app before merge (optional, skippable)
+    // Demo review step — owner reviews the running app before the egress hold
+    // (optional, skippable).
     if (wf.currentStep === 'demo_review' && (action === 'approve' || action === 'skip')) {
       if (action === 'approve') {
         // Owner-gated ACs (device-only checks the AC verifier deferred) close
@@ -8818,222 +8720,11 @@ Set **Approved: no** with **Blocking: N** when any BLOCKING finding exists; thos
       return res.json({ workflow: wf });
     }
 
-    // Merge review branch to main — the "ship it" step
+    // A1c Commit 1 safety closure: the former local ship path has been
+    // removed, not feature-flagged. The later A1c slice will install reviewed
+    // PR egress; until then every direct attempt parks with typed state.
     if (wf.currentStep === 'merge_to_main') {
-      // New branching strategy: the run owns wf.branch (checked out in the main dir).
-      // Land it on the default branch, delete it (local + remote if pushed), remove
-      // any fix worktrees, and return the checkout to the default branch so the next
-      // run starts clean. Legacy runs (no wf.branch) fall through to the old logic.
-      if (wf.branch) {
-        const { execFileSync } = require('child_process');
-        const run = (args) => execFileSync('git', args, { cwd: projectRoot, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-        const def = wf.defaultBranch || 'main';
-        // Bugfix pre-merge gates. Execution runs the LLM-URL + hygiene scans at its
-        // merge_for_review step (mergeDevBranches); a bugfix run has no such step, so
-        // run them here — against the fix branch's diff vs the default branch — before
-        // anything mutates. The bug-fix discipline mandates a new regression test on
-        // every run, exactly the file class these scans protect (a test URL hitting a
-        // real LLM API already billed tokens on life-graph). Failure blocks the merge
-        // with the scan's error surfaced, same as execution — operator fixes or waives
-        // (@llm-url-fixture / config.hygiene.allow) and retries. Guarded to bugfix so
-        // execution's path is byte-identical.
-        if (wf.type === 'bugfix') {
-          const llmScan = scanTestFilesForLlmViolations(projectRoot, def);
-          if (llmScan.violations.length > 0) {
-            wf.steps.merge_to_main = { status: 'error', error: `${llmScan.violations.length} test file(s) on ${wf.branch} would call real LLM APIs. Fix them (or, for a URL asserted as REJECTED, tag the file @llm-url-fixture), commit, and retry the merge.\n\n${llmScan.violations.join('\n')}`, violations: llmScan.violations };
-            state.saveWorkflow(wf);
-            return res.status(400).json({ workflow: wf, error: `bugfix merge blocked: ${llmScan.violations.length} LLM test violation(s)`, violations: llmScan.violations });
-          }
-          const hygieneScan = scanSourceForTestScaffolding(projectRoot, def, config.hygiene || {});
-          if (hygieneScan.violations.length > 0) {
-            wf.steps.merge_to_main = { status: 'error', error: `${hygieneScan.violations.length} production source file(s) on ${wf.branch} contain test scaffolding that must not ship (env failure hooks / test seams). Remove it (or exempt via config.hygiene.allow), commit, and retry the merge.\n\n${hygieneScan.violations.join('\n')}`, violations: hygieneScan.violations, advisories: hygieneScan.advisories || [] };
-            state.saveWorkflow(wf);
-            return res.status(400).json({ workflow: wf, error: `bugfix merge blocked: ${hygieneScan.violations.length} hygiene violation(s)`, violations: hygieneScan.violations, advisories: hygieneScan.advisories || [] });
-          }
-        }
-        // Apply the backlog status transition BEFORE the merge so these doc edits are
-        // captured by the pre-merge docs auto-commit below and land inside the merge
-        // commit — instead of being written to main post-merge and left uncommitted.
-        markPrdDone(wf.input);
-        advanceLinkedFeatures(wf.prdPath, 'Implemented');
-        // Read RAW (untrimmed) porcelain output. The `run()` helper trims the whole
-        // string, which strips the leading status-column space of the FIRST line only
-        // (" M path" → "M path"), shifting it one char so slice(3) drops the path's
-        // first character ("docs/…" → "ocs/…") and a docs/ file is then misclassified
-        // as non-docs — falsely blocking the merge on auto-committable evidence.
-        let dirty = '';
-        try { dirty = execFileSync('git', ['status', '--porcelain'], { cwd: projectRoot, encoding: 'utf8' }); } catch {}
-        if (dirty.trim()) {
-          // QA's visual-smoke regenerates evidence under docs/ on every run and often
-          // leaves it uncommitted. Auto-commit docs/-only changes onto the run branch
-          // (they're part of the PRD and land as a reviewable merge commit). But BLOCK
-          // if anything OUTSIDE docs/ is uncommitted — that's un-reviewed source the
-          // agent should have committed; silently merging it would bypass QA/review.
-          // Porcelain v1: cols 0-1 = XY status, col 2 = space, col 3+ = path.
-          const entries = dirty.split('\n').filter(Boolean).map(l => {
-            const status = l.slice(0, 2);
-            let p = l.slice(3).replace(/^"|"$/g, '');
-            if (p.includes(' -> ')) p = p.split(' -> ').pop();
-            return { status, path: p };
-          });
-          const nonDocs = entries.filter(e => !e.path.startsWith('docs/')).map(e => e.path);
-          if (nonDocs.length > 0) {
-            wf.steps.merge_to_main = { status: 'error', error: `Working tree (${wf.branch}) has uncommitted non-docs changes that must be committed/reviewed first: ${nonDocs.slice(0, 8).join(', ')}${nonDocs.length > 8 ? ` (+${nonDocs.length - 8} more)` : ''}. Commit or stash, then retry the merge.` };
-            state.saveWorkflow(wf);
-            return res.status(500).json({ workflow: wf, error: `merge_to_main: uncommitted non-docs changes on ${wf.branch}`, uncommitted: nonDocs });
-          }
-          // Cross-PRD evidence churn: QA's visual smoke re-renders evidence for OTHER PRDs
-          // (PDFs/PNGs drift byte-wise even when visually identical). That evidence belongs
-          // to the other PRD, not this run — revert tracked drift rather than sweeping it
-          // into this merge. Only the CURRENT PRD's pr-evidence dir is auto-committed below.
-          // (Untracked foreign evidence is left alone — deleting it is too aggressive; it is
-          // rare and falls through to the commit.)
-          const prdBase = (wf.prdPath || '').replace(/^.*\//, '').replace(/\.md$/, '');
-          const currentEvidenceDir = prdBase ? `docs/pr-evidence/${prdBase}/` : null;
-          const foreignTracked = entries.filter(e =>
-            e.path.startsWith('docs/pr-evidence/') &&
-            (!currentEvidenceDir || !e.path.startsWith(currentEvidenceDir)) &&
-            !e.status.includes('?')).map(e => e.path);
-          if (foreignTracked.length > 0) {
-            try {
-              run(['checkout', '--', ...foreignTracked]);
-              console.log(`[workflow] merge_to_main: reverted ${foreignTracked.length} cross-PRD evidence drift file(s) not under ${currentEvidenceDir}`);
-            } catch (e) {
-              console.error(`[workflow] merge_to_main: failed to revert cross-PRD evidence drift: ${e.message}`);
-            }
-          }
-          // Whatever is still dirty under docs/ is this PRD's own work — auto-commit it.
-          let remaining = '';
-          try { remaining = execFileSync('git', ['status', '--porcelain'], { cwd: projectRoot, encoding: 'utf8' }); } catch {}
-          if (remaining.trim()) {
-            try {
-              run(['add', '-A', '--', 'docs']);
-              run(['commit', '-m', `chore(${wf.input}): commit workflow docs/evidence before merge`]);
-              console.log(`[workflow] merge_to_main: auto-committed docs/evidence on ${wf.branch}`);
-            } catch (e) {
-              wf.steps.merge_to_main = { status: 'error', error: `Failed to auto-commit docs/evidence on ${wf.branch}: ${e.message}` };
-              state.saveWorkflow(wf);
-              return res.status(500).json({ workflow: wf, error: `merge_to_main: docs auto-commit failed: ${e.message}` });
-            }
-          }
-        }
-        const runBranchExists = (() => { try { run(['rev-parse', '--verify', wf.branch]); return true; } catch { return false; } })();
-        try {
-          run(['checkout', def]);
-          if (runBranchExists && wf.branch !== def) {
-            execFileSync('git', ['merge', wf.branch, '--no-ff', '-m', `Merge ${wf.branch}: ${wf.input}`], { cwd: projectRoot, stdio: ['pipe', 'pipe', 'pipe'] });
-          }
-        } catch (e) {
-          try { run(['merge', '--abort']); } catch {}
-          try { run(['checkout', def]); } catch {}
-          wf.steps.merge_to_main = { status: 'error', error: `Failed to merge ${wf.branch} into ${def}: ${e.message}. Resolve manually (you are on ${def}; the run branch ${wf.branch} is intact).` };
-          state.saveWorkflow(wf);
-          return res.status(500).json({ workflow: wf, error: `merge_to_main failed: ${e.message}` });
-        }
-        wf.steps.merge_to_main = { status: 'completed' };
-        // markPrdDone + advanceLinkedFeatures already ran pre-merge → included in the merge commit.
-        // Bugfix: the fixed Bug is still 'Fixing' (a bug has no PRD link, so the
-        // markPrdDone/advanceLinkedFeatures item-lifecycle above are no-ops for it).
-        // Flip it Fixing → Done and stamp the merge commit sha into `fixed_in`, then
-        // commit that doc change on the default branch so the tree stays clean.
-        if (wf.type === 'bugfix' && wf.itemId) {
-          try {
-            const mergeSha = run(['rev-parse', 'HEAD']);
-            setBugItemStatus(wf.itemId, 'Done', { fixed_in: mergeSha });
-            commitWorkflowDocs(`docs(${wf.itemId}): mark Done (fixed_in ${mergeSha.slice(0, 7)})`);
-          } catch (e) { console.error(`[bugfix] finalize ${wf.itemId} → Done failed:`, e.message); }
-        }
-        // cleanupBranches removes fix worktrees + deletes wf.reviewBranch (= wf.branch) locally.
-        try { cleanupBranches(wf); } catch (e) { console.error('[workflow] cleanupBranches:', e.message); }
-        // Delete the remote copy too, if the run branch was ever pushed.
-        if (runBranchExists && wf.branch !== def) {
-          try { run(['push', 'origin', '--delete', wf.branch]); } catch (_) { /* not pushed / no remote — fine */ }
-        }
-        tagAndPush(wf);
-        wf.currentStep = 'capture_learnings';
-        state.saveWorkflow(wf);
-        broadcast('worktrees-updated', {});
-        return res.json({ workflow: wf, needsAdvance: true });
-      }
-
-      const reviewBranch = wf.reviewBranch;
-      // Check if review branch actually exists — it may not if tasks ran without worktrees
-      let branchExists = false;
-      if (reviewBranch) {
-        try {
-          const { execFileSync } = require('child_process');
-          execFileSync('git', ['rev-parse', '--verify', reviewBranch], { cwd: projectRoot, stdio: ['pipe', 'pipe', 'pipe'] });
-          branchExists = true;
-        } catch {} // branch doesn't exist
-      }
-      if (!reviewBranch || !branchExists) {
-        // No review branch — execution didn't use the worktree+review-branch flow
-        // (monolithic / iOS runs commit directly in the main checkout). This used
-        // to ASSUME "code already on main" and skip. But if execution committed
-        // onto a feature branch in the main checkout (e.g. feat/faz-NNN) and left
-        // it checked out, the work was stranded off main and never pushed — the
-        // CI/CD tab then showed nothing to deploy. Verify the actual checkout and,
-        // if it's on a non-default branch, land that branch onto the default
-        // branch before tagging/pushing.
-        const { execFileSync } = require('child_process');
-        const run = (args) => execFileSync('git', args, { cwd: projectRoot, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-        let defaultBranch = 'main';
-        try { defaultBranch = (run(['rev-parse', '--abbrev-ref', 'origin/HEAD']) || '').replace(/^origin\//, '') || 'main'; } catch {}
-        let current = '';
-        try { current = run(['branch', '--show-current']); } catch {}
-
-        if (current && current !== defaultBranch) {
-          // Refuse on a dirty tree — never carry or drop uncommitted work.
-          let dirty = '';
-          try { dirty = run(['status', '--porcelain']); } catch {}
-          if (dirty) {
-            wf.steps.merge_to_main = { status: 'error', error: `Working tree on ${current} has uncommitted changes; cannot land it on ${defaultBranch}. Commit or stash, then retry.` };
-            state.saveWorkflow(wf);
-            return res.status(500).json({ workflow: wf, error: `merge_to_main: uncommitted changes on ${current}` });
-          }
-          try {
-            run(['checkout', defaultBranch]);
-            execFileSync('git', ['merge', current, '--no-ff', '-m', `Merge ${current}: ${wf.input}`], { cwd: projectRoot, stdio: ['pipe', 'pipe', 'pipe'] });
-            try { run(['branch', '-d', current]); } catch {}
-            console.log(`[workflow] merge_to_main: landed ${current} onto ${defaultBranch}`);
-          } catch (e) {
-            try { run(['merge', '--abort']); } catch {}
-            wf.steps.merge_to_main = { status: 'error', error: `Failed to merge ${current} into ${defaultBranch}: ${e.message}. Resolve manually.` };
-            state.saveWorkflow(wf);
-            return res.status(500).json({ workflow: wf, error: `merge_to_main failed: ${e.message}` });
-          }
-        } else {
-          console.log(`[workflow] merge_to_main: on ${defaultBranch}, code already in place`);
-        }
-
-        wf.steps.merge_to_main = { status: 'completed' };
-        markPrdDone(wf.input);
-        advanceLinkedFeatures(wf.prdPath, 'Implemented');
-        commitWorkflowDocs(`docs(${wf.input.replace(/\s+/g, '-')}): mark Implemented in backlog`);
-        tagAndPush(wf);
-        wf.currentStep = 'capture_learnings';
-        state.saveWorkflow(wf);
-        return res.json({ workflow: wf, needsAdvance: true });
-      }
-      try {
-        const { execFileSync } = require('child_process');
-        execFileSync('git', ['merge', reviewBranch, '--no-ff', '-m', `Merge ${reviewBranch}: ${wf.input}`], { cwd: projectRoot, stdio: ['pipe', 'pipe', 'pipe'] });
-        wf.steps.merge_to_main = { status: 'completed' };
-        markPrdDone(wf.input);
-        advanceLinkedFeatures(wf.prdPath, 'Implemented');
-        commitWorkflowDocs(`docs(${wf.input.replace(/\s+/g, '-')}): mark Implemented in backlog`);
-        // Safe to clean up branches now — they're merged
-        cleanupBranches(wf);
-        tagAndPush(wf);
-        wf.currentStep = 'capture_learnings';
-        state.saveWorkflow(wf);
-        broadcast('worktrees-updated', {});
-        return res.json({ workflow: wf, needsAdvance: true });
-      } catch (e) {
-        wf.steps.merge_to_main = { status: 'error', error: e.message };
-        state.saveWorkflow(wf);
-        return res.status(500).json({ workflow: wf, error: `Merge to main failed: ${e.message}. Resolve manually.` });
-      }
+      return res.status(409).json(parkAtEgressBoundary(wf));
     }
 
     // Capture learnings step — extract reusable knowledge from workflow feedback
@@ -9886,8 +9577,8 @@ ${FIX_EXECUTION_EFFICIENCY_INSTRUCTIONS}${STRUCTURED_FEEDBACK_INSTRUCTIONS}`,
   return router;
 }
 
-// Pure project-state.md rewrite for a completed PRD (no I/O — exported for
-// unit tests; markPrdDone wraps it with read/write/commit).
+// Pure project-state.md rewrite retained for the future reviewed A1c acceptance
+// transaction (no I/O — exported for unit tests).
 // Returns { content, backlogRowChanged }.
 function markPrdDoneContent(original, prdId, today) {
   let content = original;

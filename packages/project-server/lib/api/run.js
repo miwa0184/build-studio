@@ -2,6 +2,7 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const { isAdmissionError } = require('../admission-error');
+const { LOCAL_MERGE_REMOVED, egressRefusal } = require('../egress-boundary');
 // Shared model-name → CLI model-id map. Was a private inline copy pinned to
 // Opus/Sonnet 4.6, two generations behind the workflow launch path.
 const { MODEL_IDS } = require('@build-studio/shared/cli');
@@ -30,6 +31,22 @@ function createRunRouter(config, state, gitOps, tmuxOps, broadcast, parseExecuti
     if (!run) return res.status(404).json({ error: 'no active run' });
     const worker = run.workers.find(w => w.branch === branch);
     if (!worker) return res.status(404).json({ error: `worker ${branch} not found` });
+
+    // This endpoint is still useful for integrating a worker into a dedicated
+    // candidate/review branch. It must never double as a local main-landing
+    // route. An unknown checkout is refused too: without a named target we
+    // cannot prove this is internal integration rather than egress.
+    const targetBranch = typeof gitOps.getCurrentBranch === 'function'
+      ? gitOps.getCurrentBranch() : '';
+    const defaultBranch = typeof gitOps.getDefaultBranch === 'function'
+      ? gitOps.getDefaultBranch() : 'main';
+    if (!targetBranch || targetBranch === defaultBranch) {
+      return res.status(409).json(egressRefusal(LOCAL_MERGE_REMOVED, {
+        targetBranch: targetBranch || null,
+        defaultBranch,
+        workerBranch: branch,
+      }));
+    }
 
     try {
       const count = gitOps.commitsAhead(branch);

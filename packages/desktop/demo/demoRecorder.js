@@ -36,7 +36,7 @@ const STEP_PHASE_LABEL = {
   reviewing: 'review_running',
   pm_draft: 'drafting',
   security_audit: 'security_audit',
-  merge_to_main: 'merging',
+  merge_to_main: 'egress_hold',
   capture_learnings: 'wrapping_up',
 };
 

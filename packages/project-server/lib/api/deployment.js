@@ -8,6 +8,11 @@ const crypto = require('crypto');
 const { runOneShot: defaultRunOneShot, getOneShotStatus: defaultGetOneShotStatus } = require('../oneshot');
 const { createMonitor } = require('../monitor');
 const { createCache } = require('../github-cache');
+const {
+  DEFAULT_BRANCH_PUSH_REMOVED,
+  REMOTE_MUTATION_REMOVED,
+  egressRefusal,
+} = require('../egress-boundary');
 
 const execFileAsync = promisify(execFile);
 
@@ -348,7 +353,7 @@ function createDeploymentRouter(config, gitOps, {
       try { deployCommits = parseLog(execGit(['log', '-20', '--format=%h|%s|%an|%ai'])); } catch {}
     }
 
-    // Compute next version (same logic as tagAndPush)
+    // Compute the next-version preview without performing workflow egress.
     if (dep.versioning === 'calver') {
       const now = new Date();
       const datePart = `${now.getFullYear()}.${String(now.getMonth() + 1).padStart(2, '0')}.${String(now.getDate()).padStart(2, '0')}`;
@@ -466,52 +471,25 @@ function createDeploymentRouter(config, gitOps, {
     res.json({ ok: true, hash, message });
   });
 
-  // POST /api/deployment/push — push main + tags to origin
+  // POST /api/deployment/push — legacy Git publication entrypoint. Commit 1
+  // leaves no remote mutation behind it; reviewed publication belongs to A1c.
   router.post('/deployment/push', (req, res) => {
-    try {
-      execGit(['remote', 'get-url', 'origin']);
-    } catch {
-      return res.status(400).json({ error: 'No remote "origin" configured' });
-    }
-
-    // `git branch --show-current` is EMPTY on a detached HEAD, and passing that
-    // through produced `git push origin ''` → "fatal: invalid refspec ''", which
-    // names neither the real problem nor the fix. Detached HEADs happen: checking
-    // out origin/main directly, inspecting an old commit, an interrupted rebase.
-    // Worse, a commit made while detached belongs to no branch, so the useful
-    // thing to say is "your work is at risk", not "invalid refspec".
     let branch = '';
     try { branch = execGit(['branch', '--show-current']); } catch {}
-    if (!branch) {
-      let head = '';
-      try { head = execGit(['rev-parse', '--short', 'HEAD']); } catch {}
-      return res.status(400).json({
-        error: `HEAD is detached at ${head || 'an unknown commit'} — there is no branch to push. `
-          + `Check out a branch first (\`git checkout main\`). If you have committed while detached, `
-          + `save that work before switching: \`git branch <name> ${head || 'HEAD'}\`, or it will be `
-          + `left unreachable.`,
-        detachedHead: true,
-        head: head || null,
-      });
-    }
-
-    const results = [];
+    let defaultBranch = '';
     try {
-      execGit(['push', 'origin', branch]);
-      results.push(`Pushed ${branch} to origin`);
-    } catch (e) {
-      return res.status(500).json({ error: `Push failed: ${e.message}` });
-    }
-
-    // Push tags
-    try {
-      execGit(['push', 'origin', '--tags']);
-      results.push('Pushed tags');
-    } catch (e) {
-      results.push(`Tag push failed: ${e.message}`);
-    }
-
-    res.json({ ok: true, results });
+      defaultBranch = typeof gitOps?.getDefaultBranch === 'function'
+        ? gitOps.getDefaultBranch()
+        : (execGit(['rev-parse', '--abbrev-ref', 'origin/HEAD']) || '').replace(/^origin\//, '');
+    } catch {}
+    defaultBranch = defaultBranch || config.default_branch || 'main';
+    const refusalCode = branch && branch === defaultBranch
+      ? DEFAULT_BRANCH_PUSH_REMOVED
+      : REMOTE_MUTATION_REMOVED;
+    return res.status(409).json(egressRefusal(refusalCode, {
+      branch: branch || null,
+      defaultBranch,
+    }));
   });
 
   // POST /api/deployment/rebase — replay local commits on top of the remote.
@@ -953,7 +931,9 @@ function createDeploymentRouter(config, gitOps, {
     res.json(out);
   });
 
-  // POST /api/deployment/ci-fix-accept — commit + push the fix (or open a PR per strategy).
+  // POST /api/deployment/ci-fix-accept — legacy acceptance entrypoint. It used
+  // to commit and then either push or open a PR. Both are A1c egress concerns,
+  // so refuse before git add/commit/checkout/push/gh.
   router.post('/deployment/ci-fix-accept', (req, res) => {
     let porcelain;
     try { porcelain = execGit(['status', '--porcelain']); }
@@ -961,38 +941,20 @@ function createDeploymentRouter(config, gitOps, {
     if (!porcelain) return res.status(400).json({ error: 'No fix to accept — working tree is clean.' });
 
     const strategy = resolveCiFixStrategy(config);
-    const summary = String(req.body?.summary || '').trim();
-    const commitMsg = `fix(ci): ${summary || 'repair failing pipeline'}`;
-
+    let branch = '';
+    let defaultBranch = '';
+    try { branch = execGit(['branch', '--show-current']); } catch {}
     try {
-      if (strategy === 'pr') {
-        const orig = execGit(['branch', '--show-current']) || 'main';
-        const branch = `ci-fix-${Date.now()}`;
-        execGit(['checkout', '-b', branch]);
-        execGit(['add', '-A']);
-        execGit(['commit', '-m', commitMsg]);
-        execGit(['push', '-u', 'origin', branch]);
-        let prUrl = '';
-        try {
-          prUrl = execFileSync('gh', ['pr', 'create', '--repo', config.deployment.repo,
-            '--head', branch, '--title', commitMsg, '--body', summary || 'Automated CI fix.'],
-            { cwd: projectRoot, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
-        } catch {}
-        try { execGit(['checkout', orig]); } catch {}
-        clearCurrentInvestigation();
-        return res.json({ ok: true, mode: 'pr', branch, prUrl });
-      }
-      // push
-      execGit(['add', '-A']);
-      execGit(['commit', '-m', commitMsg]);
-      const branch = execGit(['branch', '--show-current']);
-      execGit(['push', 'origin', branch]);
-      const hash = execGit(['rev-parse', '--short', 'HEAD']);
-      clearCurrentInvestigation();
-      return res.json({ ok: true, mode: 'push', hash, branch });
-    } catch (e) {
-      return res.status(500).json({ error: `Accept failed: ${e.stderr || e.message}` });
-    }
+      defaultBranch = typeof gitOps?.getDefaultBranch === 'function'
+        ? gitOps.getDefaultBranch()
+        : (execGit(['rev-parse', '--abbrev-ref', 'origin/HEAD']) || '').replace(/^origin\//, '');
+    } catch {}
+    defaultBranch = defaultBranch || config.default_branch || 'main';
+    return res.status(409).json(egressRefusal(REMOTE_MUTATION_REMOVED, {
+      branch: branch || null,
+      defaultBranch,
+      strategy,
+    }));
   });
 
   // POST /api/deployment/ci-fix-dismiss — revert the agent's working-tree changes.

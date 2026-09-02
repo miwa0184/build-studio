@@ -84,9 +84,8 @@ const DEFAULTS = {
   //   auto-archived after 30 injections.
   learnings: { enabled: true, capture: 'failures', max_injected: 6, max_entries_per_domain: 25, auto_capture: true },
   // bugfix workflow: a lean execution flow driven by a Bug backlog item (no PRD,
-  // no planning step, no review panel). auto_merge=true lands the fix
-  // automatically once code_review approves instead of waiting at the manual
-  // merge_to_main gate; default false keeps the merge a deliberate operator step.
+  // no planning step, no review panel). auto_merge is retained as a parsed
+  // legacy setting but is intentionally inert until A1c reviewed PR egress.
   bugfix: { auto_merge: false },
   // support view: auto-commit filed items (pathspec-scoped, on the current
   // branch) so filings never wait on a manual Operations-tab commit.
@@ -99,8 +98,8 @@ const DEFAULTS = {
   deployment: {
     strategy: 'trunk',           // trunk | gitflow
     versioning: 'semver',        // semver | calver | none
-    auto_tag: true,              // create git tag on merge-to-main
-    auto_deploy: false,          // push to remote after merge (triggers CD)
+    auto_tag: true,              // legacy preference; run egress does not tag before A1c
+    auto_deploy: false,          // legacy preference; workflow egress does not push before A1c
     tag_prefix: 'v',             // tag format: v1.2.3
     initial_version: '0.1.0',    // first tag if none exists
   },
