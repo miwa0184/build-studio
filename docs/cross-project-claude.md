@@ -144,9 +144,8 @@ required for this step regardless of which role runs it.
 3. /qa         → Run PRD-scoped tests (new spec + directly affected existing tests); failures → /frontend_dev or /backend_dev to fix
 4. /security   → Code-level security audit scoped to PRD changes only; blocking findings → fix before continuing
 5. Evaluate    → Keep or discard. If vision needs updating → /ceo
-6. Commit & push → Full regression runs in CI/CD pipeline (not per-iteration)
-7. Clean up    → Dashboard "Merge Branches" removes worktrees, branches, and logs automatically
-               → Mark PRD done in docs/project-state.md (Active PRD + Backlog table + Phase line)
+6. Egress Hold → Preserve the candidate branch; Build Studio does not merge to main, tag, push, open a PR, or delete it
+7. Land later  → A separately reviewed A1c PR-egress transaction is not installed yet; do not infer Implemented or Done from the hold
 ```
 
 **DevOps note:** Standalone infrastructure work (CI/CD pipeline, deployment setup,
@@ -516,24 +515,32 @@ and the project's CI has run it green at least once.
 
 ## Branching & Deployment Strategy
 
-All Build Studio projects use **trunk-based development** by default:
+All Build Studio projects target **trunk-based development** by default, but
+A1c Commit 1 deliberately stops before trunk landing:
 
 - **`main`** is always production-ready and deployable
-- **Feature branches** are short-lived, created by workflow agents (worktrees), merged back to main when approved
-- **No long-lived branches** — no `develop`, `staging`, or `release` branches
-- **Hotfixes** go directly to main (or fast branch + merge)
+- **Candidate branches** are created by execution/bugfix workflows and preserved at Egress Hold until a separately reviewed landing exists
+- **Internal worker branches** may still merge into a named candidate/review branch before the hold; this never grants default-branch or remote authority
+- **No permanent integration branches** — no `develop`, `staging`, or `release`; a parked candidate is a tracked temporary egress artifact, not a second trunk
+- **Bug fixes** use the same candidate-and-hold boundary; Build Studio does not send them directly to main
 
 ### Versioning
 
-- Semver git tags (`v1.2.3`) are created automatically on merge-to-main
-- **Patch** bumps per PRD/feature merge, **minor** for significant features, **major** for breaking changes
+- Semver git tags (`v1.2.3`) remain the intended release format, but Build Studio does not create them at Egress Hold
+- **Patch**, **minor**, and **major** release decisions belong to the later reviewed landing transaction
 - Tags provide rollback targets and changelog anchors
 
 ### Auto-deploy
 
-When `deployment.auto_deploy: true`, the workflow pushes to `origin/main` after merge + tag. This triggers the project's CD pipeline (Railway, Cloudflare Pages, Vercel, etc.).
+`deployment.auto_deploy` and `deployment.auto_tag` are retained legacy
+preferences, but both are inert for workflow egress in A1c Commit 1. The
+`merge_to_main` state is an Egress Hold: it does not merge or tag locally and
+does not push `origin/main`.
 
-**The default is `false`** — `merge_to_main` merges + tags locally and stops. The operator clicks the Push button on the CI/CD tab when ready to deploy. This matches the cross-project rule "never push to main without explicit user approval" — pushing triggers production. Opt in to `auto_deploy: true` only when you genuinely want the workflow to push automatically (e.g. a low-stakes side project where you accept that merging implies deploying).
+The CI/CD Push control is non-actionable, and the server also refuses direct
+push and CI-fix acceptance routes before commit, branch creation, push, tag, or
+PR creation. A reviewed A1c PR-egress transaction must exist before Build
+Studio may publish again; it is not part of this commit.
 
 ### DB migrations
 
@@ -550,8 +557,8 @@ Override in `.build-studio/config.yaml`:
 
 ```yaml
 deployment:
-  auto_tag: false        # disable auto-tagging
-  auto_deploy: false     # disable auto-push (manual deploy)
+  auto_tag: false        # legacy preference; inert at Egress Hold in A1c Commit 1
+  auto_deploy: false     # legacy preference; does not enable or disable current egress
   versioning: calver     # use date-based versioning: 2026.04.04
   initial_version: 1.0.0 # start from v1.0.0 instead of v0.1.0
 ```
