@@ -37,17 +37,26 @@ function suiteSummary(name, executed, failures = 0) {
   ];
 }
 
-/** Two bundles in one xcodebuild invocation, the way a real serial run prints them. */
+/**
+ * One bundle session, the way a real serial run prints it: the session suite,
+ * the `<bundle>.xctest` boundary, the cases, then the boundary's own native
+ * summary and the session's. `summary` forges the executed count.
+ */
+function session(bundle, n, { failed = 0, summary, at = '10:00:00.000' } = {}) {
+  return [
+    `Test Suite 'All tests' started at 2026-09-02 ${at}.`,
+    `Test Suite '${bundle}.xctest' started at 2026-09-02 ${at}.`,
+    ...cases(bundle, n, { failed }),
+    ...suiteSummary(`${bundle}.xctest`, summary ?? n, failed),
+    ...suiteSummary('All tests', summary ?? n, failed),
+  ];
+}
+
+/** Two bundles in one xcodebuild invocation. */
 function twoTargetLog({ a = 30, b = 26, aFailed = 0, bFailed = 0, banner = 'SUCCEEDED', aSummary, bSummary } = {}) {
   return [
-    "Test Suite 'All tests' started at 2026-09-02 10:00:00.000.",
-    ...cases('AtlasTests', a, { failed: aFailed }),
-    ...suiteSummary('AtlasTests.xctest', aSummary ?? a, aFailed),
-    ...suiteSummary('All tests', aSummary ?? a, aFailed),
-    "Test Suite 'All tests' started at 2026-09-02 10:05:00.000.",
-    ...cases('AtlasUITests', b, { failed: bFailed }),
-    ...suiteSummary('AtlasUITests.xctest', bSummary ?? b, bFailed),
-    ...suiteSummary('All tests', bSummary ?? b, bFailed),
+    ...session('AtlasTests', a, { failed: aFailed, summary: aSummary }),
+    ...session('AtlasUITests', b, { failed: bFailed, summary: bSummary, at: '10:05:00.000' }),
     ...(banner ? [`** TEST ${banner} **`] : []),
   ].join('\n');
 }
@@ -66,8 +75,11 @@ test('F1 — two configured targets with 30 + 26 native summaries verify exactly
 test('F1 — a single target with nested class, bundle and All-tests summaries still verifies', () => {
   const log = [
     "Test Suite 'All tests' started at 2026-09-02 10:00:00.000.",
+    "Test Suite 'AtlasUITests.xctest' started at 2026-09-02 10:00:00.000.",
+    "Test Suite 'HomeTests' started at 2026-09-02 10:00:00.000.",
     ...cases('AtlasUITests', 20, { cls: 'HomeTests' }),
     ...suiteSummary('HomeTests', 20),
+    "Test Suite 'PlayTests' started at 2026-09-02 10:00:00.000.",
     ...cases('AtlasUITests', 36, { cls: 'PlayTests' }),
     ...suiteSummary('PlayTests', 36),
     ...suiteSummary('AtlasUITests.xctest', 56),
@@ -81,12 +93,12 @@ test('F1 — a single target with nested class, bundle and All-tests summaries s
 
 test('F1 — single-target semantics are unchanged: 55 and 57 still mismatch, a lone summary must agree', () => {
   for (const n of [55, 57]) {
-    const log = [...cases('AtlasUITests', n), ...suiteSummary('All tests', n), '** TEST SUCCEEDED **'].join('\n');
+    const log = [...session('AtlasUITests', n), '** TEST SUCCEEDED **'].join('\n');
     const verdict = evaluateSuiteAuthority(completed(log), 56);
     assert.equal(verdict.code, 'QA_EXPECTED_TEST_COUNT_MISMATCH');
     assert.equal(verdict.actualTestCount, n);
   }
-  const disagreeing = [...cases('AtlasUITests', 56), ...suiteSummary('All tests', 55), '** TEST SUCCEEDED **'].join('\n');
+  const disagreeing = [...session('AtlasUITests', 56, { summary: 55 }), '** TEST SUCCEEDED **'].join('\n');
   assert.equal(evaluateSuiteAuthority(completed(disagreeing), 56).code, 'QA_TEST_COUNT_INCONSISTENT');
 });
 
@@ -130,10 +142,11 @@ test('F1 — a replayed run stays blocked: doubled cases, or doubled banners', (
 });
 
 test('F1 — a repeated summary for one target cannot stand in for the other target', () => {
-  // 30 + 26 cases ran, but the log carries two summaries of 30 and none of 26.
+  // 30 + 26 cases ran, but the log carries two summaries of 30 and none of 26:
+  // the second bundle's boundary is closed by a copy of the first one's count.
   const log = [
-    ...cases('AtlasTests', 30), ...suiteSummary('All tests', 30),
-    ...cases('AtlasUITests', 26), ...suiteSummary('All tests', 30),
+    ...session('AtlasTests', 30),
+    ...session('AtlasUITests', 26, { summary: 30, at: '10:05:00.000' }),
     '** TEST SUCCEEDED **',
   ].join('\n');
   const verdict = evaluateSuiteAuthority(completed(log), 56);

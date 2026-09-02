@@ -424,19 +424,6 @@ function qaServerSuiteGateVerdict(step, config) {
       reason: 'expected_test_count is configured but no persisted server-suite authority exists',
     };
   }
-  const recomputed = qaSuite.evaluateSuiteAuthority(step.suiteRun, expected);
-  if (recomputed.blocked !== authority.blocked
-      || recomputed.code !== authority.code
-      || recomputed.actualTestCount !== authority.actualTestCount) {
-    return {
-      configured: true,
-      blocked: true,
-      code: 'QA_SERVER_SUITE_AUTHORITY_DRIFT',
-      expectedTestCount: expected,
-      actualTestCount: recomputed.actualTestCount ?? null,
-      reason: `persisted authority disagrees with server recomputation (${authority.code} vs ${recomputed.code})`,
-    };
-  }
   if (authority.expectedTestCount !== expected) {
     return {
       configured: true,
@@ -468,6 +455,23 @@ function qaServerSuiteGateVerdict(step, config) {
       expectedTestCount: expected,
       actualTestCount: authority.actualTestCount ?? null,
       reason: 'persisted authority was evaluated with different simulator.parallel_testing configuration',
+    };
+  }
+  // The persisted verdict must be reproducible from the raw run, under the
+  // only_testing scope the run was spawned with (checked against the current
+  // config just above), so every configured target re-binds to its own
+  // native bundle evidence on every read.
+  const recomputed = qaSuite.evaluateSuiteAuthority(step.suiteRun, expected, { onlyTesting: authority.onlyTesting });
+  if (recomputed.blocked !== authority.blocked
+      || recomputed.code !== authority.code
+      || recomputed.actualTestCount !== authority.actualTestCount) {
+    return {
+      configured: true,
+      blocked: true,
+      code: 'QA_SERVER_SUITE_AUTHORITY_DRIFT',
+      expectedTestCount: expected,
+      actualTestCount: recomputed.actualTestCount ?? null,
+      reason: `persisted authority disagrees with server recomputation (${authority.code} vs ${recomputed.code})`,
     };
   }
   return authority;
@@ -8372,7 +8376,7 @@ You are QA. **Your job is to RUN the test suite and report test outcomes — not
           // completed run does, so the gate reads it back as the unavailable
           // verdict it is rather than as a stale-scope one.
           unavailable.authority = {
-            ...qaSuite.evaluateSuiteAuthority(unavailable, expectedTestCount),
+            ...qaSuite.evaluateSuiteAuthority(unavailable, expectedTestCount, { onlyTesting: qaScopeTargets || [] }),
             onlyTesting: qaScopeTargets || [],
             parallelTesting: _pt,
           };
@@ -8488,7 +8492,7 @@ You are QA. **Your job is to RUN the test suite and report test outcomes — not
         const step = wf.steps.qa_validation;
         if (!step) return;
         const authority = {
-          ...qaSuite.evaluateSuiteAuthority(result, expectedTestCount),
+          ...qaSuite.evaluateSuiteAuthority(result, expectedTestCount, { onlyTesting: qaScopeTargets || [] }),
           onlyTesting: qaScopeTargets || [],
           parallelTesting: _pt,
           command: suiteCommand,

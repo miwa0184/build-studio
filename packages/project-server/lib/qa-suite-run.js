@@ -108,11 +108,19 @@ function displayCommand(args) {
 /**
  * Test counts from xcodebuild stdout.
  *
- * Two independent sources, kept separate on purpose. `Executed N tests, with M
- * failures` is xcodebuild's own summary and is emitted once PER TEST TARGET, so
- * a unit target plus a UI target produce two lines that must be summed. The
- * per-case `Test Case '...' passed` lines are the finer-grained tally, and they
- * are what progress reporting counts while the run is still going.
+ * Evidence is read off the NATIVE HIERARCHY, not off the numbers. Serial
+ * xcodebuild output nests `Test Suite 'All tests'` (or `'Selected tests'`) →
+ * `Test Suite '<Bundle>.xctest'` → `Test Suite '<Class>'` → `Test Case` lines,
+ * and closes every suite with `Test Suite '<name>' passed|failed at` followed
+ * by that suite's own `Executed N tests, with M failures` summary. The
+ * `.xctest` boundary is the only stable identity in the stream: a Swift case
+ * prints as `-[Module.Class method]`, an Objective-C case as `-[Class method]`,
+ * and neither names its bundle. So a bundle is a `.xctest` boundary, its cases
+ * are the case lines inside that boundary, and its summary is the `Executed`
+ * line that closes it. Nothing is inferred from the case name and nothing is
+ * matched by equal counts — the second review of this file found both
+ * inferences forgeable (one summary vouching for two equal-count bundles; two
+ * Objective-C classes masquerading as two bundles).
  *
  * `succeeded` comes from the `** TEST SUCCEEDED **` / `** TEST FAILED **`
  * banner, and is null when neither appeared — a run killed on timeout has
@@ -120,40 +128,104 @@ function displayCommand(args) {
  * than reporting none.
  */
 const CASE_LINE = /^Test Case '(.*)' (passed|failed) \(/;
-const SUMMARY_LINE = /Executed (\d+) tests?, with (\d+) failures?/;
+const SUITE_START_LINE = /^Test Suite '(.*)' started at /;
+const SUITE_END_LINE = /^Test Suite '(.*)' (passed|failed) at /;
+const SUMMARY_LINE = /^\s*Executed (\d+) tests?, with (\d+) failures?/;
 const SUCCESS_BANNER = /\*\* TEST SUCCEEDED \*\*/g;
 const FAILURE_BANNER = /\*\* TEST (?:FAILED|BUILD FAILED) \*\*/g;
+const BUNDLE_SUFFIX = /\.xctest$/;
 
-/**
- * The test bundle a per-case line belongs to. xcodebuild prints Swift cases
- * as `-[Module.Class method]` and Objective-C ones as `-[Class method]`; the
- * first token is the finest grouping that a native `Executed` summary is
- * also printed for, so it is what the per-target check groups by.
- */
-function caseModule(name) {
-  const m = /^-\[([^\s\].]+)/.exec(String(name || ''));
-  return m ? m[1] : 'default';
+/** The bundle a `Test Suite` name denotes, or null when it is a session or class suite. */
+function bundleNameOf(suiteName) {
+  return BUNDLE_SUFFIX.test(suiteName) ? suiteName.replace(BUNDLE_SUFFIX, '') : null;
+}
+
+/** The test target an `only_testing` entry (`Target`, `Target/Class`, `Target/Class/method`) names. */
+function targetOf(entry) {
+  const head = String(entry || '').trim().split('/')[0];
+  return head || null;
 }
 
 function createTally() {
   return {
-    casesPassed: 0, casesFailed: 0, caseTallies: {},
-    summaryCounts: [], successBannerCount: 0, failureBannerCount: 0,
+    casesPassed: 0, casesFailed: 0,
+    // One entry per `.xctest` boundary in output order. `ordinal` disambiguates
+    // a bundle that appears twice (a replay), which is never valid evidence.
+    bundles: [],
+    // Indexes into `bundles` of boundaries opened and not yet closed, innermost last.
+    openBundles: [],
+    // Case lines seen outside every bundle boundary. They belong to nothing.
+    unboundCases: { passed: 0, failed: 0 },
+    // The suite a `Test Suite ... passed|failed at` line just closed; the next
+    // `Executed` line is that suite's summary and nobody else's.
+    pendingSummaryOwner: null,
+    summaryCounts: [],
+    successBannerCount: 0, failureBannerCount: 0,
   };
+}
+
+function openBundle(tally, name) {
+  const ordinal = tally.bundles.filter((b) => b.name === name).length + 1;
+  tally.bundles.push({ name, ordinal, passed: 0, failed: 0, started: true, closed: false, summaries: [] });
+  return tally.bundles.length - 1;
 }
 
 /** Fold one COMPLETE line of xcodebuild output into the tally. */
 function tallyLine(tally, line) {
   const kase = CASE_LINE.exec(line);
   if (kase) {
-    const module = caseModule(kase[1]);
-    const bucket = tally.caseTallies[module] || (tally.caseTallies[module] = { passed: 0, failed: 0 });
+    tally.pendingSummaryOwner = null;
+    const open = tally.openBundles.length ? tally.bundles[tally.openBundles[tally.openBundles.length - 1]] : null;
+    const bucket = open || tally.unboundCases;
     if (kase[2] === 'passed') { tally.casesPassed++; bucket.passed++; } else { tally.casesFailed++; bucket.failed++; }
+    return;
+  }
+  const started = SUITE_START_LINE.exec(line);
+  if (started) {
+    tally.pendingSummaryOwner = null;
+    const bundle = bundleNameOf(started[1]);
+    if (bundle !== null) tally.openBundles.push(openBundle(tally, bundle));
+    return;
+  }
+  const ended = SUITE_END_LINE.exec(line);
+  if (ended) {
+    const bundle = bundleNameOf(ended[1]);
+    let bundleIndex = null;
+    if (bundle !== null) {
+      for (let i = tally.openBundles.length - 1; i >= 0; i--) {
+        if (tally.bundles[tally.openBundles[i]].name === bundle) {
+          bundleIndex = tally.openBundles.splice(i, 1)[0];
+          break;
+        }
+      }
+      if (bundleIndex === null) {
+        // Closed without ever starting: a boundary that encloses no cases. Its
+        // summary is recorded against an empty tally, which cannot corroborate.
+        bundleIndex = openBundle(tally, bundle);
+        tally.bundles[bundleIndex].started = false;
+      }
+      tally.bundles[bundleIndex].closed = true;
+    }
+    tally.pendingSummaryOwner = { suite: ended[1], bundleIndex };
     return;
   }
   const summary = SUMMARY_LINE.exec(line);
   if (summary) {
-    tally.summaryCounts.push({ executed: parseInt(summary[1], 10), failures: parseInt(summary[2], 10) });
+    const owner = tally.pendingSummaryOwner;
+    const entry = {
+      executed: parseInt(summary[1], 10), failures: parseInt(summary[2], 10),
+      suite: owner ? owner.suite : null,
+      bundle: owner && owner.bundleIndex !== null
+        ? `${tally.bundles[owner.bundleIndex].name}#${tally.bundles[owner.bundleIndex].ordinal}`
+        : null,
+    };
+    const index = tally.summaryCounts.push(entry) - 1;
+    if (owner && owner.bundleIndex !== null) {
+      tally.bundles[owner.bundleIndex].summaries.push({ executed: entry.executed, failures: entry.failures, index });
+    }
+    // The owner is kept until the next suite or case line: a second
+    // `Executed` line closing the same boundary is two claims for one bundle,
+    // which the authority rejects, not a stray line to be ignored.
   }
   tally.successBannerCount += (line.match(SUCCESS_BANNER) || []).length;
   tally.failureBannerCount += (line.match(FAILURE_BANNER) || []).length;
@@ -166,6 +238,8 @@ function tallyText(tally, text) {
 /** The counts object the rest of the server reads, from a finished tally. */
 function finalizeTally(tally) {
   const sawSummary = tally.summaryCounts.length > 0;
+  // `executed`/`failures` are the display sum of every native summary in the
+  // log, as before. The authority never reads them: it reads `bundles`.
   const executed = tally.summaryCounts.reduce((n, item) => n + item.executed, 0);
   const failures = tally.summaryCounts.reduce((n, item) => n + item.failures, 0);
   const succeeded = tally.successBannerCount > 0 && tally.failureBannerCount === 0
@@ -174,11 +248,11 @@ function finalizeTally(tally) {
   return {
     executed: sawSummary ? executed : null,
     failures: sawSummary ? failures : null,
-    summaryCounts: tally.summaryCounts.slice(),
+    summaryCounts: tally.summaryCounts.map((item) => ({ ...item })),
     casesPassed: tally.casesPassed,
     casesFailed: tally.casesFailed,
-    caseTallies: Object.fromEntries(Object.entries(tally.caseTallies).map(([k, v]) => [k, { ...v }])),
-    caseTallyComplete: true,
+    bundles: tally.bundles.map((b) => ({ ...b, summaries: b.summaries.map((s) => ({ ...s })) })),
+    unboundCases: { ...tally.unboundCases },
     successBannerCount: tally.successBannerCount,
     failureBannerCount: tally.failureBannerCount,
     succeeded,
@@ -192,6 +266,89 @@ function parseTestCounts(text) {
 }
 
 /**
+ * Bind every expected test bundle to its own native evidence, one-to-one.
+ *
+ * The expected bundles are the targets named by `only_testing` when it is
+ * configured, otherwise every bundle boundary the run printed. Each must be
+ * exactly one `.xctest` boundary that started, closed, and was closed by
+ * exactly one `Executed` summary equal to the case tally inside it. A summary
+ * is consumed by the boundary that printed it and by nothing else; a bundle
+ * that appears twice, a case outside every boundary, and a bundle that ran
+ * outside the configured scope are all inconsistent evidence. Counts are
+ * never compared across bundles.
+ */
+function bindBundleEvidence(counts, onlyTesting) {
+  const block = (code, reason) => ({ blocked: true, code, reason });
+  const sessions = (Array.isArray(counts.bundles) ? counts.bundles : []).filter((b) => b
+    && typeof b.name === 'string' && b.name
+    && Number.isInteger(b.passed) && b.passed >= 0 && Number.isInteger(b.failed) && b.failed >= 0
+    && Array.isArray(b.summaries));
+  const unbound = counts.unboundCases && typeof counts.unboundCases === 'object' ? counts.unboundCases : {};
+  const unboundTotal = (Number.isInteger(unbound.passed) ? unbound.passed : 0) + (Number.isInteger(unbound.failed) ? unbound.failed : 0);
+  const caseTotal = counts.casesPassed + counts.casesFailed;
+  if (!Array.isArray(counts.bundles) || !counts.unboundCases) {
+    return block('QA_TEST_COUNT_INCONSISTENT', 'the run carries no native test-bundle evidence (recorded before bundle binding); rerun the suite');
+  }
+  if (unboundTotal > 0) {
+    return block('QA_TEST_COUNT_INCONSISTENT', `${unboundTotal} test-case results were printed outside any native test bundle (Test Suite '<Target>.xctest') boundary`);
+  }
+  const configured = [...new Set((Array.isArray(onlyTesting) ? onlyTesting : []).map(targetOf).filter(Boolean))];
+  const expected = configured.length ? configured : [...new Set(sessions.map((b) => b.name))];
+  if (expected.length === 0) {
+    return block('QA_TEST_COUNT_INCONSISTENT', `parsed ${caseTotal} test-case results but no native test bundle (Test Suite '<Target>.xctest') boundary`);
+  }
+  const consumed = new Set();
+  const bound = [];
+  let executed = 0;
+  let failures = 0;
+  for (const name of expected) {
+    const matches = sessions.filter((b) => b.name === name);
+    if (matches.length === 0) {
+      return block('QA_TEST_TARGET_UNBOUND', `configured target ${name} produced no native test bundle (Test Suite '${name}.xctest') in the xcodebuild output`);
+    }
+    if (matches.length > 1) {
+      return block('QA_TEST_COUNT_INCONSISTENT', `test bundle ${name} appeared ${matches.length} times in one xcodebuild run`);
+    }
+    const session = matches[0];
+    const tally = session.passed + session.failed;
+    if (!session.closed) {
+      return block('QA_TEST_COUNT_INCONSISTENT', `test bundle ${name} started but was never closed by a native summary`);
+    }
+    if (session.summaries.length !== 1) {
+      return block(
+        'QA_TEST_COUNT_INCONSISTENT',
+        session.summaries.length === 0
+          ? `test bundle ${name} has no native Executed summary of its own (${tally} test-case results inside its boundary)`
+          : `test bundle ${name} closed with ${session.summaries.length} native Executed summaries`,
+      );
+    }
+    const summary = session.summaries[0];
+    if (!Number.isInteger(summary.executed) || !Number.isInteger(summary.failures) || consumed.has(summary.index)) {
+      return block('QA_TEST_COUNT_INCONSISTENT', `test bundle ${name} is bound to a summary that is not its own`);
+    }
+    consumed.add(summary.index);
+    if (summary.executed !== tally || summary.failures !== session.failed) {
+      return block(
+        'QA_TEST_COUNT_INCONSISTENT',
+        `test bundle ${name}: its native summary reports ${summary.executed} executed with ${summary.failures} failures, but ${tally} test-case results with ${session.failed} failures were parsed inside its boundary`,
+      );
+    }
+    executed += tally;
+    failures += session.failed;
+    bound.push(`${name}=${tally}/${session.failed}`);
+  }
+  const outside = sessions.filter((b) => !expected.includes(b.name)
+    && (b.passed + b.failed > 0 || b.summaries.some((s) => s.executed > 0)));
+  if (outside.length) {
+    return block('QA_TEST_COUNT_INCONSISTENT', `test bundle(s) ${[...new Set(outside.map((b) => b.name))].join(', ')} ran outside the configured only_testing scope`);
+  }
+  if (executed !== caseTotal) {
+    return block('QA_TEST_COUNT_INCONSISTENT', `${caseTotal - executed} test-case results were parsed outside the bound test bundles`);
+  }
+  return { blocked: false, executed, failures, bound };
+}
+
+/**
  * Evaluate the immutable server-side authority for an exact-count QA run.
  *
  * The agent still explains failures and inspects visual evidence, but it never
@@ -200,8 +357,12 @@ function parseTestCounts(text) {
  * coherent native count, one success verdict, exit 0 and exactly that count can
  * pass. Missing or contradictory evidence is a block, not an invitation to
  * infer a result from prose.
+ *
+ * `onlyTesting` is the configured `qa_validation.only_testing` list the run
+ * was spawned with; every target in it must bind to its own bundle evidence
+ * (see bindBundleEvidence). Without it, every bundle the run printed must.
  */
-function evaluateSuiteAuthority(run, expectedTestCount) {
+function evaluateSuiteAuthority(run, expectedTestCount, { onlyTesting } = {}) {
   if (expectedTestCount === undefined || expectedTestCount === null) {
     return { configured: false, blocked: false, code: 'QA_EXACT_COUNT_NOT_CONFIGURED' };
   }
@@ -239,66 +400,38 @@ function evaluateSuiteAuthority(run, expectedTestCount) {
   const caseTotal = Number.isInteger(counts.casesPassed) && Number.isInteger(counts.casesFailed)
     ? counts.casesPassed + counts.casesFailed
     : 0;
-  let actualTestCount = null;
-  let actualFailures = null;
 
-  if (caseTotal > 0) {
-    actualTestCount = caseTotal;
-    actualFailures = counts.casesFailed;
-    const agrees = (item, executed, failures) => item.executed === executed && item.failures === failures;
-    // One session (one test bundle): a native summary states the whole run.
-    // xcodebuild also prints class- and bundle-level summaries, so "some
-    // summary agrees" is the check, not "every summary agrees".
-    const wholeRunSummary = validSummaries.some((item) => agrees(item, actualTestCount, actualFailures));
-    // Several sessions (several bundles under only_testing): xcodebuild never
-    // prints an aggregate, only one summary per session. The per-case tally is
-    // grouped by bundle and every group must be corroborated by a native
-    // summary of exactly its count; a summary that stands in for a different
-    // bundle, or a bundle nobody summarised, is inconsistent evidence.
-    const tallies = counts.caseTallies && typeof counts.caseTallies === 'object' ? counts.caseTallies : {};
-    const groups = Object.entries(tallies).map(([module, item]) => ({
-      module,
-      executed: (Number.isInteger(item && item.passed) ? item.passed : 0) + (Number.isInteger(item && item.failed) ? item.failed : 0),
-      failures: Number.isInteger(item && item.failed) ? item.failed : 0,
-    }));
-    const groupTotal = groups.reduce((n, group) => n + group.executed, 0);
-    const uncorroborated = groups.filter((group) => !validSummaries.some((item) => agrees(item, group.executed, group.failures)));
-    const perTargetSummaries = groups.length >= 2 && groupTotal === actualTestCount && uncorroborated.length === 0;
-    // No native summary may claim more tests than were seen to run: that is
-    // either a summary from somewhere else or per-case evidence that was lost.
-    const oversized = validSummaries.find((item) => item.executed > actualTestCount);
-    if (oversized) {
-      return block(
-        'QA_TEST_COUNT_INCONSISTENT',
-        `a native summary reports ${oversized.executed} executed tests but only ${actualTestCount} test-case results were parsed`,
-        actualTestCount,
-      );
-    }
-    if (!wholeRunSummary && !perTargetSummaries) {
-      if (validSummaries.length === 0) {
-        return block('QA_TEST_COUNT_MISSING', `parsed ${actualTestCount} test-case results but no native Executed summary`, actualTestCount);
-      }
-      const detail = groups.length >= 2
-        ? `per-target tally ${groups.map((g) => `${g.module}=${g.executed}/${g.failures}`).join(', ')} is not corroborated by native summaries${uncorroborated.length ? ` (uncorroborated: ${uncorroborated.map((g) => g.module).join(', ')})` : ''}`
-        : 'no native summary agrees';
-      return block(
-        'QA_TEST_COUNT_INCONSISTENT',
-        `test-case tally parsed ${actualTestCount} tests with ${actualFailures} failures, but ${detail}`,
-        actualTestCount,
-      );
-    }
-  } else {
-    const unique = new Map(validSummaries.map((item) => [`${item.executed}:${item.failures}`, item]));
+  if (caseTotal === 0) {
+    // Summaries alone never carry a verdict: a summary is corroboration for
+    // case lines, not a substitute for them.
+    const unique = new Set(validSummaries.map((item) => `${item.executed}:${item.failures}`));
     if (unique.size === 0) {
-      return block('QA_TEST_COUNT_MISSING', 'no native Executed test-count summary was parsed');
+      return block('QA_TEST_COUNT_MISSING', 'no native Executed test-count summary and no test-case results were parsed');
     }
     if (unique.size > 1) {
       return block('QA_TEST_COUNT_AMBIGUOUS', 'multiple different native Executed summaries were parsed and no per-case tally disambiguates them');
     }
-    const only = [...unique.values()][0];
-    actualTestCount = only.executed;
-    actualFailures = only.failures;
+    return block('QA_TEST_COUNT_INCONSISTENT', `a native summary reports ${validSummaries[0].executed} executed tests but no test-case results were parsed`);
   }
+  // No native summary may claim more tests than were seen to run: that is
+  // either a summary from somewhere else or per-case evidence that was lost.
+  const oversized = validSummaries.find((item) => item.executed > caseTotal);
+  if (oversized) {
+    return block(
+      'QA_TEST_COUNT_INCONSISTENT',
+      `a native summary reports ${oversized.executed} executed tests but only ${caseTotal} test-case results were parsed`,
+      caseTotal,
+    );
+  }
+  if (validSummaries.length === 0) {
+    return block('QA_TEST_COUNT_MISSING', `parsed ${caseTotal} test-case results but no native Executed summary`, caseTotal);
+  }
+  const binding = bindBundleEvidence(counts, onlyTesting);
+  if (binding.blocked) {
+    return block(binding.code, `test-case tally parsed ${caseTotal} tests with ${counts.casesFailed} failures, but ${binding.reason}`, caseTotal);
+  }
+  const actualTestCount = binding.executed;
+  const actualFailures = binding.failures;
 
   if (successBanners !== 1 || failureBanners !== 0 || counts.succeeded !== true) {
     return block(
@@ -326,7 +459,7 @@ function evaluateSuiteAuthority(run, expectedTestCount) {
     ...base,
     blocked: false,
     code: 'QA_EXACT_COUNT_VERIFIED',
-    reason: `expected ${expectedTestCount} executable tests and parsed exactly ${actualTestCount}; zero failures; TEST SUCCEEDED; exit 0`,
+    reason: `expected ${expectedTestCount} executable tests and parsed exactly ${actualTestCount} across ${binding.bound.length} native test bundle${binding.bound.length === 1 ? '' : 's'} (${binding.bound.join(', ')}); zero failures; TEST SUCCEEDED; exit 0`,
     actualTestCount,
   };
 }

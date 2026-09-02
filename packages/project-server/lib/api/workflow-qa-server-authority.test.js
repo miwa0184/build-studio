@@ -24,6 +24,7 @@ const path = require('path');
 
 const qaSuite = require('../qa-suite-run');
 const { git, stubBinDir, withPath, mountWorkflow, waitFor } = require('../test-support/workflow-http');
+const { singleBundleLog, bundleSession, xcodebuildLog } = require('../test-support/xcodebuild-log');
 
 const EXPECTED = 56;
 const ONLY_TESTING = ['StubUITests'];
@@ -36,7 +37,7 @@ const CLEAN_APPROVAL = [
 /** The tick fires 500ms after auto-advance is enabled. */
 const TICK_SETTLE_MS = 1500;
 
-function exactQaRepo({ discoverable = true } = {}) {
+function exactQaRepo({ discoverable = true, onlyTesting = ONLY_TESTING } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'exact-qa-'));
   const simulator = [
     'simulator:',
@@ -54,7 +55,7 @@ function exactQaRepo({ discoverable = true } = {}) {
     '    - role: QA', '      skill: qa', '      command: qa.md',
     ...simulator,
     'qa_validation:',
-    `  only_testing: [${ONLY_TESTING.join(', ')}]`,
+    `  only_testing: [${onlyTesting.join(', ')}]`,
     `  expected_test_count: ${EXPECTED}`,
     '',
   ].join('\n'));
@@ -107,19 +108,20 @@ function persistedRun(result, command = 'xcodebuild test -project Stub.xcodeproj
     ...result,
     command,
     authority: {
-      ...qaSuite.evaluateSuiteAuthority(result, EXPECTED),
+      ...qaSuite.evaluateSuiteAuthority(result, EXPECTED, { onlyTesting: ONLY_TESTING }),
       onlyTesting: ONLY_TESTING, parallelTesting: false, command,
     },
     finishedAt: new Date().toISOString(),
   };
 }
 
+/** Shell lines that print `log` verbatim, as xcodebuild would. */
+function echoLog(log) {
+  return log.split('\n').map((line) => `echo "${line}"`).join('\n');
+}
+
 function successfulLog() {
-  const lines = [];
-  for (let i = 1; i <= EXPECTED; i++) lines.push(`echo "Test Case '-[StubUITests.Cases test${i}]' passed (0.1 seconds)."`);
-  lines.push(`echo "Executed ${EXPECTED} tests, with 0 failures (0 unexpected) in 1.0 (1.1) seconds"`);
-  lines.push('echo "** TEST SUCCEEDED **"');
-  return lines.join('\n');
+  return echoLog(singleBundleLog('StubUITests', EXPECTED));
 }
 
 function clean(root) { try { fs.rmSync(root, { recursive: true, force: true }); } catch {} }
@@ -287,6 +289,67 @@ test('F2 — a run still marked running with no persisted authority (server rest
   const server = await mountRecording(root, wf);
   try {
     await withPath(bin, () => assertNoBypass(server, 'QA_SERVER_SUITE_AUTHORITY_MISSING'));
+  } finally { await server.close(); clean(root); clean(bin); }
+});
+
+test('F1 — two configured targets with equal counts and one corroborating summary block approval, override and the tick', async () => {
+  // The forgery the second review reproduced at the evaluator, driven through
+  // the real launch: StubTests and StubUITests both run 28 cases, only
+  // StubTests prints its own native summary. Under count-only matching that
+  // one summary vouched for both bundles and the run reached code_review.
+  const root = exactQaRepo({ onlyTesting: ['StubTests', 'StubUITests'] });
+  const log = xcodebuildLog([
+    bundleSession({ bundle: 'StubTests', classes: [{ name: 'Cases', count: 28 }] }),
+    bundleSession({ bundle: 'StubUITests', classes: [{ name: 'Cases', count: 28 }], bundleSummary: false, sessionSummary: false }),
+  ]);
+  const bin = stubBinDir(['claude', 'pgrep'], { xcodebuild: `#!/bin/sh\n${echoLog(log)}\nexit 0\n` });
+  const server = await mountRecording(root, qaWorkflow());
+  try {
+    await withPath(bin, async () => {
+      const launch = await server.request('POST', '/api/workflow/advance', { action: 'launch' });
+      assert.equal(launch.status, 200, JSON.stringify(launch.body));
+      const authority = await waitFor(() => {
+        const step = server.state.loadWorkflow().steps.qa_validation;
+        return step.suiteRun && step.suiteRun.authority;
+      }, { label: 'persisted suite authority' });
+      assert.equal(authority.code, 'QA_TEST_COUNT_INCONSISTENT', JSON.stringify(authority));
+      assert.equal(authority.blocked, true);
+      assert.deepEqual(authority.onlyTesting, ['StubTests', 'StubUITests']);
+      assert.match(authority.reason, /StubUITests/);
+
+      await waitFor(() => (server.state.loadWorkflow().steps.qa_validation.agents || []).length > 0, { label: 'QA agent launched' });
+      const fb = await server.request('POST', '/api/workflow/feedback', { role: 'QA', step: 'qa_validation', feedback: CLEAN_APPROVAL });
+      assert.equal(fb.status, 200, JSON.stringify(fb.body));
+      await assertNoBypass(server, 'QA_TEST_COUNT_INCONSISTENT');
+    });
+  } finally { await server.close(); clean(root); clean(bin); }
+});
+
+test('F1 — control: two configured targets with equal counts and independently bound summaries approve', async () => {
+  const root = exactQaRepo({ onlyTesting: ['StubTests', 'StubUITests'] });
+  const log = xcodebuildLog([
+    bundleSession({ bundle: 'StubTests', classes: [{ name: 'Cases', count: 28 }] }),
+    bundleSession({ bundle: 'StubUITests', style: 'objc', classes: [{ name: 'Home', count: 20 }, { name: 'Play', count: 8 }] }),
+  ]);
+  const bin = stubBinDir(['claude', 'pgrep'], { xcodebuild: `#!/bin/sh\n${echoLog(log)}\nexit 0\n` });
+  const server = await mountRecording(root, qaWorkflow());
+  try {
+    await withPath(bin, async () => {
+      const launch = await server.request('POST', '/api/workflow/advance', { action: 'launch' });
+      assert.equal(launch.status, 200, JSON.stringify(launch.body));
+      const authority = await waitFor(() => {
+        const step = server.state.loadWorkflow().steps.qa_validation;
+        return step.suiteRun && step.suiteRun.authority;
+      }, { label: 'persisted suite authority' });
+      assert.equal(authority.code, 'QA_EXACT_COUNT_VERIFIED', JSON.stringify(authority));
+      assert.equal(authority.actualTestCount, EXPECTED);
+      await waitFor(() => (server.state.loadWorkflow().steps.qa_validation.agents || []).length > 0, { label: 'QA agent launched' });
+      const fb = await server.request('POST', '/api/workflow/feedback', { role: 'QA', step: 'qa_validation', feedback: CLEAN_APPROVAL });
+      assert.equal(fb.status, 200, JSON.stringify(fb.body));
+      const approve = await server.request('POST', '/api/workflow/advance', { action: 'approve' });
+      assert.equal(approve.status, 200, JSON.stringify(approve.body));
+      assert.equal(server.state.loadWorkflow().currentStep, 'code_review');
+    });
   } finally { await server.close(); clean(root); clean(bin); }
 });
 

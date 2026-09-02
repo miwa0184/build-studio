@@ -116,15 +116,20 @@ test('a log with no summary reports null counts rather than zero', () => {
   assert.equal(c.failures, null);
 });
 
+const { bundleSession, xcodebuildLog } = require('./test-support/xcodebuild-log');
+
+/**
+ * A completed single-bundle run the way xcodebuild prints it: `caseCount`
+ * Objective-C-style cases inside the `SudokuDailyUITests.xctest` boundary,
+ * whose own native summary claims `executed`.
+ */
 function xcodeResult(executed, { failures = 0, banner = 'SUCCEEDED', caseCount = executed } = {}) {
-  const lines = [];
-  for (let i = 1; i <= caseCount; i++) {
-    const outcome = i <= failures ? 'failed' : 'passed';
-    lines.push(`Test Case '-[SudokuDailyUITests Case${i} test]' ${outcome} (0.1 seconds).`);
-  }
-  lines.push(`Executed ${executed} tests, with ${failures} failures (0 unexpected) in 1.0 (1.1) seconds`);
-  if (banner) lines.push(`** TEST ${banner} **`);
-  const counts = parseTestCounts(lines.join('\n'));
+  const log = xcodebuildLog([bundleSession({
+    bundle: 'SudokuDailyUITests', style: 'objc',
+    classes: [{ name: 'Cases', count: caseCount, failed: failures, summary: executed }],
+    bundleSummary: executed, sessionSummary: executed,
+  })], { banner });
+  const counts = parseTestCounts(log);
   return { status: 'completed', exitCode: failures ? 65 : 0, counts };
 }
 

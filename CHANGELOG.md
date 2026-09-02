@@ -24,11 +24,30 @@ that move underneath you without your having edited anything.
 ## 2026-09-03 — Exact QA authority and governed inventory repairs
 
 Repairs to the governed-existing adoption and exact serial QA authority that
-shipped on 2026-09-02, after independent review of that change. Nothing here
+shipped on 2026-09-02, after two rounds of independent review. Nothing here
 changes a project that has not opted into `governed-existing` onboarding or
 `qa_validation.expected_test_count`.
 
 ### Changed
+
+- **Exact QA evidence is bound to native test bundles, one-to-one.** The
+  authority now reads the xcodebuild hierarchy: a test bundle is a
+  `Test Suite '<Target>.xctest'` boundary, its test cases are the case lines
+  printed inside that boundary, and its summary is the `Executed N tests` line
+  that closes it. Every target named in `qa_validation.only_testing` (or,
+  without that list, every bundle the run printed) must bind to exactly one
+  such boundary with exactly one summary equal to its own tally. Consequences
+  on an unmodified config:
+  - a configured target that prints no `Test Suite '<Target>.xctest'`
+    boundary — including a target whose product name differs from its target
+    name — blocks with the new code `QA_TEST_TARGET_UNBOUND`;
+  - a native summary with no test-case lines behind it, test-case lines
+    printed outside any bundle boundary, a bundle boundary printed twice, a
+    bundle closed by two summaries, and a bundle that ran outside the
+    configured `only_testing` scope all block as `QA_TEST_COUNT_INCONSISTENT`.
+    Before, a lone summary equal to `expected_test_count` could verify a run
+    with no case lines at all;
+  - an unconfigured bundle that executed zero tests is tolerated.
 
 - **A Markdown-relevant symlink now fails the governed inventory closed.** A
   symlink named `*.md`, a symlink to a directory, or a symlink that cannot be
@@ -47,6 +66,25 @@ changes a project that has not opted into `governed-existing` onboarding or
 
 ### Fixed
 
+- **One native summary could vouch for two test bundles.** The multi-target
+  corroboration matched summaries to per-bundle tallies by count alone, with
+  no consumption and no bundle identity. Two configured targets with equal
+  counts and only one summary between them, or a bundle vouched for by a
+  class-level or unrelated summary, persisted `QA_EXACT_COUNT_VERIFIED` and
+  approve advanced the run to `code_review`. Each bundle now consumes the one
+  summary that closes its own boundary and nothing else; the run above blocks
+  before any agent sees it, and approve, operator override and the
+  auto-advance tick all refuse it.
+- **Objective-C test classes were mistaken for test bundles.** Bundle identity
+  was inferred from the case name, which is `-[Module.Class method]` for
+  Swift and `-[Class method]` for Objective-C, so one Objective-C target with
+  two classes was treated as two bundles and entered the multi-target path. A
+  target with 30 + 26 cases, honest class summaries, a false whole-bundle
+  aggregate of 50, `expected_test_count: 56`, `TEST SUCCEEDED` and exit 0 was
+  verified, while the same evidence in Swift form blocked. Identity now comes
+  only from the `.xctest` boundary, so the verdict no longer depends on the
+  language the tests are written in; the genuine two-class Objective-C run,
+  with its honest bundle summary, still verifies.
 - **A valid multi-target exact QA run was blocked as
   `QA_TEST_COUNT_INCONSISTENT`.** With two entries in
   `qa_validation.only_testing`, xcodebuild prints one native summary per test
@@ -71,7 +109,10 @@ changes a project that has not opted into `governed-existing` onboarding or
 
 **In Build Studio** — rebuild and reinstall the Hub and project-server bundle.
 
-**In each managed project** — nothing to do. A `governed-existing` project
+**In each managed project** — nothing to do for a project at rest. A
+`qa_validation` step whose server suite ran before this update carries no
+bundle evidence and will read as `QA_SERVER_SUITE_AUTHORITY_DRIFT` on approve;
+relaunch `qa_validation` for a fresh server run. A `governed-existing` project
 whose corpus contains a Markdown-relevant symlink will now be refused at
 inventory and at owner sign-off until the symlink is replaced or removed; run
 `find . -type l -not -path './node_modules/*' -not -path './.git/*'` to list
@@ -89,17 +130,31 @@ candidates.
   exact server authority the last persisted QA verdict therefore stays blocked
   on the step until an operator relaunches `qa_validation`; the run still
   parks at the A1c egress hold and cannot ship locally.
+- The authority binds evidence only in serial xcodebuild output
+  (`simulator.parallel_testing: false`), which prints the
+  `Test Suite` / `Test Case` hierarchy. Parallel-distributed output
+  (`Test case '…' passed on 'Clone 1 of …'`) and Swift Testing output print
+  no case lines the parser reads, so those runs block as
+  `QA_TEST_COUNT_MISSING` or `QA_TEST_COUNT_INCONSISTENT`, as they did before;
+  they have never verified. The display line `Executed N tests` in the agent
+  prompt still sums every native summary in the log (class, bundle and
+  session), so it over-counts a hierarchical log; the verdict does not use it.
 
 ### Notes for forks
 
-- `parseTestCounts` now returns `caseTallies` (per test bundle
-  `{ passed, failed }`) alongside the existing fields, and `startSuiteRun`
-  derives every count from the stream; a fork that re-parses the log tail for
-  authority decisions will disagree with the server on long two-target runs.
-- `evaluateSuiteAuthority` accepts a per-bundle corroborated tally only when
-  there are at least two bundles and every bundle has a matching native
-  summary. Keep that "every bundle" requirement: relaxing it to a sum lets one
-  repeated summary vouch for a bundle that never ran.
+- `parseTestCounts` returns `bundles` — one entry per `.xctest` boundary,
+  `{ name, ordinal, passed, failed, started, closed, summaries: [{ executed,
+  failures, index }] }` — plus `unboundCases`, and each `summaryCounts` entry
+  now carries the `suite` that printed it and the `bundle` it closed (or
+  `null`). `caseTallies` is gone. `startSuiteRun` derives every count from
+  the stream; a fork that re-parses the log tail for authority decisions will
+  disagree with the server on long two-target runs.
+- `evaluateSuiteAuthority(run, expected, { onlyTesting })` takes the
+  configured target list the run was spawned with, and
+  `qaServerSuiteGateVerdict` recomputes under the persisted
+  `authority.onlyTesting` after the scope-staleness checks. Keep the binding
+  structural: never match a summary to a bundle by its count, and never derive
+  a bundle from a case name — both were shown forgeable by independent review.
 
 ## 2026-09-02 — Governed existing-repo adoption and exact serial QA authority
 

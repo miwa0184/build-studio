@@ -12,6 +12,7 @@ const assert = require('node:assert/strict');
 
 const { qaStrictGateVerdict, qaServerSuiteGateVerdict } = require('./workflow');
 const { parseTestCounts } = require('../qa-suite-run');
+const { singleBundleLog } = require('../test-support/xcodebuild-log');
 
 const CERTIFIED_WITH_FLAKE = [
   '**Tests passed:** 1305/1305 (unit) + 143/143 stable + 1 flaky-confirmed (E2E)',
@@ -97,11 +98,7 @@ test('failure count parsed from "(N failed" parenthetical form', () => {
 
 test('server exact-count authority blocks before and regardless of an agent clean verdict or operator override', () => {
   const config = { qa_validation: { expected_test_count: 56 } };
-  const counts = parseTestCounts([
-    ...Array.from({ length: 55 }, (_, i) => `Test Case '-[SudokuDailyUITests Case${i} test]' passed (0.1 seconds).`),
-    'Executed 55 tests, with 0 failures (0 unexpected)',
-    '** TEST SUCCEEDED **',
-  ].join('\n'));
+  const counts = parseTestCounts(singleBundleLog('SudokuDailyUITests', 55, { style: 'objc' }));
   const step = {
     suiteRun: {
       status: 'completed',
@@ -124,11 +121,7 @@ test('server exact-count authority passes only its persisted exact verdict; lega
     qa_validation: { expected_test_count: 56, only_testing: ['SudokuDailyUITests'] },
     simulator: { parallel_testing: false },
   };
-  const counts = parseTestCounts([
-    ...Array.from({ length: 56 }, (_, i) => `Test Case '-[SudokuDailyUITests Case${i} test]' passed (0.1 seconds).`),
-    'Executed 56 tests, with 0 failures (0 unexpected)',
-    '** TEST SUCCEEDED **',
-  ].join('\n'));
+  const counts = parseTestCounts(singleBundleLog('SudokuDailyUITests', 56, { style: 'objc' }));
   assert.equal(qaServerSuiteGateVerdict({
     suiteRun: { status: 'completed', exitCode: 0, counts, authority: {
       configured: true, blocked: false, code: 'QA_EXACT_COUNT_VERIFIED',
@@ -150,11 +143,7 @@ test('persisted exact authority is bound to current target scope and serial sett
     expectedTestCount: 56, actualTestCount: 56,
     onlyTesting: ['OtherUITests'], parallelTesting: false,
   };
-  const counts = parseTestCounts([
-    ...Array.from({ length: 56 }, (_, i) => `Test Case '-[SudokuDailyUITests Case${i} test]' passed (0.1 seconds).`),
-    'Executed 56 tests, with 0 failures (0 unexpected)',
-    '** TEST SUCCEEDED **',
-  ].join('\n'));
+  const counts = parseTestCounts(singleBundleLog('SudokuDailyUITests', 56, { style: 'objc' }));
   const suiteRun = { status: 'completed', exitCode: 0, counts, authority };
   assert.equal(qaServerSuiteGateVerdict({ suiteRun }, config).code, 'QA_SERVER_SUITE_SCOPE_STALE');
   authority.onlyTesting = ['SudokuDailyUITests'];
@@ -164,11 +153,7 @@ test('persisted exact authority is bound to current target scope and serial sett
 
 test('persisted pass cannot disagree with the raw server result', () => {
   const config = { qa_validation: { expected_test_count: 56 } };
-  const counts = parseTestCounts([
-    ...Array.from({ length: 55 }, (_, i) => `Test Case '-[T Case${i} test]' passed (0.1 seconds).`),
-    'Executed 55 tests, with 0 failures (0 unexpected)',
-    '** TEST SUCCEEDED **',
-  ].join('\n'));
+  const counts = parseTestCounts(singleBundleLog('T', 55, { style: 'objc' }));
   const verdict = qaServerSuiteGateVerdict({ suiteRun: {
     status: 'completed', exitCode: 0, counts,
     authority: {
