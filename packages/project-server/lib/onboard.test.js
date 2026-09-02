@@ -71,6 +71,52 @@ test('onboardProject: refuses when no recognizable project file', async () => {
   } finally { clean(root); }
 });
 
+// ─── Apple projects (Xcode / XcodeGen / SwiftPM) ────────────────────────────
+//
+// An Apple app has none of the seven original PROJECT_FILE_MARKERS: no
+// package.json, and CocoaPods (Podfile) is optional and increasingly rare.
+// Before these markers existed, detectAll threw NO_CODE at the marker gate —
+// which runs BEFORE detectPreset — so `mobile-app` detection was unreachable
+// for the exact repo shape Xcode produces.
+
+const XCODEGEN_APP_SHAPE = {
+  'project.yml': 'name: SudokuDaily\ntargets:\n  SudokuDaily:\n    type: application\n    platform: iOS\n',
+  'SudokuDaily.xcodeproj/project.pbxproj': '// !$*UTF8*$!\n{ archiveVersion = 1; }\n',
+  'SudokuDailyApp.swift': 'import SwiftUI\n@main struct SudokuDailyApp: App { var body: some Scene { WindowGroup {} } }\n',
+  'README.md': '# Sudoku Daily',
+};
+
+test('previewOnboard: accepts an Xcode/XcodeGen app and reaches preset detection', async () => {
+  const root = makeRepo(XCODEGEN_APP_SHAPE);
+  try {
+    const preview = await previewOnboard(root);
+    assert.equal(preview.preset, 'mobile-app');
+  } finally { clean(root); }
+});
+
+test('previewOnboard: accepts a SwiftPM package past the marker gate', async () => {
+  const root = makeRepo({
+    'Package.swift': '// swift-tools-version:5.9\nimport PackageDescription\nlet package = Package(name: "Kit")\n',
+    'Sources/Kit/Kit.swift': 'public struct Kit {}\n',
+  });
+  try {
+    await previewOnboard(root);
+  } catch (e) {
+    assert.notEqual(e.code, 'NO_CODE', 'Package.swift must satisfy the recognizable-code gate');
+  } finally { clean(root); }
+});
+
+test('previewOnboard: a bare .xcworkspace also satisfies the marker gate', async () => {
+  const root = makeRepo({
+    'SudokuDaily.xcworkspace/contents.xcworkspacedata': '<?xml version="1.0"?><Workspace version="1.0"></Workspace>\n',
+    'App.swift': 'import SwiftUI\n',
+  });
+  try {
+    const preview = await previewOnboard(root);
+    assert.equal(preview.preset, 'mobile-app');
+  } finally { clean(root); }
+});
+
 test('onboardProject: refuses when .build-studio/config.yaml already exists (409 shape)', async () => {
   const root = makeRepo(EXAMPLE_APP_SHAPE);
   fs.mkdirSync(path.join(root, '.build-studio'));
