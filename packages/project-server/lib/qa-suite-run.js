@@ -339,9 +339,8 @@ function startSuiteRun({ cwd, args, logPath, timeoutMs, env, onProgress }) {
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (killTimer) clearTimeout(killTimer);
       if (child.pid) activeRuns.delete(child.pid);
-      out.end();
       const counts = parseTestCounts(tail);
-      resolve({
+      const result = {
         status: timedOut ? 'timeout' : 'completed',
         exitCode: code,
         signal: signal || null,
@@ -349,7 +348,17 @@ function startSuiteRun({ cwd, args, logPath, timeoutMs, env, onProgress }) {
         logPath,
         counts: { ...counts, casesPassed, casesFailed },
         failureExcerpt: failureExcerpt(tail),
-      });
+      };
+      // The log is the artifact the agent is pointed at, and `** TEST FAILED **`
+      // is the LAST line xcodebuild writes. `out.end()` only ASKS the stream to
+      // flush; resolving in the same tick hands the reader a log that can be
+      // missing exactly the verdict it exists to carry — a red suite that reads
+      // green. Wait for the flush. Settle once even if the stream errors, so a
+      // write failure truncates the log rather than hanging the run forever.
+      let settled = false;
+      const settle = () => { if (!settled) { settled = true; resolve(result); } };
+      out.once('error', settle);
+      out.end(settle);
     });
   });
 
