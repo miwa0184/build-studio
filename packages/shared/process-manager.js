@@ -150,6 +150,12 @@ function killStaleServers(projectPath, keepPid) {
  * Returns { pid, port }.
  */
 async function startProject(name) {
+  // Canonicalize a URL-derived name against the registry so PID files and
+  // health comparisons key off the registered project name, never the raw
+  // (possibly percent-encoded) route text.
+  const canonical = registry.resolveName(name);
+  if (!canonical) throw new Error(`Project "${name}" not found in registry`);
+  name = canonical;
   const project = registry.get(name);
   if (!project) throw new Error(`Project "${name}" not found in registry`);
 
@@ -279,6 +285,9 @@ async function startProject(name) {
  * Stop a project server.
  */
 async function stopProject(name) {
+  const canonical = registry.resolveName(name);
+  if (!canonical) return { stopped: false, reason: 'project not found' };
+  name = canonical;
   const info = readPidFile(name);
   if (!info) return { stopped: false, reason: 'no pid file' };
 
@@ -309,6 +318,9 @@ async function stopProject(name) {
  * Check if a project server is running and healthy.
  */
 async function getStatus(name) {
+  const canonical = registry.resolveName(name);
+  if (!canonical) return { running: false, reason: 'project not found' };
+  name = canonical;
   const info = readPidFile(name);
   if (!info) return { running: false, reason: 'no pid file' };
   if (!isProcessAlive(info.pid)) {

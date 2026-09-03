@@ -21,6 +21,29 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-09-03 — A project name with a space in it no longer 404s
+
+### Fixed
+
+- **Opening a managed project whose name contains a space (or other characters
+  a URL encodes, like parentheses) no longer shows a 404.** The project page
+  and the health/start/stop/registry-removal routes all take the project name
+  from the URL, which the browser and Next.js's dynamic route arrive with as
+  a percent-encoded string (`Quiet%20Nine`); nothing decoded it before
+  comparing against the registry, so the lookup silently failed and the page
+  fell back to Next's not-found boundary. The registry now resolves a URL
+  name to its registered key — an exact key always wins, otherwise the name
+  is decoded exactly once — and process start/stop/status now key PID files
+  off that resolved name instead of the raw route text. A malformed
+  percent-encoding fails closed (not found) instead of throwing.
+
+### Upgrade steps
+
+**In Build Studio** — rebuild the hub and re-inject into the Electron app
+(see *Build & Deploy* in `CLAUDE.md`), then restart the app.
+
+**In each managed project** — nothing to do.
+
 ## 2026-09-03 — Exact QA authority and governed inventory repairs
 
 Repairs to the governed-existing adoption and exact serial QA authority that
