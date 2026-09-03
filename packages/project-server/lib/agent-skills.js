@@ -61,6 +61,7 @@ const MAX_INLINE_BYTES = 40 * 1024;
  * of them would inline a role file into a prompt that never asked for it.
  */
 const COMMAND_REF = /(?:^|[\s(*_"'`])\/([a-z][a-z0-9_-]*)\b/g;
+const COMMAND_PATH_REF = /\.claude\/commands\/([a-z][a-z0-9_-]*)\.md\b/g;
 
 /** Skill references, which the prompts always write in backticks. */
 const SKILL_REF = /`([a-z][a-z0-9-]*)`\s+skill/g;
@@ -78,6 +79,7 @@ function referencedNames(instruction) {
   const commands = [];
   const skills = [];
   for (const m of text.matchAll(COMMAND_REF)) commands.push(m[1]);
+  for (const m of text.matchAll(COMMAND_PATH_REF)) commands.push(m[1]);
   for (const m of text.matchAll(SKILL_REF)) skills.push(m[1]);
   // A backticked name may also appear with a leading slash elsewhere in the
   // same prompt; commands win, since the command file is the role definition.
@@ -130,8 +132,8 @@ function resolveReferences(instruction, { roots, fs }) {
  * @param {string} instruction
  * @param {{cli:string, roots:string[], fs:object, maxBytes?:number}} ctx
  */
-function inlineReferencedDefinitions(instruction, { cli, roots, fs, maxBytes = MAX_INLINE_BYTES }) {
-  if (NATIVE_CLAUDE_DIR_CLIS.has(cli)) return '';
+function inlineReferencedDefinitions(instruction, { cli, roots, fs, maxBytes = MAX_INLINE_BYTES, force = false }) {
+  if (NATIVE_CLAUDE_DIR_CLIS.has(cli) && !force) return '';
   let refs;
   try { refs = resolveReferences(instruction, { roots, fs }); } catch { return ''; }
   if (!refs.length) return '';
@@ -159,6 +161,19 @@ function inlineReferencedDefinitions(instruction, { cli, roots, fs, maxBytes = M
     + `Do not treat any of them as unavailable, and do not substitute a similar-sounding capability of your own `
     + `(a browser runtime, a built-in review mode) for what is written below.${note}\n\n`
     + parts.join('\n\n');
+}
+
+/** Build Studio's bundled role/skill tree, across source and app layouts. */
+function bundledDefinitionRoots(fsImpl) {
+  const suffix = path.join('templates', 'default');
+  const candidates = [
+    path.resolve(__dirname, '..', '..', '..', suffix),
+    path.resolve(__dirname, '..', '..', suffix),
+    path.resolve(__dirname, '..', '..', '..', '..', '..', suffix),
+  ];
+  return candidates.filter((candidate) => {
+    try { return fsImpl.existsSync(candidate); } catch { return false; }
+  });
 }
 
 /**
@@ -237,4 +252,5 @@ module.exports = {
   NATIVE_CLAUDE_DIR_CLIS,
   CLAUDE_ONLY_TRANSLATIONS,
   MAX_INLINE_BYTES,
+  bundledDefinitionRoots,
 };

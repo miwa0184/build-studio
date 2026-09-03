@@ -17,6 +17,7 @@ const exitRecovery = require('../exit-recovery');
 const agentSkills = require('../agent-skills');
 const gateBlocked = require('../gate-blocked');
 const qaSuite = require('../qa-suite-run');
+const governedOnboarding = require('../governed-onboarding');
 const { extractFixPlan, checkFeedbackContract, rejectionOutcome, MAX_REJECTIONS } = require('../plan-contract');
 const { RunGuardCorruptError } = require('../run-guard');
 const { attachStateAuthority, AcceptanceGapPersistError } = require('../state');
@@ -399,6 +400,93 @@ function qaStrictGateVerdict(qaFeedback, config, operatorOverride) {
     return { blocked: false, failingCount, cleanApproval, honoredBypass: true };
   }
   return { blocked: true, failingCount, cleanApproval, honoredBypass: false };
+}
+
+// Exact-count iOS QA is server authority, not agent testimony. This pure gate
+// is used by manual approval and the auto-advance tick so both paths read the
+// same persisted verdict. An operator override deliberately has no parameter
+// here: once expected_test_count is configured, only a fresh exact server run
+// can replace a blocked verdict.
+function qaServerSuiteGateVerdict(step, config) {
+  const qaConfig = (config && config.qa_validation) || {};
+  const expected = qaConfig.expected_test_count;
+  if (expected === undefined || expected === null) {
+    return { configured: false, blocked: false, code: 'QA_EXACT_COUNT_NOT_CONFIGURED' };
+  }
+  const authority = step && step.suiteRun && step.suiteRun.authority;
+  if (!authority || authority.configured !== true) {
+    return {
+      configured: true,
+      blocked: true,
+      code: 'QA_SERVER_SUITE_AUTHORITY_MISSING',
+      expectedTestCount: expected,
+      actualTestCount: null,
+      reason: 'expected_test_count is configured but no persisted server-suite authority exists',
+    };
+  }
+  if (authority.expectedTestCount !== expected) {
+    return {
+      configured: true,
+      blocked: true,
+      code: 'QA_SERVER_SUITE_AUTHORITY_STALE',
+      expectedTestCount: expected,
+      actualTestCount: authority.actualTestCount ?? null,
+      reason: `persisted authority was evaluated for expected ${authority.expectedTestCount}, not current expected ${expected}`,
+    };
+  }
+  if (Array.isArray(qaConfig.only_testing)
+      && JSON.stringify(authority.onlyTesting) !== JSON.stringify(qaConfig.only_testing)) {
+    return {
+      configured: true,
+      blocked: true,
+      code: 'QA_SERVER_SUITE_SCOPE_STALE',
+      expectedTestCount: expected,
+      actualTestCount: authority.actualTestCount ?? null,
+      reason: 'persisted authority was evaluated for a different only_testing target list',
+    };
+  }
+  const simulator = (config && config.simulator) || {};
+  if (Object.prototype.hasOwnProperty.call(simulator, 'parallel_testing')
+      && authority.parallelTesting !== simulator.parallel_testing) {
+    return {
+      configured: true,
+      blocked: true,
+      code: 'QA_SERVER_SUITE_PARALLELISM_STALE',
+      expectedTestCount: expected,
+      actualTestCount: authority.actualTestCount ?? null,
+      reason: 'persisted authority was evaluated with different simulator.parallel_testing configuration',
+    };
+  }
+  // The persisted verdict must be reproducible from the raw run, under the
+  // only_testing scope the run was spawned with (checked against the current
+  // config just above), so every configured target re-binds to its own
+  // native bundle evidence on every read.
+  const recomputed = qaSuite.evaluateSuiteAuthority(step.suiteRun, expected, { onlyTesting: authority.onlyTesting });
+  if (recomputed.blocked !== authority.blocked
+      || recomputed.code !== authority.code
+      || recomputed.actualTestCount !== authority.actualTestCount) {
+    return {
+      configured: true,
+      blocked: true,
+      code: 'QA_SERVER_SUITE_AUTHORITY_DRIFT',
+      expectedTestCount: expected,
+      actualTestCount: recomputed.actualTestCount ?? null,
+      reason: `persisted authority disagrees with server recomputation (${authority.code} vs ${recomputed.code})`,
+    };
+  }
+  return authority;
+}
+
+function onboardingPlanForInventory(inventory) {
+  return governedOnboarding.onboardingPlanForInventory(inventory);
+}
+
+function buildGovernedDiscoveryInstruction(options) {
+  return governedOnboarding.buildGovernedDiscoveryInstruction(options);
+}
+
+function governedSignoffPathspecs() {
+  return governedOnboarding.governedSignoffPathspecs();
 }
 
 // Scan an AC verifier's matrix for MET rows whose cited evidence doesn't hold
@@ -1790,6 +1878,12 @@ ${EFFICIENCY_INSTRUCTIONS}`,
     // the primary gate, and a request that only this line stops is a
     // primary-gate defect — but a forgotten wiring must not spawn agents.
     const admissionCtx = admission.assertRunAdmitted(wf.id, 'launchWorkflowAgents');
+    // A mature governed repo may carry legacy AGENTS/CLAUDE workflow rules that
+    // are historical evidence, not live factory authority. Inject the small,
+    // tracked adoption instruction before every agent prompt so Build Studio's
+    // runtime boundary and the product-law allowlist cannot be displaced by an
+    // auto-loaded legacy file. Missing/drifted instruction fails the launch.
+    const governedAuthorityContext = governedOnboarding.governedAgentContext(config, projectRoot);
     // Needed before the CLI probe below, which now checks the one CLI this
     // step resolves to rather than one per agent role.
     const resolvedStep = stepKey || wf.currentStep;
@@ -2029,7 +2123,15 @@ ${EFFICIENCY_INSTRUCTIONS}`,
       // agent's CLI is known — so a codex/opencode agent gets the definition
       // rather than inventing a substitute for it (see agent-skills.js).
       const inlinedSkills = agentSkills.inlineReferencedDefinitions(agent.instruction, {
-        cli: agentCli, roots: [agentCwd, projectRoot], fs,
+        cli: agentCli,
+        roots: config.onboarding && config.onboarding.mode === governedOnboarding.GOVERNED_MODE
+          ? [...agentSkills.bundledDefinitionRoots(fs), agentCwd, projectRoot]
+          : [agentCwd, projectRoot],
+        fs,
+        // Claude normally loads project-local .claude definitions itself. In
+        // governed mode those files are classified legacy, so inline the
+        // bundled Build Studio definitions for Claude too.
+        force: Boolean(config.onboarding && config.onboarding.mode === governedOnboarding.GOVERNED_MODE),
       });
       if (inlinedSkills) {
         console.log(`[workflow] inlined .claude definitions for ${agent.role} (${agentCli}): ${inlinedSkills.length} chars`);
@@ -2037,10 +2139,13 @@ ${EFFICIENCY_INSTRUCTIONS}`,
       // Capabilities with no file to inline (they live in the claude binary)
       // get their method spelled out instead — see agent-skills.js.
       const translated = agentSkills.translateClaudeOnlyCapabilities(agent.instruction, agentCli);
+      const runtimeInstruction = config.onboarding && config.onboarding.mode === governedOnboarding.GOVERNED_MODE
+        ? governedOnboarding.retireLegacyRuntimeReferences(translated.text)
+        : translated.text;
       if (translated.translated.length) {
         console.log(`[workflow] translated claude-only capabilities for ${agent.role} (${agentCli}): ${translated.translated.join(', ')}`);
       }
-      const prompt = interpolate(`${translated.text}${extraInstructions}${inlinedSkills}${learningsResult.text}${history}${feedbackCurl}`);
+      const prompt = interpolate(`${runtimeInstruction}${extraInstructions}${inlinedSkills}${learningsResult.text}${history}${governedAuthorityContext}${feedbackCurl}`);
 
       const baseWindow = (agent.window || agent.role).replace(/[^a-zA-Z0-9_-]/g, '-').slice(0, 12).replace(/-+$/, '');
       const windowName = wf.round > 1 ? `${baseWindow}-r${wf.round}` : baseWindow;
@@ -2980,7 +3085,9 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
       kickoff: config.workflow.kickoff || [],
       review: config.workflow.review || [],
       execution: config.workflow.execution || [],
-      onboarding: config.workflow.onboarding || [],
+      onboarding: wf && wf.type === 'onboarding'
+        ? Object.keys(wf.steps || {})
+        : (config.workflow.onboarding || []),
       // Resolved server-side (config.workflow.bugfix override or DEFAULT_BUGFIX_STEPS)
       // so the hub can render the bugfix timeline the same way it does the others.
       bugfix: bugfixSequence(config),
@@ -3249,6 +3356,8 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     let itemId = null; // set when `input` named a backlog user story / task
     let steps, currentStep;
     let taskPlan = null; // bugfix synthesizes its single-task plan up front (no planning step)
+    let onboardingMode = null;
+    let onboardingAuthorityMap = null;
 
     if (type === 'kickoff') {
       steps = {
@@ -3262,27 +3371,30 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
       };
       currentStep = 'ceo_synthesis';
     } else if (type === 'onboarding') {
-      // PRD-001 v1: only available when docs/onboarding/inventory.json exists
-      // (the button has run) AND docs/vision.md does not (workflow hasn't completed yet).
+      // The inventory chooses between legacy single-PRD synthesis and explicit
+      // governed-existing adoption. Never infer the mode from filenames.
       const inventoryPath = path.join(projectRoot, 'docs', 'onboarding', 'inventory.json');
       const visionPath = path.join(docsPath, 'vision.md');
       if (!fs.existsSync(inventoryPath)) {
         return res.status(400).json({ error: 'No docs/onboarding/inventory.json — run Onboard project from the home screen first.' });
       }
-      if (fs.existsSync(visionPath)) {
+      let inventory;
+      try { inventory = JSON.parse(fs.readFileSync(inventoryPath, 'utf8')); }
+      catch (error) {
+        return res.status(400).json({ error: `Cannot read docs/onboarding/inventory.json: ${error.message}` });
+      }
+      const onboardingPlan = onboardingPlanForInventory(inventory);
+      onboardingMode = onboardingPlan.mode;
+      if (onboardingMode === governedOnboarding.GOVERNED_MODE) {
+        try { onboardingAuthorityMap = governedOnboarding.loadGovernedAuthorityMap(projectRoot, inventory); }
+        catch (error) {
+          return res.status(400).json({ error: error.message, code: error.code || 'GOVERNED_AUTHORITY_MAP_INVALID' });
+        }
+      } else if (fs.existsSync(visionPath)) {
         return res.status(400).json({ error: 'docs/vision.md already exists — onboarding has already run for this project.' });
       }
-      steps = {
-        discovery:           { status: 'pending', agents: [] },
-        ceo_synthesis:       { status: 'pending', agents: [] },
-        architect_backfill:  { status: 'pending', agents: [] },
-        pm_synthesis:        { status: 'pending', agents: [] },
-        devops_detect:       { status: 'pending', agents: [] },
-        team_review:         { status: 'pending', agents: [] },
-        pm_revision:         { status: 'pending', agents: [] },
-        owner_signoff:       { status: 'pending', agents: [] },
-      };
-      currentStep = 'discovery';
+      steps = onboardingPlan.steps;
+      currentStep = onboardingPlan.currentStep;
     } else if (type === 'bugfix') {
       // Bugfix: a lean execution flow driven by a single Bug backlog item. No
       // PRD, no planning, no review panel — the bug file is the spec. `input` is
@@ -3520,6 +3632,8 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
         },
       } : {}),
       type, input, prdPath, itemId, currentStep, steps,
+      ...(onboardingMode ? { onboardingMode } : {}),
+      ...(onboardingAuthorityMap ? { onboardingAuthorityMap } : {}),
       // Bugfix synthesizes its single-task plan at start (no planning step). Left
       // undefined for other types, which build taskPlan during their planning step.
       ...(taskPlan ? { taskPlan } : {}),
@@ -4309,7 +4423,10 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
     } else if (allDone) {
       // Detect verdict from agent feedback (server-side detectVerdict)
       const qaStrict = (config.qa_validation && config.qa_validation.strict) !== false;
-      const hasBlocking = wf.currentStep === 'qa_tests' ? false : verdictAgents.some(a => {
+      const serverQaGate = wf.currentStep === 'qa_validation'
+        ? qaServerSuiteGateVerdict(step, config)
+        : { blocked: false };
+      const hasBlocking = wf.currentStep === 'qa_tests' ? false : serverQaGate.blocked || verdictAgents.some(a => {
         if (!a.feedback) return false;
         const fb = a.feedback;
         // PRD-002: qa_validation strict mode treats ANY failing test as blocking,
@@ -5690,6 +5807,79 @@ Fix only the issues raised. Commit your changes.`,
       const r = findRole(config, name);
       return r ? r.skill : fallbackSkill;
     };
+
+    if (wf.onboardingMode === governedOnboarding.GOVERNED_MODE) {
+      if (wf.currentStep === 'discovery' && wf.steps.discovery.status === 'pending') {
+        const agents = [{
+          role: 'Surveyor', window: 'survey', status: 'pending', reportFeedback: true,
+          instruction: buildGovernedDiscoveryInstruction({ ownerNotes: wf.ownerSignoffNotes || '' }),
+        }];
+        wf.steps.discovery = { status: 'running', agents: launchWorkflowAgents(wf, agents, { useWorktrees: false }) };
+        state.saveWorkflow(wf);
+        return res.json({ workflow: wf });
+      }
+      if (wf.currentStep === 'discovery' && action === 'approve') {
+        wf.steps.discovery.status = 'completed';
+        wf.currentStep = 'owner_signoff';
+        state.saveWorkflow(wf);
+        return res.json({ workflow: wf, needsAdvance: true });
+      }
+      if (wf.currentStep === 'owner_signoff' && action === 'send_back') {
+        wf.ownerSignoffNotes = notes || 'Owner requested another authority-map review.';
+        wf.round = (wf.round || 1) + 1;
+        wf.currentStep = 'discovery';
+        wf.steps.discovery = { status: 'pending', agents: [] };
+        wf.steps.owner_signoff = { status: 'pending', agents: [] };
+        state.saveWorkflow(wf);
+        return res.json({ workflow: wf, needsAdvance: true });
+      }
+      if (wf.currentStep === 'owner_signoff' && action === 'approve') {
+        let inventory;
+        let map;
+        try {
+          inventory = JSON.parse(fs.readFileSync(path.join(projectRoot, 'docs', 'onboarding', 'inventory.json'), 'utf8'));
+          map = governedOnboarding.loadGovernedAuthorityMap(projectRoot, inventory);
+          const validation = governedOnboarding.validateGovernedSignoff(projectRoot, map);
+          if (!validation.ok) {
+            return res.status(409).json({
+              error: `Governed adoption is not commit-ready:\n- ${validation.errors.join('\n- ')}`,
+              code: 'GOVERNED_SIGNOFF_REFUSED',
+              authorityErrors: validation.errors,
+              workflow: wf,
+            });
+          }
+          const { execFileSync } = require('child_process');
+          const pathspecs = governedSignoffPathspecs();
+          const preStaged = execFileSync('git', ['diff', '--cached', '--name-only'], {
+            cwd: projectRoot, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+          }).trim().split('\n').filter(Boolean);
+          const allowed = new Set(pathspecs);
+          const outside = preStaged.filter(rel => !allowed.has(rel));
+          if (outside.length) {
+            return res.status(409).json({
+              error: `Governed adoption has pre-staged files outside the adoption allowlist: ${outside.join(', ')}`,
+              code: 'GOVERNED_SIGNOFF_SCOPE_REFUSED',
+              workflow: wf,
+            });
+          }
+          execFileSync('git', ['add', '--', ...pathspecs], { cwd: projectRoot, stdio: ['pipe', 'pipe', 'pipe'] });
+          execFileSync('git', ['commit', '-m', 'chore: adopt governed project into build-studio'], {
+            cwd: projectRoot, stdio: ['pipe', 'pipe', 'pipe'],
+          });
+        } catch (error) {
+          const msg = (error.stderr && error.stderr.toString()) || error.message;
+          wf.steps.owner_signoff = { status: 'error', error: `Commit failed: ${msg}` };
+          state.saveWorkflow(wf);
+          return res.status(500).json({ workflow: wf, error: msg, code: error.code || 'GOVERNED_SIGNOFF_FAILED' });
+        }
+        wf.onboardingAuthorityMap = map;
+        wf.steps.owner_signoff.status = 'completed';
+        wf.currentStep = 'completed';
+        state.saveWorkflow(wf);
+        return res.json({ workflow: wf });
+      }
+      return res.status(400).json({ error: `no valid governed onboarding transition for step=${wf.currentStep} action=${action}` });
+    }
 
     // ─── 1. discovery ────────────────────────────────────────────────────────
     if (wf.currentStep === 'discovery' && wf.steps.discovery.status === 'pending') {
@@ -7997,14 +8187,23 @@ Report honestly. Note: this step does NOT block — even Approved: no advances t
       // `-only-testing:<Scheme>Tests`, xcodebuild aborted during target
       // resolution in 683ms, and zero tests ran (2026-08-29). Two resolutions of
       // one fact is the bug; there is now one.
+      const expectedTestCount = config.qa_validation && config.qa_validation.expected_test_count;
+      const exactAuthorityRequired = expectedTestCount !== undefined && expectedTestCount !== null;
+      const configuredOnlyTesting = config.qa_validation && config.qa_validation.only_testing;
       let suiteTarget = null;
+      let suiteUnavailableReason = null;
       if (config.simulator && config.simulator.destination
           && (config.qa_validation && config.qa_validation.server_runs_suite) !== false) {
         suiteTarget = qaSuite.discoverProjectAndScheme({ projectRoot, simulator: config.simulator });
         if (suiteTarget.error) {
           console.warn(`[qa-suite] not running the suite server-side: ${suiteTarget.error}`);
+          suiteUnavailableReason = suiteTarget.error;
           suiteTarget = null;
         }
+      } else if (!config.simulator || !config.simulator.destination) {
+        suiteUnavailableReason = 'simulator.destination is not configured';
+      } else {
+        suiteUnavailableReason = 'qa_validation.server_runs_suite is false';
       }
       const hoistSuite = !!suiteTarget;
       // Parallel XCUITest cloning halves wallclock but, on some iOS-26 simulator
@@ -8019,9 +8218,16 @@ Report honestly. Note: this step does NOT block — even Approved: no advances t
       const parallelFlag = qaSuite.parallelArgs(_pt).join(' ');
       // Collected while composing the scope section so the server can run the
       // same scoped invocation the prompt used to describe.
-      let qaScopeTargets = null;
+      let qaScopeTargets = Array.isArray(configuredOnlyTesting) ? [...configuredOnlyTesting] : null;
       let qaScopeSection = '';
-      if (qaScope === 'new-uitests' && config.simulator && config.simulator.destination) {
+      if (qaScopeTargets) {
+        qaScopeSection = `\n\n## QA SCOPE — EXPLICIT SERVER AUTHORITY
+
+Run exactly the configured \`qa_validation.only_testing\` targets, with no inferred unit-test or regression target:
+${qaScopeTargets.map((target) => `- \`${target}\``).join('\n')}
+
+This explicit list takes precedence over \`qa_validation.scope\`.`;
+      } else if (qaScope === 'new-uitests' && config.simulator && config.simulator.destination) {
         try {
           const { execFileSync } = require('child_process');
           const diff = execFileSync('git', ['diff', '--name-only', '--diff-filter=AM', 'main...HEAD'], { cwd: projectRoot, encoding: 'utf8' });
@@ -8163,9 +8369,48 @@ You are QA. **Your job is to RUN the test suite and report test outcomes — not
         state.saveWorkflow(wf);
       };
 
+      const launchUnavailableQa = (error, { preserveExistingRun = false } = {}) => {
+        const unavailable = { status: 'unavailable', error };
+        if (exactAuthorityRequired) {
+          // Bind the verdict to the scope it was evaluated for, exactly as a
+          // completed run does, so the gate reads it back as the unavailable
+          // verdict it is rather than as a stale-scope one.
+          unavailable.authority = {
+            ...qaSuite.evaluateSuiteAuthority(unavailable, expectedTestCount, { onlyTesting: qaScopeTargets || [] }),
+            onlyTesting: qaScopeTargets || [],
+            parallelTesting: _pt,
+          };
+          wf.steps.qa_validation = {
+            ...(wf.steps.qa_validation || {}),
+            status: 'running',
+            agents: [],
+            suiteRun: unavailable,
+          };
+          // Persist the server verdict before any LLM sees or comments on it.
+          state.saveWorkflow(wf);
+        } else if (preserveExistingRun) {
+          wf.steps.qa_validation.suiteRun = {
+            ...(wf.steps.qa_validation.suiteRun || {}),
+            status: 'error',
+            error,
+            finishedAt: new Date().toISOString(),
+          };
+        } else {
+          // Backwards-compatible fallback: legacy projects still hand an
+          // unavailable server run to the QA agent without gaining a new
+          // server-authority state shape.
+          wf.steps.qa_validation = { status: 'running', agents: [] };
+        }
+        launchQaAgent(qaSuite.formatSuiteSection(unavailable));
+      };
+
       if (!hoistSuite) {
-        wf.steps.qa_validation = { status: 'running', agents: [] };
-        launchQaAgent('');
+        if (exactAuthorityRequired) {
+          launchUnavailableQa(suiteUnavailableReason || 'the server could not resolve an iOS suite target');
+        } else {
+          wf.steps.qa_validation = { status: 'running', agents: [] };
+          launchQaAgent('');
+        }
         return res.json({ workflow: wf });
       }
 
@@ -8185,9 +8430,8 @@ You are QA. **Your job is to RUN the test suite and report test outcomes — not
           onlyTesting: qaScopeTargets || [],
         });
       } catch (e) {
-        console.warn('[qa-suite] cannot build command, falling back to agent-run:', e.message);
-        wf.steps.qa_validation = { status: 'running', agents: [] };
-        launchQaAgent(qaSuite.formatSuiteSection({ status: 'unavailable', error: e.message }));
+        console.warn('[qa-suite] cannot build command:', e.message);
+        launchUnavailableQa(e.message);
         return res.json({ workflow: wf });
       }
       const suiteCommand = qaSuite.displayCommand(suiteArgs);
@@ -8196,9 +8440,8 @@ You are QA. **Your job is to RUN the test suite and report test outcomes — not
       // time, and a second xcodebuild doubles wallclock and orphans clones.
       if (qaSuite.xcodebuildInFlight()) {
         const why = 'another xcodebuild test is already running on this machine';
-        console.warn(`[qa-suite] ${why} — leaving the run to the agent`);
-        wf.steps.qa_validation = { status: 'running', agents: [] };
-        launchQaAgent(qaSuite.formatSuiteSection({ status: 'unavailable', error: why }));
+        console.warn(`[qa-suite] ${why}`);
+        launchUnavailableQa(why);
         return res.json({ workflow: wf });
       }
 
@@ -8219,9 +8462,8 @@ You are QA. **Your job is to RUN the test suite and report test outcomes — not
           },
         });
       } catch (e) {
-        console.warn('[qa-suite] spawn failed, falling back to agent-run:', e.message);
-        wf.steps.qa_validation = { status: 'running', agents: [] };
-        launchQaAgent(qaSuite.formatSuiteSection({ status: 'unavailable', error: `xcodebuild could not be started (${e.message})` }));
+        console.warn('[qa-suite] spawn failed:', e.message);
+        launchUnavailableQa(`xcodebuild could not be started (${e.message})`);
         return res.json({ workflow: wf });
       }
 
@@ -8232,6 +8474,7 @@ You are QA. **Your job is to RUN the test suite and report test outcomes — not
           status: 'running',
           command: suiteCommand,
           logPath: suiteLogPath,
+          ...(exactAuthorityRequired ? { expectedTestCount } : {}),
           pid: handle.pid,
           // Whose child is this? The watchdog uses it to tell "running, and I
           // am awaiting it" from "running, but the server that started it is
@@ -8248,9 +8491,23 @@ You are QA. **Your job is to RUN the test suite and report test outcomes — not
       handle.promise.then((result) => {
         const step = wf.steps.qa_validation;
         if (!step) return;
-        step.suiteRun = { ...step.suiteRun, ...result, status: result.status, finishedAt: new Date().toISOString() };
+        const authority = {
+          ...qaSuite.evaluateSuiteAuthority(result, expectedTestCount, { onlyTesting: qaScopeTargets || [] }),
+          onlyTesting: qaScopeTargets || [],
+          parallelTesting: _pt,
+          command: suiteCommand,
+        };
+        step.suiteRun = {
+          ...step.suiteRun,
+          ...result,
+          status: result.status,
+          authority,
+          finishedAt: new Date().toISOString(),
+        };
         console.log(`[qa-suite] ${result.status} in ${Math.round(result.durationMs / 1000)}s — `
           + `${result.counts.casesPassed} passed, ${result.counts.casesFailed} failed`);
+        // The agent may explain the result but cannot be its source. Save first.
+        state.saveWorkflow(wf);
         launchQaAgent(qaSuite.formatSuiteSection({ ...step.suiteRun, timeoutMs }));
         // Reap simulator clones the run leaked. Only Shutdown+idle clones are
         // removed, so this is safe even while another project is mid-test.
@@ -8260,9 +8517,8 @@ You are QA. **Your job is to RUN the test suite and report test outcomes — not
       }).catch((e) => {
         const step = wf.steps.qa_validation;
         if (!step) return;
-        console.warn('[qa-suite] run failed, falling back to agent-run:', e.message);
-        step.suiteRun = { ...step.suiteRun, status: 'error', error: e.message, finishedAt: new Date().toISOString() };
-        launchQaAgent(qaSuite.formatSuiteSection({ status: 'unavailable', error: `the run failed to start (${e.message})` }));
+        console.warn('[qa-suite] run failed:', e.message);
+        launchUnavailableQa(`the run failed to start (${e.message})`, { preserveExistingRun: true });
       });
 
       return res.json({ workflow: wf });
@@ -8275,6 +8531,13 @@ You are QA. **Your job is to RUN the test suite and report test outcomes — not
     }
 
     if (wf.currentStep === 'qa_validation' && action === 'approve') {
+      const serverGate = qaServerSuiteGateVerdict(wf.steps.qa_validation, config);
+      if (serverGate.blocked) {
+        return res.status(400).json({
+          error: `Cannot approve QA: server-authoritative exact-count gate is blocked (${serverGate.code}): ${serverGate.reason || 'no valid exact-count verdict'}. QA feedback and operator override cannot bypass this gate; run a fresh server suite.`,
+          qaServerAuthority: serverGate,
+        });
+      }
       // GATE: QA agent must have submitted feedback before approval is allowed
       const qaAgents = wf.steps.qa_validation.agents || [];
       const qaFeedback = qaAgents.map(a => a.feedback || '').join('\n');
@@ -9112,6 +9375,29 @@ Before adding new entries, scan existing files in docs/learnings/:
           return res.status(400).json({ error: wf.steps.fix_plan.error });
         }
 
+        // A zero-task plan is the shortcut back to the main line, and it used
+        // to be the one path that walked a run past a BLOCKED server-
+        // authoritative exact-count verdict: the tick sent the blocked
+        // qa_validation to devs, the planner found nothing to fix, and the
+        // QA agent's clean report carried the run on to the next step without
+        // a single fresh server run. Only such a run can replace the verdict.
+        // Refuse here, before the advance target is computed, and accept no
+        // override: an operator override answers the planner's judgement, not
+        // the server's evidence.
+        if (sourceStep === 'qa_validation') {
+          const serverGate = qaServerSuiteGateVerdict(wf.steps.qa_validation, config);
+          if (serverGate.blocked) {
+            wf.steps.fix_plan.status = 'blocked';
+            wf.steps.fix_plan.error = `Fix planner returned 0 tasks, but qa_validation's server-authoritative exact-count gate is blocked (${serverGate.code}): ${serverGate.reason || 'no valid exact-count verdict'}. A zero-task plan cannot advance past a blocked server verdict and no override applies. Fix the cause, then relaunch qa_validation for a fresh server suite.`;
+            state.saveWorkflow(wf);
+            return res.status(400).json({
+              error: wf.steps.fix_plan.error,
+              qaServerAuthority: serverGate,
+              sourceStep,
+            });
+          }
+        }
+
         // Generalised strict-mode guard: refuse 0-task fix plans whenever the
         // source step is a review step that actually reported blocking
         // findings. Closes the rationalisation escape hatch where fix_planner
@@ -9665,6 +9951,10 @@ module.exports = {
   markPrdDoneContent,
   collectMissingAcArtifacts,
   qaStrictGateVerdict,
+  qaServerSuiteGateVerdict,
+  onboardingPlanForInventory,
+  buildGovernedDiscoveryInstruction,
+  governedSignoffPathspecs,
   extractOwnerChecklist,
   findIncompleteRequiredSpecs,
 };

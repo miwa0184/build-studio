@@ -274,6 +274,68 @@ function loadConfig(projectRoot) {
   if (!config.port || typeof config.port !== 'number' || config.port < 1024 || config.port > 65535) {
     errors.push('Missing or invalid field: port (number 1024-65535)');
   }
+  if (Object.prototype.hasOwnProperty.call(config.qa_validation || {}, 'only_testing')) {
+    const targets = config.qa_validation.only_testing;
+    const targetPattern = /^[A-Za-z0-9_.+][-A-Za-z0-9_.+-]*(?:\/[A-Za-z0-9_.+][-A-Za-z0-9_.+-]*){0,2}$/;
+    if (!Array.isArray(targets) || targets.length === 0) {
+      errors.push('qa_validation.only_testing must be a non-empty array of xcodebuild target identifiers');
+    } else {
+      const seen = new Set();
+      for (const target of targets) {
+        if (typeof target !== 'string' || !targetPattern.test(target)) {
+          errors.push(`qa_validation.only_testing contains an invalid target identifier: ${JSON.stringify(target)}`);
+          continue;
+        }
+        if (seen.has(target)) errors.push(`qa_validation.only_testing contains duplicate target: ${target}`);
+        seen.add(target);
+      }
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(config.qa_validation || {}, 'expected_test_count')) {
+    const expected = config.qa_validation.expected_test_count;
+    if (!Number.isInteger(expected) || expected <= 0) {
+      errors.push('qa_validation.expected_test_count must be a positive integer');
+    }
+  }
+  const hasExactQaScope = Object.prototype.hasOwnProperty.call(config.qa_validation || {}, 'only_testing');
+  const hasExactQaCount = Object.prototype.hasOwnProperty.call(config.qa_validation || {}, 'expected_test_count');
+  if (hasExactQaCount && !hasExactQaScope) {
+    errors.push('qa_validation.expected_test_count requires qa_validation.only_testing');
+  }
+  if (hasExactQaCount && (!config.simulator
+      || config.simulator.parallel_testing !== false)) {
+    errors.push('qa_validation.expected_test_count requires simulator.parallel_testing: false');
+  }
+  if ((hasExactQaScope || hasExactQaCount) && (!config.simulator || !config.simulator.destination)) {
+    errors.push('qa_validation.only_testing/expected_test_count require simulator.destination for the server-run suite');
+  }
+  if ((hasExactQaScope || hasExactQaCount) && config.qa_validation.server_runs_suite === false) {
+    errors.push('qa_validation.only_testing/expected_test_count cannot be combined with server_runs_suite: false');
+  }
+  if (config.simulator && Object.prototype.hasOwnProperty.call(config.simulator, 'parallel_testing')) {
+    const parallel = config.simulator.parallel_testing;
+    if (!(typeof parallel === 'boolean' || (Number.isInteger(parallel) && parallel > 0))) {
+      errors.push('simulator.parallel_testing must be true, false, or a positive integer worker count');
+    }
+  }
+  if (config.onboarding && config.onboarding.mode !== undefined) {
+    if (!['single-prd-mvp', 'governed-existing'].includes(config.onboarding.mode)) {
+      errors.push('onboarding.mode must be single-prd-mvp or governed-existing');
+    }
+    if (config.onboarding.mode === 'governed-existing') {
+      for (const [key, fallback] of [
+        ['authority_map', 'docs/onboarding/authority-map.json'],
+        ['agent_instruction', '.build-studio/agent-instructions.md'],
+      ]) {
+        const rel = config.onboarding[key] || fallback;
+        if (typeof rel !== 'string' || path.isAbsolute(rel) || rel === '..' || rel.startsWith('../') || rel.includes('/../')) {
+          errors.push(`onboarding.${key} must be a safe project-relative path`);
+        } else if (!fs.existsSync(path.join(projectRoot, rel))) {
+          errors.push(`onboarding.${key} does not exist: ${rel}`);
+        }
+      }
+    }
+  }
   if (!VALID_CLIS.includes(config.cli.default)) {
     console.warn(`[config] Warning: cli.default "${config.cli.default}" is not one of ${VALID_CLIS.join('/')} — falling back to 'claude'.`);
     config.cli.default = 'claude';

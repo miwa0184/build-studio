@@ -26,10 +26,38 @@ function list() {
   return Object.entries(reg.projects).map(([name, info]) => ({ name, ...info }));
 }
 
+/**
+ * Resolve a URL-derived project name to the canonical key registered in
+ * `projects`. An exact key always wins without decoding. Otherwise the name
+ * is decoded exactly once (no recursive decoding) and matched against
+ * `projects`; a malformed percent-encoding or a decoded value that isn't
+ * itself a registered key fails closed (returns null) rather than throwing
+ * or guessing. Pure and disk-free so it can be unit-tested directly.
+ */
+function resolveNameInProjects(projects, name) {
+  if (Object.prototype.hasOwnProperty.call(projects, name)) return name;
+  let decoded;
+  try {
+    decoded = decodeURIComponent(name);
+  } catch {
+    return null;
+  }
+  if (decoded !== name && Object.prototype.hasOwnProperty.call(projects, decoded)) {
+    return decoded;
+  }
+  return null;
+}
+
+function resolveName(name) {
+  const reg = load();
+  return resolveNameInProjects(reg.projects, name);
+}
+
 function get(name) {
   const reg = load();
-  const info = reg.projects[name];
-  return info ? { name, ...info } : null;
+  const canonical = resolveNameInProjects(reg.projects, name);
+  if (!canonical) return null;
+  return { name: canonical, ...reg.projects[canonical] };
 }
 
 function add(name, projectPath, port, workspace = null) {
@@ -69,8 +97,9 @@ function findByName(name) {
 
 function remove(name) {
   const reg = load();
-  if (!reg.projects[name]) return false;
-  delete reg.projects[name];
+  const canonical = resolveNameInProjects(reg.projects, name);
+  if (!canonical) return false;
+  delete reg.projects[canonical];
   save(reg);
   return true;
 }
@@ -95,4 +124,9 @@ function findByPath(projectPath) {
   return null;
 }
 
-module.exports = { load, save, list, get, add, remove, nextAvailablePort, findByPath, listByWorkspace, findByName };
+module.exports = {
+  load, save, list, get, add, remove, nextAvailablePort, findByPath, listByWorkspace, findByName,
+  resolveName,
+  // Exported for unit tests.
+  resolveNameInProjects,
+};

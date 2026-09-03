@@ -21,6 +21,177 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-09-03 — A project name with a space in it no longer 404s
+
+### Fixed
+
+- **Opening a managed project whose name contains a space (or other characters
+  a URL encodes, like parentheses) no longer shows a 404.** The project page
+  and the health/start/stop/registry-removal routes all take the project name
+  from the URL, which the browser and Next.js's dynamic route arrive with as
+  a percent-encoded string (`Quiet%20Nine`); nothing decoded it before
+  comparing against the registry, so the lookup silently failed and the page
+  fell back to Next's not-found boundary. The registry now resolves a URL
+  name to its registered key — an exact key always wins, otherwise the name
+  is decoded exactly once — and process start/stop/status now key PID files
+  off that resolved name instead of the raw route text. A malformed
+  percent-encoding fails closed (not found) instead of throwing.
+
+### Upgrade steps
+
+**In Build Studio** — rebuild the hub and re-inject into the Electron app
+(see *Build & Deploy* in `CLAUDE.md`), then restart the app.
+
+**In each managed project** — nothing to do.
+
+## 2026-09-03 — Exact QA authority and governed inventory repairs
+
+Repairs to the governed-existing adoption and exact serial QA authority that
+shipped on 2026-09-02, after two rounds of independent review. Nothing here
+changes a project that has not opted into `governed-existing` onboarding or
+`qa_validation.expected_test_count`.
+
+### Changed
+
+- **Exact QA evidence is bound to native test bundles, one-to-one.** The
+  authority now reads the xcodebuild hierarchy: a test bundle is a
+  `Test Suite '<Target>.xctest'` boundary, its test cases are the case lines
+  printed inside that boundary, and its summary is the `Executed N tests` line
+  that closes it. Every target named in `qa_validation.only_testing` (or,
+  without that list, every bundle the run printed) must bind to exactly one
+  such boundary with exactly one summary equal to its own tally. Consequences
+  on an unmodified config:
+  - a configured target that prints no `Test Suite '<Target>.xctest'`
+    boundary — including a target whose product name differs from its target
+    name — blocks with the new code `QA_TEST_TARGET_UNBOUND`;
+  - a native summary with no test-case lines behind it, test-case lines
+    printed outside any bundle boundary, a bundle boundary printed twice, a
+    bundle closed by two summaries, and a bundle that ran outside the
+    configured `only_testing` scope all block as `QA_TEST_COUNT_INCONSISTENT`.
+    Before, a lone summary equal to `expected_test_count` could verify a run
+    with no case lines at all;
+  - an unconfigured bundle that executed zero tests is tolerated.
+
+- **A Markdown-relevant symlink now fails the governed inventory closed.** A
+  symlink named `*.md`, a symlink to a directory, or a symlink that cannot be
+  resolved used to be skipped silently, so a linked product-law file or a
+  linked folder of specs vanished from the authority map — and owner sign-off,
+  which walks the same way, would accept and commit a corpus it had never fully
+  seen. Both now refuse with `AUTHORITY_INVENTORY_SYMLINK` and the offending
+  path. Nothing is followed, inside or outside the repository. Symlinks to
+  non-Markdown files are still skipped. Standard (`single-prd-mvp`) onboarding
+  is unchanged.
+- **The server-run suite tallies its evidence off the stream, not the tail.**
+  Native `Executed N tests` summaries and success/failure banners are now
+  counted from every line the run emitted. Before, only the last 200 KB were
+  parsed for them, so a two-target run's first summary could scroll out of the
+  window and the exact-count verdict was evaluated on partial evidence.
+
+### Fixed
+
+- **One native summary could vouch for two test bundles.** The multi-target
+  corroboration matched summaries to per-bundle tallies by count alone, with
+  no consumption and no bundle identity. Two configured targets with equal
+  counts and only one summary between them, or a bundle vouched for by a
+  class-level or unrelated summary, persisted `QA_EXACT_COUNT_VERIFIED` and
+  approve advanced the run to `code_review`. Each bundle now consumes the one
+  summary that closes its own boundary and nothing else; the run above blocks
+  before any agent sees it, and approve, operator override and the
+  auto-advance tick all refuse it.
+- **Objective-C test classes were mistaken for test bundles.** Bundle identity
+  was inferred from the case name, which is `-[Module.Class method]` for
+  Swift and `-[Class method]` for Objective-C, so one Objective-C target with
+  two classes was treated as two bundles and entered the multi-target path. A
+  target with 30 + 26 cases, honest class summaries, a false whole-bundle
+  aggregate of 50, `expected_test_count: 56`, `TEST SUCCEEDED` and exit 0 was
+  verified, while the same evidence in Swift form blocked. Identity now comes
+  only from the `.xctest` boundary, so the verdict no longer depends on the
+  language the tests are written in; the genuine two-class Objective-C run,
+  with its honest bundle summary, still verifies.
+- **A valid multi-target exact QA run was blocked as
+  `QA_TEST_COUNT_INCONSISTENT`.** With two entries in
+  `qa_validation.only_testing`, xcodebuild prints one native summary per test
+  bundle (30 + 26, say) and no aggregate, and the authority demanded a single
+  summary equal to the whole run. Per-bundle summaries are now corroborated
+  against the per-bundle case tally and summed; a summary that does not match
+  its bundle, a bundle no summary vouches for, a summary larger than the case
+  tally, a replayed run, or a run with no per-case lines still fails closed.
+  Single-target semantics are unchanged.
+- **A server-blocked exact QA verdict could be walked past by the fix loop.**
+  Auto-advance routed the blocked `qa_validation` to devs, the fix planner
+  returned zero tasks, and the QA agent's clean report then carried the run to
+  the next step without a fresh server run. A zero-task fix plan now refuses
+  (`qaServerAuthority` in the response) whenever the QA server gate is blocked,
+  with no override; relaunch `qa_validation` for a fresh server suite instead.
+- **A suite the server could not run was refused for the wrong reason.** The
+  persisted unavailable verdict lacked its scope binding, so approval reported
+  `QA_SERVER_SUITE_SCOPE_STALE` rather than `QA_SERVER_SUITE_UNAVAILABLE`. It
+  was blocked either way; it is now blocked for the stated reason.
+
+### Upgrade steps
+
+**In Build Studio** — rebuild and reinstall the Hub and project-server bundle.
+
+**In each managed project** — nothing to do for a project at rest. A
+`qa_validation` step whose server suite ran before this update carries no
+bundle evidence and will read as `QA_SERVER_SUITE_AUTHORITY_DRIFT` on approve;
+relaunch `qa_validation` for a fresh server run. A `governed-existing` project
+whose corpus contains a Markdown-relevant symlink will now be refused at
+inventory and at owner sign-off until the symlink is replaced or removed; run
+`find . -type l -not -path './node_modules/*' -not -path './.git/*'` to list
+candidates.
+
+### Known issues
+
+- An `opencode` agent launch fails after the prompt file is written
+  (`ReferenceError: opencodeModel is not defined` in the launcher). This is
+  present on `main` before this change and is outside its scope; the governed
+  role-precedence test drives `claude` and `codex` through the launcher and
+  pins `opencode` at the definition resolver only.
+- A fix loop that DOES produce tasks still returns to `code_review` after the
+  fixes land, as it always has, rather than re-running `qa_validation`. Under
+  exact server authority the last persisted QA verdict therefore stays blocked
+  on the step until an operator relaunches `qa_validation`; the run still
+  parks at the A1c egress hold and cannot ship locally.
+- The authority binds evidence only in serial xcodebuild output
+  (`simulator.parallel_testing: false`), which prints the
+  `Test Suite` / `Test Case` hierarchy. Parallel-distributed output
+  (`Test case '…' passed on 'Clone 1 of …'`) and Swift Testing output print
+  no case lines the parser reads, so those runs block as
+  `QA_TEST_COUNT_MISSING` or `QA_TEST_COUNT_INCONSISTENT`, as they did before;
+  they have never verified. The display line `Executed N tests` in the agent
+  prompt still sums every native summary in the log (class, bundle and
+  session), so it over-counts a hierarchical log; the verdict does not use it.
+
+### Notes for forks
+
+- `parseTestCounts` returns `bundles` — one entry per `.xctest` boundary,
+  `{ name, ordinal, passed, failed, started, closed, summaries: [{ executed,
+  failures, index }] }` — plus `unboundCases`, and each `summaryCounts` entry
+  now carries the `suite` that printed it and the `bundle` it closed (or
+  `null`). `caseTallies` is gone. `startSuiteRun` derives every count from
+  the stream; a fork that re-parses the log tail for authority decisions will
+  disagree with the server on long two-target runs.
+- `evaluateSuiteAuthority(run, expected, { onlyTesting })` takes the
+  configured target list the run was spawned with, and
+  `qaServerSuiteGateVerdict` recomputes under the persisted
+  `authority.onlyTesting` after the scope-staleness checks. Keep the binding
+  structural: never match a summary to a bundle by its count, and never derive
+  a bundle from a case name — both were shown forgeable by independent review.
+
+## 2026-09-02 — Governed existing-repo adoption and exact serial QA authority
+
+### Added
+
+- **Mature governed repositories can be adopted without greenfield synthesis.** The explicit `governed-existing` mode inventories the existing Markdown corpus into a reviewable authority map, keeps product and governance sources byte-identical, retires legacy execution files from Build Studio runtime authority, and routes directly from discovery to owner sign-off. The only commit is scoped to Build Studio metadata, the authority map, inventory, and adoption survey.
+- **iOS QA can declare exact server authority.** `qa_validation.only_testing` supplies the exact xcodebuild target list and `qa_validation.expected_test_count` requires a coherent, completed server-run suite with exactly that count, zero failures, one success banner, and exit 0. `simulator.parallel_testing: false` emits the serial xcodebuild flag with no worker/clone flags. Missing, extra, ambiguous, inconsistent, timed-out, or unavailable results block approval and cannot be overridden by QA-agent prose or an operator override.
+
+### Upgrade steps
+
+**In Build Studio** — rebuild and reinstall the Hub and project-server bundle.
+
+**In each managed project** — nothing changes unless the project opts into `governed-existing` onboarding or the new exact QA fields.
+
 ## 2026-09-02 — A1c Commit 1 parks candidates at a hard egress boundary
 
 Build Studio no longer has a local ship path while the reviewed A1c PR-egress
