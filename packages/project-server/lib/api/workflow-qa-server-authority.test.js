@@ -37,7 +37,7 @@ const CLEAN_APPROVAL = [
 /** The tick fires 500ms after auto-advance is enabled. */
 const TICK_SETTLE_MS = 1500;
 
-function exactQaRepo({ discoverable = true, onlyTesting = ONLY_TESTING } = {}) {
+function exactQaRepo({ discoverable = true, onlyTesting = ONLY_TESTING, appleAuthority = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'exact-qa-'));
   const simulator = [
     'simulator:',
@@ -57,6 +57,7 @@ function exactQaRepo({ discoverable = true, onlyTesting = ONLY_TESTING } = {}) {
     'qa_validation:',
     `  only_testing: [${onlyTesting.join(', ')}]`,
     `  expected_test_count: ${EXPECTED}`,
+    ...(appleAuthority ? ['  apple_result_authority: true', '  test_language: en'] : []),
     '',
   ].join('\n'));
   write(path.join(root, '.gitignore'), '.build-studio/workflow-state.json\n.build-studio/run-guard/\n.build-studio/admission/\n.build-studio/snapshots/\ntmp/\n');
@@ -72,6 +73,50 @@ function exactQaRepo({ discoverable = true, onlyTesting = ONLY_TESTING } = {}) {
   git(root, ['checkout', '-q', '-b', 'fix/ls-001']);
   return root;
 }
+
+test('Apple result authority runs through the workflow boundary with unique persisted artifacts', async () => {
+  const root = exactQaRepo({ appleAuthority: true });
+  const resultWriter = [
+    '#!/bin/sh',
+    'result=""',
+    'previous=""',
+    'for argument in "$@"; do',
+    '  if [ "$previous" = "-resultBundlePath" ]; then result="$argument"; fi',
+    '  previous="$argument"',
+    'done',
+    'mkdir -p "$result/Data"',
+    'printf info > "$result/Info.plist"',
+    'printf data > "$result/Data/payload"',
+    successfulLog(),
+    'exit 0',
+    '',
+  ].join('\n');
+  const xcrun = `#!/bin/sh\nprintf '%s\\n' '${JSON.stringify({
+    totalTestCount: EXPECTED, passedTests: EXPECTED, failedTests: 0,
+    skippedTests: 0, expectedFailures: 0, result: 'Passed',
+  })}'\n`;
+  const bin = stubBinDir(['claude', 'pgrep'], { xcodebuild: resultWriter, xcrun });
+  const server = await mountRecording(root, qaWorkflow());
+  try {
+    await withPath(bin, async () => {
+      const launch = await server.request('POST', '/api/workflow/advance', { action: 'launch' });
+      assert.equal(launch.status, 200, JSON.stringify(launch.body));
+      const suiteRun = await waitFor(() => {
+        const run = server.state.loadWorkflow().steps.qa_validation.suiteRun;
+        return run && run.authority && run;
+      }, { label: 'Apple-authoritative suite run' });
+      assert.equal(suiteRun.authority.code, 'QA_APPLE_RESULT_VERIFIED', JSON.stringify(suiteRun.authority));
+      assert.equal(suiteRun.authority.blocked, false);
+      assert.equal(suiteRun.authority.testLanguage, 'en');
+      assert.equal(suiteRun.args[suiteRun.args.indexOf('-testLanguage') + 1], 'en');
+      assert.equal(suiteRun.args[suiteRun.args.indexOf('-derivedDataPath') + 1], suiteRun.derivedDataPath);
+      assert.equal(suiteRun.args[suiteRun.args.indexOf('-resultBundlePath') + 1], suiteRun.resultBundlePath);
+      assert.ok(suiteRun.artifactDir.startsWith(path.join(root, 'tmp', 'qa-artifacts') + path.sep));
+      assert.match(suiteRun.artifacts.log.sha256, /^[0-9a-f]{64}$/);
+      assert.match(suiteRun.artifacts.resultBundle.manifestDigest, /^[0-9a-f]{64}$/);
+    });
+  } finally { await server.close(); clean(root); clean(bin); }
+});
 
 function write(file, content) {
   fs.mkdirSync(path.dirname(file), { recursive: true });

@@ -297,8 +297,19 @@ function loadConfig(projectRoot) {
       errors.push('qa_validation.expected_test_count must be a positive integer');
     }
   }
+  if (Object.prototype.hasOwnProperty.call(config.qa_validation || {}, 'apple_result_authority')
+      && typeof config.qa_validation.apple_result_authority !== 'boolean') {
+    errors.push('qa_validation.apple_result_authority must be true or false');
+  }
+  if (Object.prototype.hasOwnProperty.call(config.qa_validation || {}, 'test_language')) {
+    const language = config.qa_validation.test_language;
+    if (typeof language !== 'string' || !/^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(language)) {
+      errors.push('qa_validation.test_language must be a locale identifier such as en or sv-SE');
+    }
+  }
   const hasExactQaScope = Object.prototype.hasOwnProperty.call(config.qa_validation || {}, 'only_testing');
   const hasExactQaCount = Object.prototype.hasOwnProperty.call(config.qa_validation || {}, 'expected_test_count');
+  const hasAppleResultAuthority = config.qa_validation && config.qa_validation.apple_result_authority === true;
   if (hasExactQaCount && !hasExactQaScope) {
     errors.push('qa_validation.expected_test_count requires qa_validation.only_testing');
   }
@@ -311,6 +322,15 @@ function loadConfig(projectRoot) {
   }
   if ((hasExactQaScope || hasExactQaCount) && config.qa_validation.server_runs_suite === false) {
     errors.push('qa_validation.only_testing/expected_test_count cannot be combined with server_runs_suite: false');
+  }
+  if (hasAppleResultAuthority && (!hasExactQaScope || !hasExactQaCount)) {
+    errors.push('qa_validation.apple_result_authority requires only_testing and expected_test_count');
+  }
+  if (hasAppleResultAuthority && !config.qa_validation.test_language) {
+    errors.push('qa_validation.apple_result_authority requires qa_validation.test_language');
+  }
+  if (!hasAppleResultAuthority && config.qa_validation && config.qa_validation.test_language) {
+    errors.push('qa_validation.test_language requires apple_result_authority: true');
   }
   if (config.simulator && Object.prototype.hasOwnProperty.call(config.simulator, 'parallel_testing')) {
     const parallel = config.simulator.parallel_testing;

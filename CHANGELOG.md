@@ -21,6 +21,33 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-09-03 — Apple-native QA artifacts can be authoritative
+
+### Added
+
+- **An iOS project can opt into dual-source QA authority with
+  `qa_validation.apple_result_authority: true`.** Each server attempt receives
+  a unique ignored artifact directory, explicit test language, isolated
+  DerivedData, a real `.xcresult` bundle, a raw-log SHA-256 and a deterministic
+  result-bundle manifest digest. Build Studio reads Apple's supported
+  `xcresulttool get test-results summary` output and blocks missing, malformed,
+  non-clean or stdout-contradicting evidence. Agent feedback and operator
+  override cannot replace this evidence.
+- **QA settlement now treats a failed log flush as infrastructure failure.**
+  The server observes the writer's real terminal state, terminates an in-flight
+  child on writer failure, and never collects native artifacts from a partial
+  log.
+
+### Upgrade steps
+
+**In Build Studio** — re-inject the project server into the Electron app and
+restart it.
+
+**In each managed project** — nothing changes unless this authority is enabled.
+To enable it, configure exact serial QA (`only_testing`,
+`expected_test_count`, `simulator.parallel_testing: false`) plus
+`apple_result_authority: true` and `test_language`.
+
 ## 2026-09-03 — Governed signoff accepts its own runtime logs
 
 ### Fixed

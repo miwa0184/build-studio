@@ -164,3 +164,34 @@ test('persisted pass cannot disagree with the raw server result', () => {
   assert.equal(verdict.code, 'QA_SERVER_SUITE_AUTHORITY_DRIFT');
   assert.equal(verdict.blocked, true);
 });
+
+test('persisted Apple authority is bound to current artifact policy and language', () => {
+  const config = {
+    qa_validation: {
+      expected_test_count: 2, only_testing: ['ExampleUITests'],
+      apple_result_authority: true, test_language: 'en',
+    },
+    simulator: { parallel_testing: false },
+  };
+  const counts = parseTestCounts(singleBundleLog('ExampleUITests', 2, { style: 'objc' }));
+  const artifacts = {
+    status: 'complete',
+    log: { path: '/tmp/log', sha256: 'a'.repeat(64) },
+    resultBundle: { path: '/tmp/result.xcresult', fileCount: 1, manifestDigest: 'b'.repeat(64) },
+    apple: { totalTestCount: 2, passedTests: 2, failedTests: 0, skippedTests: 0, expectedFailures: 0, result: 'Passed' },
+  };
+  const authority = {
+    configured: true, blocked: false, code: 'QA_APPLE_RESULT_VERIFIED',
+    expectedTestCount: 2, actualTestCount: 2,
+    onlyTesting: ['ExampleUITests'], parallelTesting: false,
+    appleResultAuthority: true, testLanguage: 'en',
+  };
+  const suiteRun = { status: 'completed', exitCode: 0, counts, artifacts, authority };
+  assert.equal(qaServerSuiteGateVerdict({ suiteRun }, config).blocked, false);
+
+  authority.testLanguage = 'sv';
+  assert.equal(qaServerSuiteGateVerdict({ suiteRun }, config).code, 'QA_SERVER_SUITE_LANGUAGE_STALE');
+  authority.testLanguage = 'en';
+  authority.appleResultAuthority = false;
+  assert.equal(qaServerSuiteGateVerdict({ suiteRun }, config).code, 'QA_SERVER_SUITE_ARTIFACT_POLICY_STALE');
+});
