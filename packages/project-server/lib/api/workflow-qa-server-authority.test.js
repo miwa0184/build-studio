@@ -118,6 +118,50 @@ test('Apple result authority runs through the workflow boundary with unique pers
   } finally { await server.close(); clean(root); clean(bin); }
 });
 
+test('Apple result failure cannot be bypassed by clean feedback, operator override or auto-advance', async () => {
+  const root = exactQaRepo({ appleAuthority: true });
+  const resultWriter = [
+    '#!/bin/sh',
+    'result=""',
+    'previous=""',
+    'for argument in "$@"; do',
+    '  if [ "$previous" = "-resultBundlePath" ]; then result="$argument"; fi',
+    '  previous="$argument"',
+    'done',
+    'mkdir -p "$result/Data"',
+    'printf info > "$result/Info.plist"',
+    'printf data > "$result/Data/payload"',
+    successfulLog(),
+    'exit 0',
+    '',
+  ].join('\n');
+  const xcrun = `#!/bin/sh\nprintf '%s\\n' '${JSON.stringify({
+    totalTestCount: EXPECTED, passedTests: EXPECTED - 1, failedTests: 1,
+    skippedTests: 0, expectedFailures: 0, result: 'Failed',
+  })}'\n`;
+  const bin = stubBinDir(['claude', 'pgrep'], { xcodebuild: resultWriter, xcrun });
+  const server = await mountRecording(root, qaWorkflow());
+  try {
+    await withPath(bin, async () => {
+      const launch = await server.request('POST', '/api/workflow/advance', { action: 'launch' });
+      assert.equal(launch.status, 200, JSON.stringify(launch.body));
+      const authority = await waitFor(() => {
+        const run = server.state.loadWorkflow().steps.qa_validation.suiteRun;
+        return run && run.authority;
+      }, { label: 'blocked Apple-authoritative suite run' });
+      assert.equal(authority.code, 'QA_APPLE_STDOUT_CONTRADICTION', JSON.stringify(authority));
+      assert.equal(authority.blocked, true);
+
+      await waitFor(() => (server.state.loadWorkflow().steps.qa_validation.agents || []).length > 0, { label: 'QA agent launched' });
+      const feedback = await server.request('POST', '/api/workflow/feedback', {
+        role: 'QA', step: 'qa_validation', feedback: CLEAN_APPROVAL,
+      });
+      assert.equal(feedback.status, 200, JSON.stringify(feedback.body));
+      await assertNoBypass(server, 'QA_APPLE_STDOUT_CONTRADICTION');
+    });
+  } finally { await server.close(); clean(root); clean(bin); }
+});
+
 function write(file, content) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, content);

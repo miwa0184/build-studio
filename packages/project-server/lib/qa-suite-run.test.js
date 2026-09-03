@@ -11,7 +11,7 @@ const {
   parallelArgs, buildXcodebuildArgs, displayCommand, parseTestCounts,
   failureExcerpt, resolveTimeoutMs, formatSuiteSection, startSuiteRun,
   evaluateSuiteAuthority, createNativeArtifactPaths, collectNativeArtifacts,
-  DEFAULT_TIMEOUT_MINUTES,
+  isPidAlive, DEFAULT_TIMEOUT_MINUTES,
 } = require('./qa-suite-run');
 
 // ── argv construction ────────────────────────────────────────────────────────
@@ -413,6 +413,30 @@ exit 0
     const result = await run.promise;
     assert.equal(result.status, 'error');
     assert.match(result.error, /ENOSPC.*finalization failure/);
+  } finally {
+    fs.createWriteStream = originalCreateWriteStream;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a log-writer failure while xcodebuild is running terminates the child and fails closed', async () => {
+  const dir = stubDir(`#!/bin/sh
+echo "first chunk"
+sleep 60
+`);
+  const originalCreateWriteStream = fs.createWriteStream;
+  fs.createWriteStream = () => new Writable({
+    write(_chunk, _encoding, callback) { callback(new Error('EIO: deterministic in-flight writer failure')); },
+  });
+  try {
+    const run = startSuiteRun({
+      cwd: dir, args: ['test'], logPath: path.join(dir, 'run.log'), timeoutMs: 30000,
+      env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+    });
+    const result = await run.promise;
+    assert.equal(result.status, 'error');
+    assert.match(result.error, /EIO.*in-flight writer failure/);
+    assert.equal(isPidAlive(run.pid), false, 'the xcodebuild child must not survive a writer failure');
   } finally {
     fs.createWriteStream = originalCreateWriteStream;
     fs.rmSync(dir, { recursive: true, force: true });

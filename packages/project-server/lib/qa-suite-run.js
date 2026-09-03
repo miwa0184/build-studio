@@ -176,7 +176,7 @@ function parseAppleSummary(raw) {
   return Object.fromEntries([...keys, 'result'].map((key) => [key, value[key]]));
 }
 
-/** Collect immutable, content-bound evidence after xcodebuild and log flush. */
+/** Collect a content-digest snapshot after xcodebuild and the log flush. */
 function collectNativeArtifacts({
   logPath, resultBundlePath, derivedDataPath,
   fsImpl = fs, execFileSyncImpl = execFileSync,
