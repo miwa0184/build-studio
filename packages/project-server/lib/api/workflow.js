@@ -1916,12 +1916,7 @@ ${EFFICIENCY_INSTRUCTIONS}`,
       } catch (e) {
         zshErrDetail = e && (e.stderr ? e.stderr.toString().trim() : '') || (e && e.message) || '';
       }
-      const candidates = [
-        `/opt/homebrew/bin/${bin}`,
-        `/usr/local/bin/${bin}`,
-        `${process.env.HOME || ''}/.npm-global/bin/${bin}`,
-        `${process.env.HOME || ''}/.local/bin/${bin}`,
-      ];
+      const candidates = module.exports.binaryFallbackDirs().map(d => `${d}/${bin}`);
       const found = candidates.find(p => p && fs.existsSync(p));
       if (found) {
         console.warn(`[workflow] zsh pre-launch probe for ${bin} failed (${zshErrDetail || 'no detail'}), but binary present at ${found} — proceeding.`);
@@ -9935,8 +9930,27 @@ function markPrdDoneContent(original, prdId, today) {
   return { content, backlogRowChanged };
 }
 
+// The absolute directories probeBinary falls back to when the zsh check fails.
+// Read through `module.exports` at call time, and exported, for one reason: on
+// a host that has the probed CLI genuinely installed at one of these paths the
+// fallback rescues the launch, so an end-to-end "missing binary" test cannot
+// prove the check fails closed — it silently proves nothing instead. A test
+// substitutes an empty directory here to remove that rescue. Production never
+// reassigns it; the value below is the only one a real run ever sees, and
+// `binaryFallbackDirs defaults to production's real directories` pins that.
+function binaryFallbackDirs() {
+  const home = process.env.HOME || '';
+  return [
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    `${home}/.npm-global/bin`,
+    `${home}/.local/bin`,
+  ];
+}
+
 module.exports = {
   createWorkflowRouter,
+  binaryFallbackDirs,
   // Exported for unit tests (pure helpers — no I/O).
   iosDerivedDataGuidance,
   resolveReviewerCliAtStart,

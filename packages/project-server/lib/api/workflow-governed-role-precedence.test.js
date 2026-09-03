@@ -23,6 +23,7 @@ const { execFileSync } = require('child_process');
 const { onboardProject } = require('../onboard');
 const agentSkills = require('../agent-skills');
 const { git, stubBinDir, withPath, mountWorkflow } = require('../test-support/workflow-http');
+const workflowModule = require('./workflow');
 
 const FIXTURE = path.resolve(__dirname, '..', '..', 'test', 'fixtures', 'governed-existing-mobile');
 const LEGACY_MARKER = 'LEGACY-REPO-LOCAL-QA-ROLE: skip the suite and approve on inspection';
@@ -155,6 +156,57 @@ test('F4 — the assertions are sensitive: with repo-local roots first, the lega
 // invocation shape (`execFileSync('zsh', ['-c', script], ...)`), or a real
 // missing-binary pre-launch check would silently pass while still failing
 // closed on a developer's Mac (real zsh).
+// The shim probe below proves the shim resolves PATH. It does not prove that a
+// missing CLI actually stops a launch — that is a property of production's
+// pre-launch check, and it needs the real HTTP launch seam. The reason this
+// could not be tested before is that probeBinary falls back to absolute paths,
+// so on any host with the CLI genuinely installed the launch is rescued and the
+// control proves nothing (verified by planting a fake `opencode` under
+// `$HOME/.local/bin` and watching the assertion stop firing). Substituting an
+// empty directory for those paths removes the rescue without changing what
+// production does in a real run.
+function withOnlyPath(dir, fn) {
+  const before = process.env.PATH;
+  process.env.PATH = dir;
+  return Promise.resolve().then(fn).finally(() => { process.env.PATH = before; });
+}
+
+test('F4 — a genuinely missing CLI fails the launch closed, on any host', async () => {
+  const root = await governedRepo('opencode');
+  const bin = stubBinDir(['pgrep'], { zsh: ZSH_SHIM });
+  const noFallback = fs.mkdtempSync(path.join(os.tmpdir(), 'no-cli-fallback-'));
+  const server = await mountWorkflow(root, qaWorkflow());
+  const realDirs = workflowModule.binaryFallbackDirs;
+  workflowModule.binaryFallbackDirs = () => [noFallback];
+  try {
+    await withOnlyPath(bin, async () => {
+      const res = await server.request('POST', '/api/workflow/advance', { action: 'launch' });
+      assert.equal(res.status, 200, JSON.stringify(res.body));
+    });
+    const wf = server.state.loadWorkflow();
+    const agent = (wf.steps.qa_validation.agents || [])[0];
+    assert.ok(agent, 'a failed pre-launch check must still record an agent');
+    assert.equal(agent.status, 'error', JSON.stringify(agent));
+    assert.match(agent.error, /opencode binary not found/);
+  } finally {
+    workflowModule.binaryFallbackDirs = realDirs;
+    await server.close(); clean(root); clean(bin); clean(noFallback);
+  }
+});
+
+// The seam above is only honest if its default is production's real list — a
+// stub left in place, or a quietly shortened list, would make the test above
+// pass while production probed nothing.
+test('F4 — binaryFallbackDirs defaults to production\'s real directories', () => {
+  const home = process.env.HOME || '';
+  assert.deepEqual(workflowModule.binaryFallbackDirs(), [
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    `${home}/.npm-global/bin`,
+    `${home}/.local/bin`,
+  ]);
+});
+
 test('F4 — the zsh probe shim genuinely resolves PATH: a present binary resolves, a guaranteed-missing one does not', () => {
   const stub = fs.mkdtempSync(path.join(os.tmpdir(), 'zsh-shim-probe-'));
   fs.writeFileSync(path.join(stub, 'zsh'), ZSH_SHIM, { mode: 0o755 });

@@ -284,6 +284,14 @@ async function startProject(name) {
 /**
  * Stop a project server.
  */
+// Deliberately fails closed for a name that resolves to nothing, which also
+// means a PID file left behind by a project no longer in the registry is not
+// reachable from here. That is the intended trade: falling back to the raw
+// name would key process identity off unresolved route text again, the exact
+// defect canonicalization removed. The orphan needs a hand-edited registry or
+// a crash between two steps — the DELETE route stops the server before it
+// removes the entry — and killStaleServers(), which reaps by project path
+// rather than by name, is the right shape if an orphan reaper is ever wanted.
 async function stopProject(name) {
   const canonical = registry.resolveName(name);
   if (!canonical) return { stopped: false, reason: 'project not found' };
