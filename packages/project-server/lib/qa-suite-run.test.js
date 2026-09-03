@@ -44,11 +44,11 @@ test('only-testing scopes are appended one flag per target', () => {
 
 test('exact serial UI-only QA emits no unit target, clone, or worker flags', () => {
   const args = buildXcodebuildArgs({
-    project: 'SudokuDaily.xcodeproj', scheme: 'SudokuDaily', destination: 'platform=iOS Simulator,id=DEVICE',
-    parallelTesting: false, onlyTesting: ['SudokuDailyUITests'],
+    project: 'SampleApp.xcodeproj', scheme: 'SampleApp', destination: 'platform=iOS Simulator,id=DEVICE',
+    parallelTesting: false, onlyTesting: ['SampleAppUITests'],
   });
-  assert.ok(args.includes('-only-testing:SudokuDailyUITests'));
-  assert.ok(!args.some(arg => /SudokuDailyTests/.test(arg)));
+  assert.ok(args.includes('-only-testing:SampleAppUITests'));
+  assert.ok(!args.some(arg => /SampleAppTests/.test(arg)));
   assert.deepEqual(args.slice(args.indexOf('-parallel-testing-enabled'), args.indexOf('-parallel-testing-enabled') + 2), [
     '-parallel-testing-enabled', 'NO',
   ]);
@@ -172,12 +172,12 @@ const { bundleSession, xcodebuildLog } = require('./test-support/xcodebuild-log'
 
 /**
  * A completed single-bundle run the way xcodebuild prints it: `caseCount`
- * Objective-C-style cases inside the `SudokuDailyUITests.xctest` boundary,
+ * Objective-C-style cases inside the `SampleAppUITests.xctest` boundary,
  * whose own native summary claims `executed`.
  */
 function xcodeResult(executed, { failures = 0, banner = 'SUCCEEDED', caseCount = executed } = {}) {
   const log = xcodebuildLog([bundleSession({
-    bundle: 'SudokuDailyUITests', style: 'objc',
+    bundle: 'SampleAppUITests', style: 'objc',
     classes: [{ name: 'Cases', count: caseCount, failed: failures, summary: executed }],
     bundleSummary: executed, sessionSummary: executed,
   })], { banner });
@@ -273,7 +273,7 @@ test('expected count blocks failures, absent verdict, and contradictory banners'
 
 test('agent-facing suite section exposes immutable server authority before QA reports', () => {
   const run = xcodeResult(55);
-  run.command = 'xcodebuild test -only-testing:SudokuDailyUITests';
+  run.command = 'xcodebuild test -only-testing:SampleAppUITests';
   run.logPath = '/tmp/qa.log';
   run.durationMs = 1000;
   run.authority = evaluateSuiteAuthority(run, 56);
