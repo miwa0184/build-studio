@@ -5,11 +5,13 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { Writable } = require('stream');
 
 const {
   parallelArgs, buildXcodebuildArgs, displayCommand, parseTestCounts,
   failureExcerpt, resolveTimeoutMs, formatSuiteSection, startSuiteRun,
-  evaluateSuiteAuthority, DEFAULT_TIMEOUT_MINUTES,
+  evaluateSuiteAuthority, createNativeArtifactPaths, collectNativeArtifacts,
+  isPidAlive, DEFAULT_TIMEOUT_MINUTES,
 } = require('./qa-suite-run');
 
 // ── argv construction ────────────────────────────────────────────────────────
@@ -68,6 +70,56 @@ test('a missing required field fails loudly instead of building a broken command
 test('displayCommand quotes only what needs it', () => {
   const s = displayCommand(['test', '-destination', 'platform=iOS Simulator,name=iPhone 16']);
   assert.match(s, /^xcodebuild test -destination "platform=iOS Simulator,name=iPhone 16"$/);
+});
+
+test('native authority argv carries language and isolated artifact destinations as separate values', () => {
+  const args = buildXcodebuildArgs({
+    project: 'p.xcodeproj', scheme: 'S', destination: 'platform=iOS Simulator,id=D',
+    parallelTesting: false, onlyTesting: ['SUITests'], testLanguage: 'en',
+    derivedDataPath: '/tmp/run one/DerivedData', resultBundlePath: '/tmp/run one/result.xcresult',
+  });
+  assert.equal(args[args.indexOf('-testLanguage') + 1], 'en');
+  assert.equal(args[args.indexOf('-derivedDataPath') + 1], '/tmp/run one/DerivedData');
+  assert.equal(args[args.indexOf('-resultBundlePath') + 1], '/tmp/run one/result.xcresult');
+});
+
+test('native artifact paths are atomically unique per run attempt and remain below project tmp', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qa-native-paths-'));
+  try {
+    const first = createNativeArtifactPaths({ projectRoot: root, runId: 'run/one', round: 2 });
+    const second = createNativeArtifactPaths({ projectRoot: root, runId: 'run/one', round: 2 });
+    assert.notEqual(first.artifactDir, second.artifactDir);
+    assert.equal(path.dirname(first.artifactDir), path.join(root, 'tmp', 'qa-artifacts'));
+    assert.equal(first.derivedDataPath, path.join(first.artifactDir, 'DerivedData'));
+    assert.equal(first.resultBundlePath, path.join(first.artifactDir, 'result.xcresult'));
+    assert.ok(fs.statSync(first.artifactDir).isDirectory());
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('native artifact collector binds Apple summary, raw-log digest and deterministic bundle manifest', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qa-native-collect-'));
+  try {
+    const logPath = path.join(root, 'run.log');
+    const resultBundlePath = path.join(root, 'result.xcresult');
+    fs.mkdirSync(path.join(resultBundlePath, 'Data'), { recursive: true });
+    fs.writeFileSync(logPath, 'native output\n');
+    fs.writeFileSync(path.join(resultBundlePath, 'Info.plist'), 'info');
+    fs.writeFileSync(path.join(resultBundlePath, 'Data', 'one'), 'one');
+    const execCalls = [];
+    const artifacts = collectNativeArtifacts({
+      logPath, resultBundlePath, derivedDataPath: path.join(root, 'DerivedData'),
+      execFileSyncImpl(command, args) {
+        execCalls.push([command, args]);
+        return JSON.stringify({ totalTestCount: 56, passedTests: 56, failedTests: 0, skippedTests: 0, expectedFailures: 0, result: 'Passed' });
+      },
+    });
+    assert.equal(artifacts.status, 'complete');
+    assert.match(artifacts.log.sha256, /^[0-9a-f]{64}$/);
+    assert.equal(artifacts.resultBundle.fileCount, 2);
+    assert.match(artifacts.resultBundle.manifestDigest, /^[0-9a-f]{64}$/);
+    assert.deepEqual(artifacts.apple, { totalTestCount: 56, passedTests: 56, failedTests: 0, skippedTests: 0, expectedFailures: 0, result: 'Passed' });
+    assert.deepEqual(execCalls, [['xcrun', ['xcresulttool', 'get', 'test-results', 'summary', '--path', resultBundlePath, '--compact']]]);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 // ── log parsing ──────────────────────────────────────────────────────────────
@@ -138,6 +190,34 @@ test('expected_test_count authority passes only exact 56 + zero failures + TEST 
   assert.equal(verdict.blocked, false);
   assert.equal(verdict.actualTestCount, 56);
   assert.equal(verdict.code, 'QA_EXACT_COUNT_VERIFIED');
+});
+
+test('Apple result authority fails closed when the xcresult evidence is missing', () => {
+  const verdict = evaluateSuiteAuthority(xcodeResult(56), 56, {
+    appleResultAuthority: true,
+  });
+  assert.equal(verdict.blocked, true);
+  assert.equal(verdict.code, 'QA_APPLE_RESULT_MISSING');
+});
+
+test('Apple result authority passes matching dual evidence and blocks contradictions', () => {
+  const run = xcodeResult(56);
+  run.artifacts = {
+    status: 'complete',
+    log: { path: '/tmp/run.log', sha256: 'a'.repeat(64) },
+    resultBundle: { path: '/tmp/result.xcresult', fileCount: 2, totalBytes: 10, manifestDigest: 'b'.repeat(64) },
+    apple: { totalTestCount: 56, passedTests: 56, failedTests: 0, skippedTests: 0, expectedFailures: 0, result: 'Passed' },
+  };
+  const pass = evaluateSuiteAuthority(run, 56, { appleResultAuthority: true });
+  assert.equal(pass.blocked, false);
+  assert.equal(pass.code, 'QA_APPLE_RESULT_VERIFIED');
+  assert.equal(pass.appleTotalTestCount, 56);
+
+  run.artifacts.apple.totalTestCount = 55;
+  run.artifacts.apple.passedTests = 55;
+  const contradiction = evaluateSuiteAuthority(run, 56, { appleResultAuthority: true });
+  assert.equal(contradiction.blocked, true);
+  assert.equal(contradiction.code, 'QA_APPLE_STDOUT_CONTRADICTION');
 });
 
 for (const actual of [55, 57]) {
@@ -311,6 +391,56 @@ exit 65
   assert.equal(r.counts.succeeded, false);
   // The log is the artifact the agent is pointed at — it must actually exist.
   assert.match(fs.readFileSync(logPath, 'utf8'), /\*\* TEST FAILED \*\*/);
+});
+
+test('a log-writer finalization failure can never produce a completed QA run', async () => {
+  const dir = stubDir(`#!/bin/sh
+echo "Test Case '-[T testA]' passed (0.10 seconds)."
+echo "Executed 1 test, with 0 failures (0 unexpected) in 0.1 (0.2) seconds"
+echo "** TEST SUCCEEDED **"
+exit 0
+`);
+  const originalCreateWriteStream = fs.createWriteStream;
+  fs.createWriteStream = () => new Writable({
+    write(_chunk, _encoding, callback) { callback(); },
+    final(callback) { callback(new Error('ENOSPC: deterministic finalization failure')); },
+  });
+  try {
+    const run = startSuiteRun({
+      cwd: dir, args: ['test'], logPath: path.join(dir, 'run.log'), timeoutMs: 30000,
+      env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+    });
+    const result = await run.promise;
+    assert.equal(result.status, 'error');
+    assert.match(result.error, /ENOSPC.*finalization failure/);
+  } finally {
+    fs.createWriteStream = originalCreateWriteStream;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a log-writer failure while xcodebuild is running terminates the child and fails closed', async () => {
+  const dir = stubDir(`#!/bin/sh
+echo "first chunk"
+sleep 60
+`);
+  const originalCreateWriteStream = fs.createWriteStream;
+  fs.createWriteStream = () => new Writable({
+    write(_chunk, _encoding, callback) { callback(new Error('EIO: deterministic in-flight writer failure')); },
+  });
+  try {
+    const run = startSuiteRun({
+      cwd: dir, args: ['test'], logPath: path.join(dir, 'run.log'), timeoutMs: 30000,
+      env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+    });
+    const result = await run.promise;
+    assert.equal(result.status, 'error');
+    assert.match(result.error, /EIO.*in-flight writer failure/);
+    assert.equal(isPidAlive(run.pid), false, 'the xcodebuild child must not survive a writer failure');
+  } finally {
+    fs.createWriteStream = originalCreateWriteStream;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('a run past its timeout is killed and reported as a timeout', async () => {

@@ -457,11 +457,35 @@ function qaServerSuiteGateVerdict(step, config) {
       reason: 'persisted authority was evaluated with different simulator.parallel_testing configuration',
     };
   }
+  const appleResultAuthority = qaConfig.apple_result_authority === true;
+  if ((authority.appleResultAuthority === true) !== appleResultAuthority) {
+    return {
+      configured: true,
+      blocked: true,
+      code: 'QA_SERVER_SUITE_ARTIFACT_POLICY_STALE',
+      expectedTestCount: expected,
+      actualTestCount: authority.actualTestCount ?? null,
+      reason: 'persisted authority was evaluated with a different Apple result authority policy',
+    };
+  }
+  if (appleResultAuthority && authority.testLanguage !== qaConfig.test_language) {
+    return {
+      configured: true,
+      blocked: true,
+      code: 'QA_SERVER_SUITE_LANGUAGE_STALE',
+      expectedTestCount: expected,
+      actualTestCount: authority.actualTestCount ?? null,
+      reason: 'persisted authority was evaluated with a different qa_validation.test_language',
+    };
+  }
   // The persisted verdict must be reproducible from the raw run, under the
   // only_testing scope the run was spawned with (checked against the current
   // config just above), so every configured target re-binds to its own
   // native bundle evidence on every read.
-  const recomputed = qaSuite.evaluateSuiteAuthority(step.suiteRun, expected, { onlyTesting: authority.onlyTesting });
+  const recomputed = qaSuite.evaluateSuiteAuthority(step.suiteRun, expected, {
+    onlyTesting: authority.onlyTesting,
+    appleResultAuthority: authority.appleResultAuthority,
+  });
   if (recomputed.blocked !== authority.blocked
       || recomputed.code !== authority.code
       || recomputed.actualTestCount !== authority.actualTestCount) {
@@ -8184,6 +8208,8 @@ Report honestly. Note: this step does NOT block — even Approved: no advances t
       // one fact is the bug; there is now one.
       const expectedTestCount = config.qa_validation && config.qa_validation.expected_test_count;
       const exactAuthorityRequired = expectedTestCount !== undefined && expectedTestCount !== null;
+      const appleResultAuthority = !!(config.qa_validation && config.qa_validation.apple_result_authority === true);
+      const testLanguage = config.qa_validation && config.qa_validation.test_language;
       const configuredOnlyTesting = config.qa_validation && config.qa_validation.only_testing;
       let suiteTarget = null;
       let suiteUnavailableReason = null;
@@ -8355,6 +8381,15 @@ xcodebuild test \\\\
 You are QA. **Your job is to RUN the test suite and report test outcomes — nothing else.**\n\nPRD path: ${wf.prdPath}\nUse the /${skill} skill.${browserSkillRef2}${testFileList2}${e2eAlreadyRan ? e2eInstruction : ''}${qaRoundContext2}\n\n## DO NOT DO THESE THINGS\n\n- **Do NOT review companion-spec methodology or quality.** That is a team_review concern. Your feedback must contain test results (e.g. \`N passed\`, \`M failed\`), not spec critique. The approval gate REJECTS feedback that lacks recognizable test output.\n- **Do NOT skip running tests in favor of static review.** If you cannot run the test command (missing toolchain, broken environment), report the exact failure verbatim and stop — do not substitute a spec review for missing test output.\n- **Do NOT pass \`-resultBundlePath\` to xcodebuild.** It routes output to the .xcresult bundle instead of stdout, making the test counts invisible to you and to the approval gate. Default stdout reporting is what the gate parses.${gateBlocked.GATE_BLOCKED_INSTRUCTIONS}${devServerSection}${preTestSection}${iosTestingSection}${qaScopeSection}\n\n## VALIDATION STEPS — RUN IN ORDER\n\n**Do NOT read companion-spec files (docs/qa/*.md, docs/adrs/*.md, docs/ux/*.md, etc.) at all in this step.** They were already validated in the companion_specs step before execution started. Reading them is what causes you to drift into methodology review instead of running tests. If you find yourself opening a spec file, STOP and run tests instead.\n\n1. **Run the test suite FIRST.** Use the project's native test command:\n   - JS/TS projects: \`npx vitest run\` or \`npm test\`, plus Playwright (\`npx playwright test\`) for E2E\n   - iOS/Swift projects: \`xcodebuild test -scheme <SchemeName> -destination 'platform=iOS Simulator,name=iPhone 15'\` (or the equivalent for the project's scheme)\n   - Android/Kotlin projects: \`./gradlew test\` (unit) and \`./gradlew connectedAndroidTest\` (instrumented)\n2. **Report ALL test counts** in the format the approval gate expects: include at least one of \`**Tests passed:** N/M\`, \`N passed\`, \`N failed\`, or the native runner's "Executed N tests, with M failures" line. Without this, the gate will reject your feedback.\n3. ${e2eAlreadyRan ? 'E2E tests were already run during task execution (see results above) — skip unless re-run is needed' : 'Run any E2E/Playwright .spec.* files written for this PRD'}\n${visualSmokeSection2}\n\n## TEST DATA CLEANUP — MANDATORY\nAfter ALL tests finish (pass or fail), delete every test record created during this run.\n- Test users (emails matching \`test-*@example.com\` or \`preflight@example.com\`)\n- Test events, sessions, and any other DB rows created by tests\n- Use the project's delete endpoints or direct DB queries\n- Verify cleanup: query the DB and confirm test records are gone\n- Report cleanup status in your feedback (e.g., "Cleaned up 12 test users, 3 test events")\nDo NOT leave test data behind — it accumulates across runs and pollutes the database.\n\n## IMPORTANT\n- If tests fail, report the EXACT failure output — do not summarize\n- Distinguish between PRD test failures (blocking) and pre-existing failures (non-blocking)\n- Do NOT fix code — only report what fails${qaVisualSection2}`,
       }];
 
+      // The legacy prompt claimed result bundles suppress stdout. They do not:
+      // xcodebuild emits its ordinary stream while writing the bundle. The
+      // server owns these flags when artifact authority is enabled, so the QA
+      // agent must neither remove them nor create a substitute bundle.
+      qaAgent[0].instruction = qaAgent[0].instruction.replace(
+        '- **Do NOT pass `-resultBundlePath` to xcodebuild.** It routes output to the .xcresult bundle instead of stdout, making the test counts invisible to you and to the approval gate. Default stdout reporting is what the gate parses.',
+        '- **Do NOT add, remove or replace xcodebuild artifact flags.** When Apple result authority is configured, the server owns `-testLanguage`, `-derivedDataPath` and `-resultBundlePath`; read the persisted verdict instead of running a substitute suite.',
+      );
+
       // Launch the agent with the suite result appended. Shared by the direct
       // path and the hoisted one so there is exactly one place that starts it.
       const launchQaAgent = (suiteSection) => {
@@ -8371,9 +8406,13 @@ You are QA. **Your job is to RUN the test suite and report test outcomes — not
           // completed run does, so the gate reads it back as the unavailable
           // verdict it is rather than as a stale-scope one.
           unavailable.authority = {
-            ...qaSuite.evaluateSuiteAuthority(unavailable, expectedTestCount, { onlyTesting: qaScopeTargets || [] }),
+            ...qaSuite.evaluateSuiteAuthority(unavailable, expectedTestCount, {
+              onlyTesting: qaScopeTargets || [], appleResultAuthority,
+            }),
             onlyTesting: qaScopeTargets || [],
             parallelTesting: _pt,
+            appleResultAuthority,
+            ...(appleResultAuthority ? { testLanguage } : {}),
           };
           wf.steps.qa_validation = {
             ...(wf.steps.qa_validation || {}),
@@ -8414,7 +8453,23 @@ You are QA. **Your job is to RUN the test suite and report test outcomes — not
       // agent starts with the counts already in its prompt. An empty agent list
       // cannot auto-advance: the auto-advance gate also requires feedback, and
       // an agentless step has none.
-      const suiteLogPath = path.join(logsPath, `qa-suite-${wf.id}-r${wf.round || 1}.log`);
+      let nativeArtifactPaths = null;
+      if (appleResultAuthority) {
+        try {
+          nativeArtifactPaths = qaSuite.createNativeArtifactPaths({
+            projectRoot,
+            runId: wf.id,
+            round: wf.round || 1,
+          });
+        } catch (e) {
+          console.warn('[qa-suite] cannot reserve artifact directory:', e.message);
+          launchUnavailableQa(`native QA artifact directory could not be reserved (${e.message})`);
+          return res.json({ workflow: wf });
+        }
+      }
+      const suiteLogPath = nativeArtifactPaths
+        ? path.join(nativeArtifactPaths.artifactDir, 'xcodebuild.log')
+        : path.join(logsPath, `qa-suite-${wf.id}-r${wf.round || 1}.log`);
       let suiteArgs;
       try {
         suiteArgs = qaSuite.buildXcodebuildArgs({
@@ -8423,6 +8478,11 @@ You are QA. **Your job is to RUN the test suite and report test outcomes — not
           destination: config.simulator.destination,
           parallelTesting: _pt,
           onlyTesting: qaScopeTargets || [],
+          ...(appleResultAuthority ? {
+            testLanguage,
+            derivedDataPath: nativeArtifactPaths.derivedDataPath,
+            resultBundlePath: nativeArtifactPaths.resultBundlePath,
+          } : {}),
         });
       } catch (e) {
         console.warn('[qa-suite] cannot build command:', e.message);
@@ -8449,6 +8509,7 @@ You are QA. **Your job is to RUN the test suite and report test outcomes — not
           logPath: suiteLogPath,
           timeoutMs,
           env: { ...process.env, BUILD_STUDIO_SIMULATOR_DESTINATION: config.simulator.destination },
+          ...(nativeArtifactPaths ? { nativeArtifactPaths } : {}),
           onProgress: (p) => {
             const step = wf.steps.qa_validation;
             if (!step || !step.suiteRun) return;
@@ -8468,7 +8529,14 @@ You are QA. **Your job is to RUN the test suite and report test outcomes — not
         suiteRun: {
           status: 'running',
           command: suiteCommand,
+          args: [...suiteArgs],
           logPath: suiteLogPath,
+          ...(nativeArtifactPaths ? {
+            testLanguage,
+            artifactDir: nativeArtifactPaths.artifactDir,
+            derivedDataPath: nativeArtifactPaths.derivedDataPath,
+            resultBundlePath: nativeArtifactPaths.resultBundlePath,
+          } : {}),
           ...(exactAuthorityRequired ? { expectedTestCount } : {}),
           pid: handle.pid,
           // Whose child is this? The watchdog uses it to tell "running, and I
@@ -8487,9 +8555,13 @@ You are QA. **Your job is to RUN the test suite and report test outcomes — not
         const step = wf.steps.qa_validation;
         if (!step) return;
         const authority = {
-          ...qaSuite.evaluateSuiteAuthority(result, expectedTestCount, { onlyTesting: qaScopeTargets || [] }),
+          ...qaSuite.evaluateSuiteAuthority(result, expectedTestCount, {
+            onlyTesting: qaScopeTargets || [], appleResultAuthority,
+          }),
           onlyTesting: qaScopeTargets || [],
           parallelTesting: _pt,
+          appleResultAuthority,
+          ...(appleResultAuthority ? { testLanguage } : {}),
           command: suiteCommand,
         };
         step.suiteRun = {

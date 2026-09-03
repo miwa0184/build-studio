@@ -32,6 +32,24 @@ test('valid exact serial QA config survives load byte-for-value', () => {
   });
 });
 
+test('valid Apple result authority requires and preserves an explicit test language', () => {
+  withConfig([
+    'qa_validation:',
+    '  only_testing: [ExampleUITests]',
+    '  expected_test_count: 56',
+    '  apple_result_authority: true',
+    '  test_language: en',
+    'simulator:',
+    '  destination: platform=iOS Simulator,id=DEVICE',
+    '  parallel_testing: false',
+    '',
+  ].join('\n'), (root) => {
+    const cfg = loadConfig(root);
+    assert.equal(cfg.qa_validation.apple_result_authority, true);
+    assert.equal(cfg.qa_validation.test_language, 'en');
+  });
+});
+
 for (const [label, yaml] of [
   ['empty list', 'qa_validation:\n  only_testing: []\nsimulator:\n  destination: d\n'],
   ['blank target', 'qa_validation:\n  only_testing: [""]\nsimulator:\n  destination: d\n'],
@@ -44,6 +62,10 @@ for (const [label, yaml] of [
   ['missing simulator destination', 'qa_validation:\n  only_testing: [SudokuDailyUITests]\n  expected_test_count: 56\nsimulator:\n  parallel_testing: false\n'],
   ['parallel execution enabled', 'qa_validation:\n  only_testing: [SudokuDailyUITests]\n  expected_test_count: 56\nsimulator:\n  destination: d\n  parallel_testing: true\n'],
   ['server suite disabled', 'qa_validation:\n  only_testing: [SudokuDailyUITests]\n  expected_test_count: 56\n  server_runs_suite: false\nsimulator:\n  destination: d\n  parallel_testing: false\n'],
+  ['Apple authority without language', 'qa_validation:\n  only_testing: [ExampleUITests]\n  expected_test_count: 56\n  apple_result_authority: true\nsimulator:\n  destination: d\n  parallel_testing: false\n'],
+  ['unsafe test language', 'qa_validation:\n  only_testing: [ExampleUITests]\n  expected_test_count: 56\n  apple_result_authority: true\n  test_language: "en; touch /tmp/pwn"\nsimulator:\n  destination: d\n  parallel_testing: false\n'],
+  ['Apple authority without exact count', 'qa_validation:\n  only_testing: [ExampleUITests]\n  apple_result_authority: true\n  test_language: en\nsimulator:\n  destination: d\n  parallel_testing: false\n'],
+  ['test language without Apple authority', 'qa_validation:\n  test_language: en\n'],
 ]) {
   test(`invalid exact QA config fails closed: ${label}`, () => {
     withConfig(yaml, (root) => {

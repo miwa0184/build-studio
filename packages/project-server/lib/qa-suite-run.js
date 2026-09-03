@@ -37,8 +37,10 @@
  */
 
 const { spawn, execFileSync } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { finished } = require('stream');
 
 /** A suite that has not finished in this long is not going to. */
 const DEFAULT_TIMEOUT_MINUTES = 45;
@@ -68,7 +70,10 @@ function parallelArgs(parallelTesting) {
  * agent-facing version of this command was a shell string, which is where
  * `-resultBundlePath` and quoting mistakes used to creep in.
  */
-function buildXcodebuildArgs({ project, scheme, destination, parallelTesting, onlyTesting = [] }) {
+function buildXcodebuildArgs({
+  project, scheme, destination, parallelTesting, onlyTesting = [],
+  testLanguage, derivedDataPath, resultBundlePath,
+}) {
   if (!project) throw new Error('buildXcodebuildArgs: project is required');
   if (!scheme) throw new Error('buildXcodebuildArgs: scheme is required');
   if (!destination) throw new Error('buildXcodebuildArgs: destination is required');
@@ -88,6 +93,20 @@ function buildXcodebuildArgs({ project, scheme, destination, parallelTesting, on
   }
   const args = ['test', '-project', project, '-scheme', scheme, '-destination', destination];
   args.push(...parallelArgs(parallelTesting));
+  for (const [flag, value] of [
+    ['-testLanguage', testLanguage],
+    ['-derivedDataPath', derivedDataPath],
+    ['-resultBundlePath', resultBundlePath],
+  ]) {
+    if (value === undefined || value === null) continue;
+    if (typeof value !== 'string' || !value.trim()) {
+      throw new Error(`buildXcodebuildArgs: ${flag.slice(1)} must be a non-empty string`);
+    }
+    if (/<[^>]+>/.test(value)) {
+      throw new Error(`buildXcodebuildArgs: ${flag.slice(1)} still contains a placeholder (${value})`);
+    }
+    args.push(flag, value);
+  }
   for (const t of onlyTesting) {
     if (!t) continue;
     // A scope target is built from the scheme too (`<Scheme>Tests`), so it
@@ -98,6 +117,120 @@ function buildXcodebuildArgs({ project, scheme, destination, parallelTesting, on
     args.push(`-only-testing:${t}`);
   }
   return args;
+}
+
+/** A filesystem-safe label only; identity remains in the persisted run record. */
+function safeArtifactLabel(value) {
+  const cleaned = String(value || 'run').replace(/[^A-Za-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '');
+  return (cleaned || 'run').slice(0, 80);
+}
+
+/**
+ * Atomically reserve a unique artifact directory for one server-run attempt.
+ * mkdtemp is the stale-artifact guard: an existing result bundle can never be
+ * mistaken for output from this attempt, including a retry of the same round.
+ */
+function createNativeArtifactPaths({ projectRoot, runId, round, fsImpl = fs }) {
+  if (!projectRoot) throw new Error('createNativeArtifactPaths: projectRoot is required');
+  const parent = path.join(projectRoot, 'tmp', 'qa-artifacts');
+  fsImpl.mkdirSync(parent, { recursive: true });
+  const prefix = `${safeArtifactLabel(runId)}-r${Number.isInteger(round) && round > 0 ? round : 1}-`;
+  const artifactDir = fsImpl.mkdtempSync(path.join(parent, prefix));
+  return {
+    schemaVersion: 1,
+    artifactDir,
+    derivedDataPath: path.join(artifactDir, 'DerivedData'),
+    resultBundlePath: path.join(artifactDir, 'result.xcresult'),
+  };
+}
+
+function sha256(data) {
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+function regularFilesBelow(root, fsImpl = fs) {
+  const files = [];
+  const visit = (dir) => {
+    for (const name of fsImpl.readdirSync(dir).sort()) {
+      const absolute = path.join(dir, name);
+      const stat = fsImpl.lstatSync(absolute);
+      if (stat.isSymbolicLink()) throw new Error(`symbolic link is not valid xcresult evidence: ${path.relative(root, absolute)}`);
+      if (stat.isDirectory()) visit(absolute);
+      else if (stat.isFile()) files.push({ absolute, relative: path.relative(root, absolute), size: stat.size });
+    }
+  };
+  visit(root);
+  return files.sort((a, b) => a.relative < b.relative ? -1 : a.relative > b.relative ? 1 : 0);
+}
+
+function parseAppleSummary(raw) {
+  let value;
+  try { value = JSON.parse(String(raw)); } catch (e) { throw new Error(`xcresult summary is not JSON (${e.message})`); }
+  const keys = ['totalTestCount', 'passedTests', 'failedTests', 'skippedTests', 'expectedFailures'];
+  for (const key of keys) {
+    if (!Number.isInteger(value[key]) || value[key] < 0) {
+      throw new Error(`xcresult summary ${key} is not a non-negative integer`);
+    }
+  }
+  if (typeof value.result !== 'string' || !value.result) throw new Error('xcresult summary result is missing');
+  return Object.fromEntries([...keys, 'result'].map((key) => [key, value[key]]));
+}
+
+/** Collect a content-digest snapshot after xcodebuild and the log flush. */
+function collectNativeArtifacts({
+  logPath, resultBundlePath, derivedDataPath,
+  fsImpl = fs, execFileSyncImpl = execFileSync,
+}) {
+  const base = {
+    schemaVersion: 1,
+    derivedDataPath,
+    resultBundle: { path: resultBundlePath },
+    log: { path: logPath },
+  };
+  let logBytes;
+  try { logBytes = fsImpl.readFileSync(logPath); } catch (e) {
+    return { ...base, status: 'error', code: 'QA_LOG_ARTIFACT_UNAVAILABLE', error: e.message };
+  }
+  base.log.sha256 = sha256(logBytes);
+  let files;
+  try {
+    if (!fsImpl.statSync(resultBundlePath).isDirectory()) throw new Error('result bundle is not a directory');
+    files = regularFilesBelow(resultBundlePath, fsImpl);
+    if (files.length === 0) throw new Error('result bundle contains no regular files');
+  } catch (e) {
+    return { ...base, status: 'error', code: 'QA_APPLE_RESULT_MISSING', error: e.message };
+  }
+  const manifest = [];
+  let totalBytes = 0;
+  try {
+    for (const file of files) {
+      const bytes = fsImpl.readFileSync(file.absolute);
+      totalBytes += file.size;
+      manifest.push(`${sha256(bytes)} ${file.size} ${file.relative}\n`);
+    }
+  } catch (e) {
+    return { ...base, status: 'error', code: 'QA_RESULT_BUNDLE_DIGEST_FAILED', error: e.message };
+  }
+  base.resultBundle = {
+    path: resultBundlePath,
+    fileCount: files.length,
+    totalBytes,
+    manifestDigest: sha256(manifest.join('')),
+  };
+  let rawSummary;
+  try {
+    rawSummary = execFileSyncImpl('xcrun', [
+      'xcresulttool', 'get', 'test-results', 'summary',
+      '--path', resultBundlePath, '--compact',
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) {
+    return { ...base, status: 'error', code: 'QA_APPLE_RESULT_UNAVAILABLE', error: e.message };
+  }
+  try {
+    return { ...base, status: 'complete', apple: parseAppleSummary(rawSummary) };
+  } catch (e) {
+    return { ...base, status: 'error', code: 'QA_APPLE_RESULT_INVALID', error: e.message };
+  }
 }
 
 /** Human-readable form of the argv, for the prompt and for error messages. */
@@ -362,11 +495,11 @@ function bindBundleEvidence(counts, onlyTesting) {
  * was spawned with; every target in it must bind to its own bundle evidence
  * (see bindBundleEvidence). Without it, every bundle the run printed must.
  */
-function evaluateSuiteAuthority(run, expectedTestCount, { onlyTesting } = {}) {
+function evaluateSuiteAuthority(run, expectedTestCount, { onlyTesting, appleResultAuthority = false } = {}) {
   if (expectedTestCount === undefined || expectedTestCount === null) {
     return { configured: false, blocked: false, code: 'QA_EXACT_COUNT_NOT_CONFIGURED' };
   }
-  const base = { configured: true, expectedTestCount };
+  const base = { configured: true, expectedTestCount, appleResultAuthority: appleResultAuthority === true };
   const block = (code, reason, actualTestCount = null) => ({
     ...base, blocked: true, code, reason, actualTestCount,
   });
@@ -455,12 +588,56 @@ function evaluateSuiteAuthority(run, expectedTestCount, { onlyTesting } = {}) {
       actualTestCount,
     );
   }
-  return {
+  const stdoutPass = {
     ...base,
     blocked: false,
     code: 'QA_EXACT_COUNT_VERIFIED',
     reason: `expected ${expectedTestCount} executable tests and parsed exactly ${actualTestCount} across ${binding.bound.length} native test bundle${binding.bound.length === 1 ? '' : 's'} (${binding.bound.join(', ')}); zero failures; TEST SUCCEEDED; exit 0`,
     actualTestCount,
+  };
+  if (!appleResultAuthority) return stdoutPass;
+
+  const artifacts = run.artifacts;
+  if (!artifacts) {
+    return block('QA_APPLE_RESULT_MISSING', 'Apple result authority is configured but the run carries no xcresult evidence', actualTestCount);
+  }
+  if (artifacts.status !== 'complete') {
+    return block(artifacts.code || 'QA_APPLE_RESULT_UNAVAILABLE', artifacts.error || 'xcresult evidence collection did not complete', actualTestCount);
+  }
+  if (!artifacts.log || !/^[0-9a-f]{64}$/.test(artifacts.log.sha256 || '')
+      || !artifacts.resultBundle || !/^[0-9a-f]{64}$/.test(artifacts.resultBundle.manifestDigest || '')
+      || !Number.isInteger(artifacts.resultBundle.fileCount) || artifacts.resultBundle.fileCount <= 0) {
+    return block('QA_ARTIFACT_DIGEST_MISSING', 'native QA artifacts are not bound to both a raw-log digest and a non-empty xcresult manifest digest', actualTestCount);
+  }
+  const apple = artifacts.apple || {};
+  for (const key of ['totalTestCount', 'passedTests', 'failedTests', 'skippedTests', 'expectedFailures']) {
+    if (!Number.isInteger(apple[key]) || apple[key] < 0) {
+      return block('QA_APPLE_RESULT_INVALID', `Apple result field ${key} is missing or invalid`, actualTestCount);
+    }
+  }
+  if (apple.totalTestCount !== actualTestCount || apple.failedTests !== actualFailures) {
+    return block(
+      'QA_APPLE_STDOUT_CONTRADICTION',
+      `Apple reports ${apple.totalTestCount} total/${apple.failedTests} failed while native stdout binds ${actualTestCount} total/${actualFailures} failed`,
+      actualTestCount,
+    );
+  }
+  if (apple.result !== 'Passed' || apple.totalTestCount !== expectedTestCount
+      || apple.passedTests !== expectedTestCount || apple.failedTests !== 0
+      || apple.skippedTests !== 0 || apple.expectedFailures !== 0) {
+    return block(
+      'QA_APPLE_RESULT_NOT_CLEAN',
+      `Apple result is ${apple.result || 'missing'} with ${apple.totalTestCount} total, ${apple.passedTests} passed, ${apple.failedTests} failed, ${apple.skippedTests} skipped and ${apple.expectedFailures} expected failures`,
+      actualTestCount,
+    );
+  }
+  return {
+    ...stdoutPass,
+    code: 'QA_APPLE_RESULT_VERIFIED',
+    reason: `${stdoutPass.reason}; Apple xcresult independently reports ${apple.passedTests}/${apple.totalTestCount} passed with zero failed, skipped or expected failures`,
+    appleTotalTestCount: apple.totalTestCount,
+    logSha256: artifacts.log.sha256,
+    resultBundleManifestDigest: artifacts.resultBundle.manifestDigest,
   };
 }
 
@@ -597,7 +774,10 @@ function xcodebuildInFlight() {
  *
  * @returns {{pid:number|null, promise:Promise<object>, cancel:function}}
  */
-function startSuiteRun({ cwd, args, logPath, timeoutMs, env, onProgress }) {
+function startSuiteRun({
+  cwd, args, logPath, timeoutMs, env, onProgress,
+  nativeArtifactPaths, execFileSyncImpl,
+}) {
   fs.mkdirSync(path.dirname(logPath), { recursive: true });
   const out = fs.createWriteStream(logPath, { flags: 'w' });
   const startedAt = Date.now();
@@ -654,13 +834,48 @@ function startSuiteRun({ cwd, args, logPath, timeoutMs, env, onProgress }) {
   }, timeoutMs);
 
   const promise = new Promise((resolve, reject) => {
+    let settled = false;
+    let childResult = null;
+    let writerFinished = false;
+    let writerError = null;
+    const settleAfterWriter = () => {
+      if (settled || !childResult || !writerFinished) return;
+      settled = true;
+      if (writerError) {
+        childResult.status = 'error';
+        childResult.error = `QA log writer failed (${writerError.message || writerError})`;
+      } else if (nativeArtifactPaths) {
+        childResult.artifacts = collectNativeArtifacts({
+          logPath,
+          resultBundlePath: nativeArtifactPaths.resultBundlePath,
+          derivedDataPath: nativeArtifactPaths.derivedDataPath,
+          ...(execFileSyncImpl ? { execFileSyncImpl } : {}),
+        });
+      }
+      resolve(childResult);
+    };
+    // Observe the writer itself, not out.end(callback): Node invokes the end
+    // callback with an error before emitting `error` when finalization fails.
+    // `finished` handles both pre-close write failures and final-flush errors.
+    finished(out, (error) => {
+      writerError = error || null;
+      writerFinished = true;
+      if (writerError && child.exitCode === null && child.signalCode === null) {
+        killGroup(child.pid, 'SIGTERM');
+        if (!killTimer) killTimer = setTimeout(() => killGroup(child.pid, 'SIGKILL'), KILL_GRACE_MS);
+      }
+      settleAfterWriter();
+    });
     child.on('error', (e) => {
       if (progressTimer) clearInterval(progressTimer);
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (killTimer) clearTimeout(killTimer);
       if (child.pid) activeRuns.delete(child.pid);
       out.end();
-      reject(e);
+      if (!settled) {
+        settled = true;
+        reject(e);
+      }
     });
     child.on('close', (code, signal) => {
       if (progressTimer) clearInterval(progressTimer);
@@ -672,7 +887,7 @@ function startSuiteRun({ cwd, args, logPath, timeoutMs, env, onProgress }) {
         caseLineBuffers[source] = '';
       }
       const counts = finalizeTally(tally);
-      const result = {
+      childResult = {
         status: timedOut ? 'timeout' : 'completed',
         exitCode: code,
         signal: signal || null,
@@ -681,16 +896,10 @@ function startSuiteRun({ cwd, args, logPath, timeoutMs, env, onProgress }) {
         counts,
         failureExcerpt: failureExcerpt(tail),
       };
-      // The log is the artifact the agent is pointed at, and `** TEST FAILED **`
-      // is the LAST line xcodebuild writes. `out.end()` only ASKS the stream to
-      // flush; resolving in the same tick hands the reader a log that can be
-      // missing exactly the verdict it exists to carry — a red suite that reads
-      // green. Wait for the flush. Settle once even if the stream errors, so a
-      // write failure truncates the log rather than hanging the run forever.
-      let settled = false;
-      const settle = () => { if (!settled) { settled = true; resolve(result); } };
-      out.once('error', settle);
-      out.end(settle);
+      // The log is authoritative evidence. Ending requests the flush; actual
+      // settlement happens only from the `finished` observer above.
+      out.end();
+      settleAfterWriter();
     });
   });
 
@@ -760,6 +969,18 @@ function formatSuiteSection(run) {
     '',
   );
 
+  if (run.artifacts && run.artifacts.status === 'complete') {
+    const apple = run.artifacts.apple;
+    lines.push(
+      `Apple result bundle: \`${run.artifacts.resultBundle.path}\`.`,
+      `Apple summary: ${apple.passedTests}/${apple.totalTestCount} passed, ${apple.failedTests} failed, ${apple.skippedTests} skipped, ${apple.expectedFailures} expected failures; result ${apple.result}.`,
+      `Evidence digests: log \`${run.artifacts.log.sha256}\`; xcresult manifest \`${run.artifacts.resultBundle.manifestDigest}\`.`,
+      '',
+    );
+  } else if (run.artifacts && run.artifacts.status === 'error') {
+    lines.push(`Apple artifact collection failed closed: \`${run.artifacts.code}\` — ${run.artifacts.error || 'no detail recorded'}.`, '');
+  }
+
   const c = run.counts || {};
   if (run.status === 'timeout') {
     lines.push(
@@ -801,6 +1022,8 @@ module.exports = {
   parallelArgs,
   discoverProjectAndScheme,
   buildXcodebuildArgs,
+  createNativeArtifactPaths,
+  collectNativeArtifacts,
   displayCommand,
   parseTestCounts,
   evaluateSuiteAuthority,

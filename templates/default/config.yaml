@@ -238,12 +238,21 @@ worktree_env_files: []
 #     failures, one TEST SUCCEEDED banner, and exit 0. Missing/extra/ambiguous
 #     counts and unavailable/timeout runs fail closed; agent or operator
 #     overrides cannot bypass the verdict.
+#   apple_result_authority (default false): additionally requires a unique
+#     DerivedData directory and .xcresult bundle for every server attempt,
+#     validates Apple's supported xcresult summary, content-hashes the raw log
+#     and result bundle, and blocks any disagreement with stdout evidence.
+#     Requires only_testing, expected_test_count and test_language.
+#   test_language: locale passed as xcodebuild -testLanguage when Apple result
+#     authority is enabled (for example en or sv-SE).
 # qa_validation:
 #   strict: true
 #   honor_clean_approval: true
 #   only_testing:
 #     - ExampleUITests
 #   expected_test_count: 56
+#   apple_result_authority: true
+#   test_language: en
 #
 # hygiene — mechanical pre-merge grep gate for test scaffolding leaked into
 #   production source. Runs at merge_for_review. BLOCKS the merge only on actual
