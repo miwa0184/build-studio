@@ -3,7 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { walkMarkdownPaths, sha256File } = require('./detect/existing-docs');
+const { walkMarkdownPaths, sha256File, classifyAuthoritySource } = require('./detect/existing-docs');
 
 const GOVERNED_MODE = 'governed-existing';
 const AUTHORITY_MAP_PATH = 'docs/onboarding/authority-map.json';
@@ -125,7 +125,9 @@ function validateGovernedSignoff(projectRoot, map) {
   const initialDocs = new Set(map.entries.map(entry => safeRelative(entry.source)));
   const allowedNewDocs = new Set(['docs/onboarding/survey.md', AGENT_INSTRUCTION_PATH]);
   for (const rel of walkMarkdownPaths(projectRoot)) {
-    if (!initialDocs.has(rel) && !allowedNewDocs.has(rel)) {
+    if (initialDocs.has(rel) || allowedNewDocs.has(rel)) continue;
+    const classification = classifyAuthoritySource(rel, map.rules);
+    if (classification.class !== 'ignored/generated/runtime') {
       errors.push(`${rel}: new document is outside the governed adoption artifact allowlist`);
     }
   }

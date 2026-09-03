@@ -32,6 +32,17 @@ test('governed signoff accepts unchanged authority plus only the survey', async 
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test('governed signoff ignores Build Studio runtime Markdown created after inventory', async () => {
+  const { root, map } = await adoptedFixture();
+  try {
+    const runtimeLog = path.join(root, 'tmp', 'logs', 'workflow-onboarding-run.md');
+    fs.mkdirSync(path.dirname(runtimeLog), { recursive: true });
+    fs.writeFileSync(runtimeLog, '# Build Studio workflow runtime log\n');
+
+    assert.deepEqual(validateGovernedSignoff(root, map), { ok: true, errors: [] });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('governed signoff blocks changed founder product law', async () => {
   const { root, map } = await adoptedFixture();
   try {
