@@ -17,6 +17,8 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
+const { execFileSync } = require('child_process');
 
 const { onboardProject } = require('../onboard');
 const agentSkills = require('../agent-skills');
@@ -131,42 +133,42 @@ test('F4 — the assertions are sensitive: with repo-local roots first, the lega
   } finally { clean(root); }
 });
 
-// `withPath` prepends the stub dir ahead of the real PATH, which is right for
-// the positive-path tests above but makes a "missing CLI" negative control
-// unreliable: on a machine that already has `claude`/`codex` installed
-// system-wide (e.g. a developer's own Mac), the real PATH entry would still
-// resolve it, masking a shim that only pretends to check. Replacing PATH
-// outright, scoped to this one probe, is what actually isolates the check.
-function withOnlyPath(dir, fn) {
-  const before = process.env.PATH;
-  process.env.PATH = dir;
-  return Promise.resolve().then(fn).finally(() => { process.env.PATH = before; });
-}
+// A workflow-level "missing CLI" negative control (launch with an isolated
+// PATH, assert the launch fails closed) is not reliable: production's
+// probeBinary (workflow.js) falls back to absolute-path candidates
+// (`/opt/homebrew/bin/<bin>`, `/usr/local/bin/<bin>`, `$HOME/.npm-global/bin/<bin>`,
+// `$HOME/.local/bin/<bin>`) after a failed zsh check. A host that happens to
+// have the probed CLI installed at one of those paths — verified above by
+// dropping a fake `opencode` at `$HOME/.local/bin/opencode` and rerunning
+// this suite's prior version of this test — makes probeBinary log "binary
+// present ... — proceeding" and the launch proceed past the check entirely,
+// so the workflow-level control silently stops proving anything on such a
+// host. Probing the shim directly, with a PATH replaced outright by a
+// hand-built stub directory and a missing-binary name generated fresh per
+// run (so it can never collide with `claude`, `codex`, `opencode`, or
+// anything a host might actually have installed at those fallback paths),
+// removes that escape hatch: nothing here can be satisfied by a real,
+// pre-existing install anywhere on the machine.
+//
+// This also proves the shim is not a vacuous "always succeed" stand-in: it
+// has to genuinely run `command -v` against PATH, using production's exact
+// invocation shape (`execFileSync('zsh', ['-c', script], ...)`), or a real
+// missing-binary pre-launch check would silently pass while still failing
+// closed on a developer's Mac (real zsh).
+test('F4 — the zsh probe shim genuinely resolves PATH: a present binary resolves, a guaranteed-missing one does not', () => {
+  const stub = fs.mkdtempSync(path.join(os.tmpdir(), 'zsh-shim-probe-'));
+  fs.writeFileSync(path.join(stub, 'zsh'), ZSH_SHIM, { mode: 0o755 });
+  const present = 'present-bin';
+  fs.writeFileSync(path.join(stub, present), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  const missing = `missing-bin-${crypto.randomBytes(16).toString('hex')}`;
+  assert.ok(!fs.existsSync(path.join(stub, missing)), 'the missing name must be guaranteed absent from the isolated PATH');
 
-// The zsh shim above must not be a vacuous "always succeed" stand-in: it has
-// to genuinely run `command -v` against PATH, or a real missing-binary
-// pre-launch check would silently pass in CI while still failing closed on a
-// developer's Mac (real zsh). `claude`/`codex` are unsuitable for this probe:
-// production's absolute-path fallback (`/opt/homebrew/bin/<bin>`, etc.) can
-// find a real install on a developer's own machine regardless of what the
-// shim reports, which is correct production behaviour but would make this
-// negative control flaky rather than a genuine proof. `opencode` is the third
-// CLI the launcher supports and, unlike the other two, is not expected to be
-// installed on either a contributor's machine or CI — so omitting its stub
-// here isolates the assertion to the shim's own `command -v` behaviour.
-test('F4 — the zsh probe shim is not vacuous: a genuinely missing CLI still blocks launch', async () => {
-  const root = await governedRepo('opencode');
-  const bin = stubBinDir(['pgrep'], { zsh: ZSH_SHIM });
-  const server = await mountWorkflow(root, qaWorkflow());
+  // Mirrors probeBinary's exact script template (workflow.js) verbatim.
+  const probeScript = (bin) => `eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null; command -v ${bin} >/dev/null`;
+  const runProbe = (bin) => execFileSync('zsh', ['-c', probeScript(bin)], { env: { PATH: stub }, stdio: 'pipe' });
+
   try {
-    await withOnlyPath(bin, async () => {
-      const res = await server.request('POST', '/api/workflow/advance', { action: 'launch' });
-      assert.equal(res.status, 200, JSON.stringify(res.body));
-    });
-    const wf = server.state.loadWorkflow();
-    const agent = (wf.steps.qa_validation.agents || [])[0];
-    assert.ok(agent, 'a failed pre-launch check must still record an agent');
-    assert.equal(agent.status, 'error', JSON.stringify(agent));
-    assert.match(agent.error, /opencode binary not found/);
-  } finally { await server.close(); clean(root); clean(bin); }
+    assert.doesNotThrow(() => runProbe(present), 'a present executable on an isolated PATH must resolve via the shim');
+    assert.throws(() => runProbe(missing), 'a guaranteed-missing name must not resolve on an isolated PATH');
+  } finally { clean(stub); }
 });
