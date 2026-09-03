@@ -2,7 +2,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { resolveNameInProjects } = require('./registry');
+const { resolveNameInProjects } = require('@build-studio/shared/registry');
 
 // ─── resolveNameInProjects — canonicalizes a URL-derived project name against
 //     an in-memory `projects` map. Pure function, no disk I/O: keeps these
