@@ -405,6 +405,8 @@ const BUILD_STUDIO_GITIGNORE_PATTERNS = [
   '.build-studio/workflow-state.json',
   '.build-studio/run-state.json',
   '.build-studio/snapshots/',
+  '.build-studio/admission/',
+  '.build-studio/run-guard/',
   '.build-studio/*.bak*',
   '# Hub-written local overrides (Agents-tab CLI settings) + model catalog cache — machine-local',
   '.build-studio/local.json',

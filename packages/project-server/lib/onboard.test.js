@@ -477,6 +477,8 @@ test('onboardProject: appends build-studio runtime patterns to existing .gitigno
     assert.match(gi, /dist/, 'existing entries preserved');
     assert.match(gi, /\.build-studio\/workflow-state\.json/);
     assert.match(gi, /\.build-studio\/snapshots\//);
+    assert.match(gi, /\.build-studio\/admission\//);
+    assert.match(gi, /\.build-studio\/run-guard\//);
     assert.match(gi, /docs\/agent-status\.json/);
     assert.match(gi, /^prompt-\*\.txt$/m);
     assert.match(gi, /^start-\*\.sh$/m);
@@ -484,10 +486,35 @@ test('onboardProject: appends build-studio runtime patterns to existing .gitigno
   } finally { clean(root); }
 });
 
+test('onboardProject: admission and run-guard runtime writes leave a committed project clean', async () => {
+  const root = makeRepo({ ...EXAMPLE_APP_SHAPE, '.gitignore': 'node_modules\ndist\n' });
+  try {
+    await onboardProject(root, { name: 'desk', port: 3099 });
+    execFileSync('git', ['add', '-A'], { cwd: root, stdio: 'ignore' });
+    execFileSync(
+      'git',
+      ['-c', 'user.name=Build Studio Test', '-c', 'user.email=test@build-studio.invalid', 'commit', '-m', 'onboard fixture'],
+      { cwd: root, stdio: 'ignore' },
+    );
+
+    fs.mkdirSync(path.join(root, '.build-studio', 'admission'), { recursive: true });
+    fs.mkdirSync(path.join(root, '.build-studio', 'run-guard'), { recursive: true });
+    fs.writeFileSync(path.join(root, '.build-studio', 'admission', 'registry.json'), '{"revision":1}\n');
+    fs.writeFileSync(path.join(root, '.build-studio', 'run-guard', 'run-001.json'), '{"runId":"run-001"}\n');
+
+    const status = execFileSync(
+      'git',
+      ['status', '--porcelain', '--untracked-files=all'],
+      { cwd: root, encoding: 'utf8' },
+    );
+    assert.equal(status, '', `runtime state dirtied the managed project:\n${status}`);
+  } finally { clean(root); }
+});
+
 test('onboardProject: idempotent — re-adding patterns already present does not duplicate', async () => {
   const root = makeRepo({
     ...EXAMPLE_APP_SHAPE,
-    '.gitignore': 'node_modules\n.build-studio/workflow-state.json\n.build-studio/snapshots/\ndocs/agent-status.json\nprompt-*.txt\nstart-*.sh\nstart.sh\nTASK.md\ntmp/\n.build-studio/run-state.json\n.build-studio/*.bak*\n.build-studio/local.json\n.build-studio/*-cache.json\n.claude/scheduled_tasks.lock\n.claude/settings.local.json\ndocs/pr-evidence/**/*.png\ndocs/pr-evidence/**/*.jpg\ndocs/pr-evidence/**/*.jpeg\ndocs/pr-evidence/**/*.gif\ndocs/pr-evidence/**/*.pdf\n',
+    '.gitignore': 'node_modules\n.build-studio/workflow-state.json\n.build-studio/snapshots/\n.build-studio/admission/\n.build-studio/run-guard/\ndocs/agent-status.json\nprompt-*.txt\nstart-*.sh\nstart.sh\nTASK.md\ntmp/\n.build-studio/run-state.json\n.build-studio/*.bak*\n.build-studio/local.json\n.build-studio/*-cache.json\n.claude/scheduled_tasks.lock\n.claude/settings.local.json\ndocs/pr-evidence/**/*.png\ndocs/pr-evidence/**/*.jpg\ndocs/pr-evidence/**/*.jpeg\ndocs/pr-evidence/**/*.gif\ndocs/pr-evidence/**/*.pdf\n',
   });
   try {
     const result = await onboardProject(root, { name: 'desk', port: 3099 });

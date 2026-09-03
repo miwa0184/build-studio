@@ -21,6 +21,28 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-09-03 — Runtime state no longer dirties managed projects
+
+### Fixed
+
+- **Starting an admitted workflow no longer makes an onboarded project's Git
+  tree dirty.** Onboarding now ignores the machine-local admission registry and
+  per-run guard records under `.build-studio/admission/` and
+  `.build-studio/run-guard/`. Before, the first admitted run created untracked
+  JSON files and blocked clean-tree workflow checks in the project Build Studio
+  had just onboarded.
+
+### Upgrade steps
+
+**In Build Studio** — rebuild and re-inject the Electron app, then restart it.
+
+**In each already managed project** — add these two lines to `.gitignore`:
+
+```gitignore
+.build-studio/admission/
+.build-studio/run-guard/
+```
+
 ## 2026-09-03 — A project name with a space in it no longer 404s
 
 ### Fixed
