@@ -21,6 +21,23 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-09-03 — Governed signoff accepts its own runtime logs
+
+### Fixed
+
+- **A governed-existing adoption can now reach owner signoff after Build Studio
+  writes its workflow log.** The signoff validator still rejects every new
+  Markdown document outside the adoption artifact allowlist, but it now applies
+  the frozen authority map to post-inventory documents and ignores only paths
+  classified as `ignored/generated/runtime`. Before this fix, Build Studio's own
+  `tmp/logs/workflow-*.md` file made every real onboarding self-block at signoff.
+
+### Upgrade steps
+
+**In Build Studio** — rebuild and re-inject the Electron app, then restart it.
+
+**In each managed project** — nothing to do.
+
 ## 2026-09-03 — Runtime state no longer dirties managed projects
 
 ### Fixed
