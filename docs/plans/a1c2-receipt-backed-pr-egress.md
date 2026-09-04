@@ -20,6 +20,8 @@ server re-verifies all of the following:
 - the tracked worktree is clean;
 - a fresh fetch shows the remote default branch still equals the receipt base;
 - the exact candidate object exists locally.
+- the candidate branch is not the default branch, and any reused PR originates
+  from the admitted repository rather than a same-named branch in a fork.
 
 Any disagreement refuses before the first remote mutation.
 

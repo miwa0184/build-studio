@@ -15,7 +15,7 @@ const STATUS_CONTEXT = 'factory-run-receipt';
 const DELIVERY_DIR = path.join('run-receipt', 'egress');
 const SHA_RE = /^[0-9a-f]{40}$/;
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
-const BRANCH_RE = /^(?!.*\.\.)(?!\/)(?!.*\/$)[A-Za-z0-9._/-]+$/;
+const BRANCH_RE = /^(?!-)(?!.*\.\.)(?!\/)(?!.*\/$)[A-Za-z0-9._/-]+$/;
 const JOURNAL_STAGES = new Set(['prepared', 'branch_pushed', 'pr_open', 'delivered']);
 const JOURNAL_STAGE_RANK = new Map([...JOURNAL_STAGES].map((stage, index) => [stage, index]));
 const COMMAND_TIMEOUT_MS = 30_000;
@@ -82,7 +82,7 @@ function createGithubAdapter(run = (args) => execFileSync('gh', args, {
     },
     findOpenPr({ repo, head }) {
       const rows = json(run(['pr', 'list', '--repo', repo, '--state', 'open', '--head', head,
-        '--json', 'number,url,state,headRefName,headRefOid,baseRefName', '--limit', '2'])) || [];
+        '--json', 'number,url,state,headRefName,headRefOid,headRepository,baseRefName', '--limit', '2'])) || [];
       if (rows.length > 1) refuse(CODES.PR_CONFLICT, `more than one open PR targets branch ${head}`);
       return rows[0] || null;
     },
@@ -92,7 +92,7 @@ function createGithubAdapter(run = (args) => execFileSync('gh', args, {
     },
     readPr({ repo, number }) {
       return json(run(['pr', 'view', String(number), '--repo', repo,
-        '--json', 'number,url,state,headRefName,headRefOid,baseRefName']));
+        '--json', 'number,url,state,headRefName,headRefOid,headRepository,baseRefName']));
     },
     readStatuses({ repo, sha }) {
       // GitHub returns newest-first. One page is sufficient because this
@@ -112,6 +112,8 @@ function validatePr(pr, receipt) {
     || pr.state !== 'OPEN'
     || pr.headRefName !== receipt.candidate.branch
     || pr.headRefOid !== receipt.candidate.sha
+    || !pr.headRepository
+    || String(pr.headRepository.nameWithOwner).toLowerCase() !== receipt.identity.admittedRepo.toLowerCase()
     || pr.baseRefName !== receipt.candidate.base.branch) {
     refuse(CODES.PR_CONFLICT, 'the open PR does not match the receipt-bound branch, head, and base', {
       prNumber: pr && pr.number || null,
@@ -188,8 +190,13 @@ function createReceiptEgress({ config, receiptAuthority, git, github, now = () =
     if (!receipt || expectedSha !== receipt.candidate.sha || receipt.candidate.heldSha !== expectedSha) {
       refuse(CODES.CANDIDATE_DRIFT, 'expectedSha does not match the immutable receipt candidate');
     }
-    if (!SHA_RE.test(expectedSha) || !BRANCH_RE.test(receipt.candidate.branch)) {
+    if (!SHA_RE.test(expectedSha)
+      || !BRANCH_RE.test(receipt.candidate.branch)
+      || !BRANCH_RE.test(receipt.candidate.base.branch)) {
       refuse(CODES.CANDIDATE_DRIFT, 'receipt candidate identity is invalid');
+    }
+    if (receipt.candidate.branch.toLowerCase() === receipt.candidate.base.branch.toLowerCase()) {
+      refuse(CODES.CANDIDATE_DRIFT, 'receipt candidate branch must not be the default branch');
     }
     const repo = config.deployment && config.deployment.repo;
     if (!REPO_RE.test(repo || '')) refuse(CODES.CONFIG, 'deployment.repo must be an owner/repo value');

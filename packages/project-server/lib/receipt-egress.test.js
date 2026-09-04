@@ -49,7 +49,7 @@ function fixture(t, overrides = {}) {
     findOpenPr: () => remote.pr,
     createPr: ({ head, base }) => {
       calls.push(['createPr', head, base]);
-      remote.pr = { number: 17, url: 'https://github.com/owner/project/pull/17', state: 'OPEN', headRefName: head, headRefOid: SHA, baseRefName: base };
+      remote.pr = { number: 17, url: 'https://github.com/owner/project/pull/17', state: 'OPEN', headRefName: head, headRefOid: SHA, headRepository: { nameWithOwner: 'owner/project' }, baseRefName: base };
       return remote.pr;
     },
     readPr: () => remote.pr,
@@ -82,6 +82,13 @@ test('A1c.2 refuses before remote mutation when receipt candidate, local branch,
   };
   assert.throws(() => service(baseDrift).deliver({ expectedSha: SHA }), (error) => error.code === 'EGRESS_BASE_DRIFT');
   assert.equal(baseDrift.calls.some((call) => call[1] === 'push' || call[0] === 'createPr' || call[0] === 'status'), false);
+});
+
+test('A1c.2 categorically refuses to publish a receipt candidate onto the default branch', (t) => {
+  const fx = fixture(t);
+  fx.receipt.candidate.branch = 'main';
+  assert.throws(() => service(fx).deliver({ expectedSha: SHA }), (error) => error.code === 'EGRESS_CANDIDATE_DRIFT');
+  assert.equal(fx.calls.some((call) => call[1] === 'push' || call[0] === 'createPr' || call[0] === 'status'), false);
 });
 
 test('A1c.2 pushes the exact object, creates one exact PR, then publishes SUCCESS on that SHA', (t) => {
@@ -129,7 +136,7 @@ test('A1c.2 refuses a remote branch or PR that points at any other SHA', (t) => 
 
   const prDrift = fixture(t);
   prDrift.remote.branchSha = SHA;
-  prDrift.remote.pr = { number: 9, url: 'https://github.com/owner/project/pull/9', state: 'OPEN', headRefName: 'factory/candidate-001', headRefOid: 'e'.repeat(40), baseRefName: 'main' };
+  prDrift.remote.pr = { number: 9, url: 'https://github.com/owner/project/pull/9', state: 'OPEN', headRefName: 'factory/candidate-001', headRefOid: 'e'.repeat(40), headRepository: { nameWithOwner: 'owner/project' }, baseRefName: 'main' };
   assert.throws(() => service(prDrift).deliver({ expectedSha: SHA }), (error) => error.code === 'EGRESS_PR_CONFLICT');
   assert.equal(prDrift.calls.some((call) => call[0] === 'status'), false);
 });
@@ -144,7 +151,7 @@ test('A1c.2 never replaces a journaled PR and never overwrites a conflicting rec
 
   const statusConflict = fixture(t);
   statusConflict.remote.branchSha = SHA;
-  statusConflict.remote.pr = { number: 18, url: 'https://github.com/owner/project/pull/18', state: 'OPEN', headRefName: 'factory/candidate-001', headRefOid: SHA, baseRefName: 'main' };
+  statusConflict.remote.pr = { number: 18, url: 'https://github.com/owner/project/pull/18', state: 'OPEN', headRefName: 'factory/candidate-001', headRefOid: SHA, headRepository: { nameWithOwner: 'owner/project' }, baseRefName: 'main' };
   statusConflict.remote.statuses = [{ context: 'factory-run-receipt', state: 'failure', description: 'revoked', target_url: statusConflict.remote.pr.url }];
   assert.throws(() => service(statusConflict).deliver({ expectedSha: SHA }), (error) => error.code === 'EGRESS_STATUS_CONFLICT');
   assert.equal(statusConflict.calls.some((call) => call[0] === 'status'), false);
@@ -179,7 +186,7 @@ test('A1c.2 GitHub adapter uses only repo reads, PR create/read, and exact commi
     if (args[0] === 'repo') return JSON.stringify({ nameWithOwner: 'owner/project', defaultBranchRef: { name: 'main' }, viewerPermission: 'WRITE' });
     if (args[0] === 'pr' && args[1] === 'list') return '[]';
     if (args[0] === 'pr' && args[1] === 'create') return 'https://github.com/owner/project/pull/17';
-    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ number: 17, url: 'https://github.com/owner/project/pull/17', state: 'OPEN', headRefName: 'factory/candidate-001', headRefOid: SHA, baseRefName: 'main' });
+    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ number: 17, url: 'https://github.com/owner/project/pull/17', state: 'OPEN', headRefName: 'factory/candidate-001', headRefOid: SHA, headRepository: { nameWithOwner: 'owner/project' }, baseRefName: 'main' });
     if (args[0] === 'api' && args.includes('--method') && args.includes('GET')) return '[]';
     if (args[0] === 'api') return '{}';
     throw new Error(`unexpected gh call: ${args.join(' ')}`);
