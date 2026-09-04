@@ -24,6 +24,8 @@ server re-verifies all of the following:
   from the admitted repository rather than a same-named branch in a fork.
 
 Any disagreement refuses before the first remote mutation.
+Typed delivery refusals identify the installed capability as
+`receipt_pr_delivery`; they must not reuse the earlier `not_installed` marker.
 
 ## Transaction and recovery
 

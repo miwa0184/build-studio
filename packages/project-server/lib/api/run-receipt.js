@@ -34,7 +34,8 @@ function refusal(res, error) {
   if (!(error instanceof RunReceiptError) && !(error instanceof ReceiptEgressError)) throw error;
   const { message, code, stack, name, ...details } = error;
   delete details.cause;
-  return res.status(statusFor(code)).json({ code, error: message, egress: 'not_installed', ...details });
+  const egress = error instanceof ReceiptEgressError ? 'receipt_pr_delivery' : 'not_installed';
+  return res.status(statusFor(code)).json({ code, error: message, egress, ...details });
 }
 
 function createRunReceiptRouter(config, state, { qaGate = qaServerSuiteGateVerdict, authority, egress } = {}) {

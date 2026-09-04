@@ -30,6 +30,7 @@ test('A1c.2 route accepts exact SHA only and returns the authority result', asyn
   const bad = await request(server.address().port, { expectedSha: SHA, repo: 'other/repo' });
   assert.equal(bad.status, 400);
   assert.equal(bad.body.code, 'EGRESS_BAD_REQUEST');
+  assert.equal(bad.body.egress, 'receipt_pr_delivery');
   const good = await request(server.address().port, { expectedSha: SHA });
   assert.equal(good.status, 200);
   assert.deepEqual(good.body, { outcome: 'delivered', candidateSha: SHA });
