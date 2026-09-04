@@ -650,21 +650,56 @@ function createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast, deps = 
    */
   function parkAtEgressBoundary(wf) {
     const prior = (wf.steps && wf.steps.merge_to_main) || {};
+    const durableHold = state.authoritativeEgressHold(wf.id);
+    // A parked boundary is write-once even when it predates candidateSha.
+    // Missing historical identity must remain missing and fail closed; it can
+    // never be reconstructed from a later, unreviewed branch tip.
+    const priorIsParkedHold = prior.status === 'blocked'
+      && prior.code === LOCAL_MERGE_REMOVED;
+    const candidateBranch = durableHold
+      ? durableHold.candidateBranch
+      : priorIsParkedHold
+      ? (prior.candidateBranch || null)
+      : (wf.branch || wf.reviewBranch || null);
+    const defaultBranch = durableHold
+      ? durableHold.defaultBranch
+      : priorIsParkedHold
+      ? (prior.defaultBranch || null)
+      : (wf.defaultBranch || 'main');
+    let candidateSha = durableHold
+      ? durableHold.candidateSha
+      : priorIsParkedHold
+      && typeof prior.candidateSha === 'string'
+      && /^[0-9a-f]{40}$/.test(prior.candidateSha)
+      ? prior.candidateSha
+      : null;
+    if (!durableHold && !priorIsParkedHold && candidateBranch && /^(?!.*\.\.)[A-Za-z0-9._/-]+$/.test(candidateBranch)) {
+      try {
+        candidateSha = require('child_process').execFileSync('git', ['rev-parse', '--verify', '--quiet', `refs/heads/${candidateBranch}^{commit}`], {
+          cwd: projectRoot, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'],
+        }).trim() || null;
+      } catch (_) { candidateSha = null; }
+    }
     wf.steps.merge_to_main = {
       ...prior,
       status: 'blocked',
       code: LOCAL_MERGE_REMOVED,
       egress: 'not_installed',
       error: egressRefusal(LOCAL_MERGE_REMOVED).error,
-      candidateBranch: wf.branch || wf.reviewBranch || null,
-      defaultBranch: wf.defaultBranch || 'main',
+      candidateBranch,
+      candidateSha,
+      defaultBranch,
     };
     wf.currentStep = 'merge_to_main';
     // A persisted autonomous policy must not retry a boundary that cannot
     // advance until A1c exists.
     wf.autoAdvance = false;
     wf.autoAdvanceSkipDemoReview = false;
-    state.saveWorkflow(wf);
+    if (!durableHold && !priorIsParkedHold && candidateSha && candidateBranch && defaultBranch) {
+      state.recordEgressHold(wf, { candidateBranch, candidateSha, defaultBranch });
+    } else {
+      state.saveWorkflow(wf);
+    }
     return egressRefusal(LOCAL_MERGE_REMOVED, { workflow: wf });
   }
 
@@ -2327,6 +2362,9 @@ ${simEnvLine}claude --resume ${cliSessionId}${dangerFlag}${modelFlag}${effortFla
       // 'default'. Recorded so the UI can explain a model that isn't the one
       // picked in the UI, rather than leaving it to be read as a bug.
       agent.modelSource = modelSource;
+      // The effort token that actually reached the command line (null when
+      // none did), so a later receipt can record what ran, not what was set.
+      agent.effort = flags.effort || null;
       agent.startedAt = new Date().toISOString();
       agent.agentCwd = agentCwd;
       agent.injectedLearnings = learningsResult.injected;
