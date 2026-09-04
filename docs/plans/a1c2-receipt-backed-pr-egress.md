@@ -25,7 +25,14 @@ server re-verifies all of the following:
 - the candidate branch is not the default branch, and any reused PR originates
   from the admitted repository rather than a same-named branch in a fork.
 
-Any disagreement refuses before the first remote mutation.
+Any disagreement refuses before the first remote mutation. The active-run
+re-verification is not a one-time preflight: it is repeated immediately
+before each external mutation (branch push, PR creation, status publication),
+after the last remote read that precedes it, so a run that stops during that
+read leaves no external effect behind. Finalization itself never truncates a
+projected configuration value; an over-long value refuses with
+`RECEIPT_PROJECTION_UNSAFE` rather than sharing a `configDigest` with
+another value that has the same prefix.
 Typed delivery refusals identify the installed capability as
 `receipt_pr_delivery`; they must not reuse the earlier `not_installed` marker.
 
@@ -99,7 +106,10 @@ Node API used here does not expose, and is outside this factory's threat model.
 ## Verification contract
 
 Permanent tests cover pre-mutation drift refusal, mismatched push URLs, a real
-two-stage Git URL rewrite, active-run and local-tip rebinding, a real
+two-stage Git URL rewrite, active-run and local-tip rebinding, authority
+drift inside the final read before each of the push, PR creation and status
+publication with proof that the effect is absent and that a live retry
+completes once, a config-projection prefix collision that must refuse, a real
 bare-repository create race, base-SHA drift, closed-PR recovery, append-only
 journal tampering before status publication, direct/dangling/intermediate
 authority symlinks plus symlinked `.locks` and receipt-file leaves against the

@@ -381,3 +381,76 @@ test('repair — the create-only push cannot fast-forward a branch created in th
   ]));
   assert.equal(run(root, [`--git-dir=${bare}`, 'rev-parse', 'refs/heads/factory/candidate']), ancestor);
 });
+
+// Frozen-head review, HIGH A: authority verification happened at stage entry,
+// so a run that went inactive during the last read before a mutation could
+// still push, create the PR, or publish the status. Each case flips the
+// authority off inside that final read and proves the mutation never happens,
+// then proves a later retry with a live authority completes exactly once.
+
+test('repair — authority drift during the final ls-remote refuses before the branch push', (t) => {
+  const fx = fixture(t);
+  const baseGit = fx.git;
+  fx.git = (args) => {
+    if (args[0] === 'ls-remote') fx.remote.active = false;
+    return baseGit(args);
+  };
+  assert.throws(() => service(fx).deliver({ expectedSha: SHA }), (error) => error.code === 'RECEIPT_NO_ACTIVE_RUN');
+  assert.equal(fx.calls.some((call) => call[0] === 'git' && call[1] === 'push'), false, 'push must not run after the authority went inactive');
+  assert.equal(fx.remote.branchSha, null);
+  assert.equal(mutated(fx), false);
+
+  fx.git = baseGit;
+  fx.remote.active = true;
+  const result = service(fx).deliver({ expectedSha: SHA });
+  assert.equal(result.outcome, 'delivered');
+  assert.equal(fx.calls.filter((call) => call[0] === 'git' && call[1] === 'push').length, 1);
+  assert.equal(fx.calls.filter((call) => call[0] === 'createPr').length, 1);
+  assert.equal(fx.calls.filter((call) => call[0] === 'status').length, 1);
+});
+
+test('repair — authority drift during findPr refuses before PR creation', (t) => {
+  const fx = fixture(t);
+  fx.remote.branchSha = SHA;
+  const findPr = fx.github.findPr;
+  fx.github.findPr = (args) => {
+    fx.remote.active = false;
+    return findPr(args);
+  };
+  assert.throws(() => service(fx).deliver({ expectedSha: SHA }), (error) => error.code === 'RECEIPT_NO_ACTIVE_RUN');
+  assert.equal(fx.calls.some((call) => call[0] === 'createPr'), false, 'createPr must not run after the authority went inactive');
+  assert.equal(fx.remote.pr, null);
+  assert.equal(mutated(fx), false);
+
+  fx.github.findPr = findPr;
+  fx.remote.active = true;
+  const result = service(fx).deliver({ expectedSha: SHA });
+  assert.equal(result.outcome, 'delivered');
+  assert.equal(fx.calls.filter((call) => call[0] === 'createPr').length, 1);
+  assert.equal(fx.calls.filter((call) => call[0] === 'status').length, 1);
+});
+
+test('repair — authority drift during the first status read refuses before status publication', (t) => {
+  const fx = fixture(t);
+  fx.remote.branchSha = SHA;
+  fx.remote.pr = fx.pr();
+  const readStatuses = fx.github.readStatuses;
+  let reads = 0;
+  fx.github.readStatuses = (args) => {
+    reads += 1;
+    if (reads === 1) fx.remote.active = false;
+    return readStatuses(args);
+  };
+  assert.throws(() => service(fx).deliver({ expectedSha: SHA }), (error) => error.code === 'RECEIPT_NO_ACTIVE_RUN');
+  assert.equal(fx.calls.some((call) => call[0] === 'status'), false, 'publishStatus must not run after the authority went inactive');
+  assert.deepEqual(fx.remote.statuses, []);
+  assert.equal(mutated(fx), false);
+
+  fx.github.readStatuses = readStatuses;
+  fx.remote.active = true;
+  const result = service(fx).deliver({ expectedSha: SHA });
+  assert.equal(result.outcome, 'delivered');
+  assert.equal(result.journal.statusNonce, '0123456789abcdef0123456789abcdef');
+  assert.equal(fx.calls.filter((call) => call[0] === 'status').length, 1);
+  assert.equal(fx.calls.filter((call) => call[0] === 'createPr').length, 0);
+});

@@ -329,6 +329,13 @@ function createReceiptEgress({
     }
   }
 
+  /**
+   * Re-prove that the admitted run is still active and still finalizes the
+   * same immutable receipt. Called at stage entry and again immediately before
+   * each external mutation (push, PR creation, status publication), after the
+   * last read that precedes it, so a run that stops during that read leaves
+   * no external effect behind.
+   */
   function verifyAuthority(receipt) {
     if (typeof receiptAuthority.verifyForDelivery !== 'function') {
       refuse(CODES.CANDIDATE_DRIFT, 'receipt authority cannot re-verify active delivery evidence');
@@ -408,6 +415,7 @@ function createReceiptEgress({
       if (!remoteSha) {
         journal = assertJournalCurrent(intent, journal);
         assertNoSecondUrlRewrite(pushUrl);
+        verifyAuthority(receipt);
         runGit(['push', '--porcelain', `--force-with-lease=refs/heads/${intent.candidateBranch}:`,
           pushUrl, `${intent.candidateSha}:refs/heads/${intent.candidateBranch}`]);
       }
@@ -421,6 +429,7 @@ function createReceiptEgress({
       if (pr) validatePr(pr, receipt);
       if (!pr) {
         journal = assertJournalCurrent(intent, journal);
+        verifyAuthority(receipt);
         pr = gh.createPr({
           repo, head: intent.candidateBranch, base: intent.baseBranch,
           title: `Factory candidate: ${intent.candidateBranch}`,
@@ -454,6 +463,7 @@ function createReceiptEgress({
           refuse(CODES.STATUS_CONFLICT, 'delivered journal exists but its exact receipt status is missing');
         }
         journal = assertJournalCurrent(intent, journal);
+        verifyAuthority(receipt);
         gh.publishStatus({ repo, sha: intent.candidateSha, state: 'success', description, targetUrl: pr.url });
       }
       const confirmed = gh.readStatuses({ repo, sha: intent.candidateSha })

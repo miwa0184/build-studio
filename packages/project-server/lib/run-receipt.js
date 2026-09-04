@@ -116,6 +116,16 @@ function str(value) {
   return typeof value === 'string' && value.length > 0 ? value.slice(0, MAX_STRING) : null;
 }
 
+/**
+ * Effective string for the configuration projection, or null. Never
+ * truncates: an over-long value must reach assertProjectionSafe intact so it
+ * refuses (RECEIPT_PROJECTION_UNSAFE) instead of collapsing into the same
+ * projection and configDigest as another value that shares its prefix.
+ */
+function projected(value) {
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
 function int(value) {
   return Number.isInteger(value) ? value : null;
 }
@@ -316,11 +326,11 @@ function assertProjectionSafe(value, trail) {
 function executedAgent(agent, task) {
   return {
     task,
-    role: str(agent.role),
-    cli: str(agent.cli),
-    model: str(agent.model),
-    modelSource: str(agent.modelSource),
-    effort: str(agent.effort),
+    role: projected(agent.role),
+    cli: projected(agent.cli),
+    model: projected(agent.model),
+    modelSource: projected(agent.modelSource),
+    effort: projected(agent.effort),
   };
 }
 
@@ -352,7 +362,7 @@ function projectGroups(groups) {
   if (!isObject(groups)) return out;
   for (const key of Object.keys(groups).sort()) {
     const slot = isObject(groups[key]) ? groups[key] : {};
-    out[key] = { cli: str(slot.cli), model: str(slot.model), effort: str(slot.effort) };
+    out[key] = { cli: projected(slot.cli), model: projected(slot.model), effort: projected(slot.effort) };
   }
   return out;
 }
@@ -371,32 +381,32 @@ function buildConfigProjection(config, wf) {
   const parallel = simulator.parallel_testing;
   const projection = {
     schemaVersion: CONFIG_PROJECTION_SCHEMA_VERSION,
-    preset: str(config.preset),
-    builderStrategy: str(config.builder_strategy) || 'role',
+    preset: projected(config.preset),
+    builderStrategy: projected(config.builder_strategy) || 'role',
     cli: {
-      default: str(cli.default) || 'claude',
-      defaultModel: str(cli.default_model),
-      defaultEffort: str(cli.default_effort),
+      default: projected(cli.default) || 'claude',
+      defaultModel: projected(cli.default_model),
+      defaultEffort: projected(cli.default_effort),
       useGlobal: cli.use_global === true,
       groups: projectGroups(cli.groups),
     },
     review: {
-      reviewMode: str(config.review_mode),
+      reviewMode: projected(config.review_mode),
       maxReviewRounds: int(config.max_review_rounds),
-      codeReviewEffort: str(isObject(config.code_review) ? config.code_review.effort : null),
-      finalReviewEffort: str(isObject(config.final_review) ? config.final_review.effort : null),
+      codeReviewEffort: projected(isObject(config.code_review) ? config.code_review.effort : null),
+      finalReviewEffort: projected(isObject(config.final_review) ? config.final_review.effort : null),
     },
     qa: {
       serverRunsSuite: qa.server_runs_suite !== false,
       strict: qa.strict !== false,
       honorCleanApproval: qa.honor_clean_approval !== false,
-      scope: str(qa.scope),
+      scope: projected(qa.scope),
       expectedTestCount: int(qa.expected_test_count),
-      onlyTesting: Array.isArray(qa.only_testing) ? qa.only_testing.map((t) => str(t)).filter(Boolean) : null,
+      onlyTesting: Array.isArray(qa.only_testing) ? qa.only_testing.map((t) => projected(t)).filter(Boolean) : null,
       appleResultAuthority: qa.apple_result_authority === true,
-      testLanguage: str(qa.test_language),
+      testLanguage: projected(qa.test_language),
       simulatorParallelTesting: typeof parallel === 'boolean' || Number.isInteger(parallel) ? parallel : null,
-      simulatorDestination: str(simulator.destination),
+      simulatorDestination: projected(simulator.destination),
     },
     egress: {
       policy: 'egress_hold',
@@ -405,7 +415,7 @@ function buildConfigProjection(config, wf) {
       remoteMutation: 'disabled',
       legacyAutoDeploy: deployment.auto_deploy === true,
       legacyAutoTag: deployment.auto_tag === true,
-      versioning: str(deployment.versioning),
+      versioning: projected(deployment.versioning),
     },
     executedSteps: executedSteps(wf),
   };

@@ -110,6 +110,24 @@ that move underneath you without your having edited anything.
 
 ### Fixed
 
+- **Receipt delivery re-proves the active run immediately before each remote
+  mutation.** The authority check ran at the start of each delivery stage, so
+  a run that was stopped or lost its receipt during the final remote read
+  (the branch `ls-remote`, the PR lookup, or the first commit-status read)
+  could still push the branch, open the PR, or publish the `success` status
+  before the refusal surfaced. The check now also runs after that last read
+  and directly before the push, the PR creation, and the status publication;
+  drift there refuses with the typed authority error and leaves no external
+  effect. A later retry with a live authority continues from the journal and
+  still performs each effect exactly once.
+- **Two long effective configuration values can no longer share one receipt
+  `configDigest`.** Projection strings were cut to 200 characters before the
+  safety check ran, so values differing only beyond that prefix produced one
+  identical projection. Finalization now refuses such a configuration with
+  `RECEIPT_PROJECTION_UNSAFE` and writes no receipt instead of truncating.
+  A managed project whose resolved `preset`, CLI slot, review effort, QA
+  scope, simulator destination, versioning, or launched-agent role/model
+  exceeds 200 characters must shorten it before a receipt can be finalized.
 - **The duplicated `final_review` default is now one object.** Its `effort`
   and `wrapup_past_cap` defaults coexist, including when YAML overrides only
   one of them, and receipts record the effective default effort.
