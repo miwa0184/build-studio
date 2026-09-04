@@ -67,8 +67,10 @@ const DEFAULTS = {
   //   silent drops). `variants` is an optional per-project taxonomy the critic uses.
   coverage_matrix: { variants: null },
   // final_review: independent recall-biased review run as a hard gate before the
-  //   merge/demo gate. `effort` is the /code-review skill effort (low|medium|high|max).
-  final_review: { effort: 'high' },
+  //   merge/demo gate. `effort` is the /code-review skill effort
+  //   (low|medium|high|max). Rounds past the owner-approved cap run in wrap-up
+  //   mode unless explicitly disabled.
+  final_review: { effort: 'high', wrapup_past_cap: true },
   // code_review: in-flow review effort (#2-lite — multi-angle, recall-biased).
   code_review: { effort: 'high' },
   // hygiene: mechanical pre-merge grep gate for test scaffolding leaked into prod
@@ -90,10 +92,6 @@ const DEFAULTS = {
   // support view: auto-commit filed items (pathspec-scoped, on the current
   // branch) so filings never wait on a manual Operations-tab commit.
   support: { auto_commit: true },
-  // final_review: rounds past the owner-approved cap run in wrap-up mode
-  // (closure contract — regressions block, fresh-lens findings file as
-  // follow-up proposals). `effort` may also be set here (default 'high').
-  final_review: { wrapup_past_cap: true },
   dev_commands: [],
   deployment: {
     strategy: 'trunk',           // trunk | gitflow
@@ -110,19 +108,35 @@ const DEFAULTS = {
   },
 };
 
+// local.json is a machine-local UI preference layer, not an alternative
+// project-policy file. Keep the allowlist equal to the keys loadConfig actually
+// consumes so a plausible-looking but inert setting can never be accepted.
+const LOCAL_OVERRIDE_KEYS = new Set(['agent_defaults', 'cli', 'step_groups']);
+
+function assertSupportedLocalOverrideKeys(value, source) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const unknown = Object.keys(value).filter((key) => !LOCAL_OVERRIDE_KEYS.has(key)).sort();
+  if (unknown.length > 0) {
+    throw new Error(`${source} contains unsupported top-level keys: ${unknown.join(', ')}`);
+  }
+  return value;
+}
+
 // Machine-written per-project overrides (.build-studio/local.json). The hub's
-// CLI settings card writes here; loadConfig merges this OVER config.yaml.
-// Never hand-edited config.yaml — comments and formatting there are sacred.
+// local preference surfaces write here; loadConfig overlays only the allowlisted
+// machine-local categories. Project policy remains in tracked config.yaml.
 // Returns {} when absent or unreadable (a corrupt local.json must not kill
 // the project server — the yaml config remains authoritative).
 function loadLocalOverrides(projectRoot) {
   const localPath = path.join(projectRoot, '.build-studio', 'local.json');
+  let raw;
   try {
-    const raw = JSON.parse(fs.readFileSync(localPath, 'utf8'));
-    return raw && typeof raw === 'object' ? raw : {};
+    raw = JSON.parse(fs.readFileSync(localPath, 'utf8'));
   } catch (_) {
     return {};
   }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  return assertSupportedLocalOverrideKeys(raw, 'local.json');
 }
 
 // Atomic read-modify-write of local.json. `patch` is shallow-merged per
@@ -130,6 +144,7 @@ function loadLocalOverrides(projectRoot) {
 // existing cli block, preserving its other fields).
 function saveLocalOverrides(projectRoot, patch) {
   const localPath = path.join(projectRoot, '.build-studio', 'local.json');
+  assertSupportedLocalOverrideKeys(patch, 'local override patch');
   const current = loadLocalOverrides(projectRoot);
   for (const [k, v] of Object.entries(patch)) {
     if (v && typeof v === 'object' && !Array.isArray(v) && current[k] && typeof current[k] === 'object') {
@@ -161,7 +176,7 @@ function loadConfig(projectRoot) {
     throw new Error('Config file is empty or not a YAML object');
   }
 
-  // local.json overlays config.yaml (hub-written settings win).
+  // local.json overlays only the allowlisted machine-local categories.
   const local = loadLocalOverrides(projectRoot);
 
   // Resolve preset if specified, otherwise use legacy format
