@@ -22,7 +22,8 @@ const { loadConfig } = require('../config');
 const { createStateManager } = require('../state');
 const { createGitOps } = require('../git');
 const { createAdmissionRegistry } = require('../admission-registry');
-const { RECEIPT_DIR, CODES } = require('../run-receipt');
+const { RECEIPT_DIR, CODES, createRunReceiptAuthority } = require('../run-receipt');
+const { qaServerSuiteGateVerdict } = require('./workflow');
 const { classifyAdmissionRoute } = require('../admission-seam');
 
 const RUN_ID = 'bugfix-2026-09-04T11-00-00-cd34';
@@ -140,6 +141,33 @@ test('receipt hold — advancing an already frozen hold never rebinds it to a mo
     assert.equal(finalize.status, 409, JSON.stringify(finalize.body));
     assert.equal(finalize.body.code, CODES.CANDIDATE_DRIFT);
     assert.equal(fs.existsSync(path.join(fx.root, '.build-studio', RECEIPT_DIR, `${RUN_ID}.json`)), false);
+  } finally {
+    await server.close();
+  }
+});
+
+test('receipt delivery verification rebinds to the active run and all material evidence', async (t) => {
+  const fx = makeFixture(t);
+  const server = await mount(fx);
+  try {
+    const park = await request(server.port, 'POST', '/api/workflow/advance', { action: 'approve' });
+    assert.equal(park.status, 409, JSON.stringify(park.body));
+    const finalized = await request(server.port, 'POST', '/api/workflow/receipt/finalize', { candidateSha: fx.candidateSha });
+    assert.equal(finalized.status, 200, JSON.stringify(finalized.body));
+    const checked = server.receipts.verifyForDelivery({
+      runId: RUN_ID,
+      candidateSha: fx.candidateSha,
+      receiptDigest: finalized.body.receipt.receiptDigest,
+    });
+    assert.equal(checked.verification.active, true);
+    assert.equal(checked.verification.matchesReceipt, true);
+
+    fs.rmSync(path.join(fx.root, '.build-studio', 'workflow-state.json'));
+    assert.throws(() => server.receipts.verifyForDelivery({
+      runId: RUN_ID,
+      candidateSha: fx.candidateSha,
+      receiptDigest: finalized.body.receipt.receiptDigest,
+    }), (error) => error.code === CODES.NO_ACTIVE_RUN);
   } finally {
     await server.close();
   }
@@ -282,6 +310,8 @@ test('receipt hold — the finalize route accepts no client authority and no unk
     // run, so at the real server a legacy run refuses before this handler.
     const route = classifyAdmissionRoute({ method: 'POST', path: '/api/workflow/receipt/finalize' });
     assert.equal(route && route.kind, 'workflow-mutation');
+    const deliveryRoute = classifyAdmissionRoute({ method: 'POST', path: '/api/workflow/egress/deliver' });
+    assert.equal(deliveryRoute && deliveryRoute.kind, 'workflow-mutation');
     assert.equal(classifyAdmissionRoute({ method: 'GET', path: '/api/workflow/receipt' }), null);
   } finally {
     await server.close();
@@ -410,11 +440,12 @@ function registerRoot(statePath, guard, admittedHead) {
 async function mount(fx) {
   const config = loadConfig(fx.root);
   const state = createStateManager(config, () => {});
+  const receipts = createRunReceiptAuthority({ config, state, qaGate: qaServerSuiteGateVerdict });
   const app = express();
   app.use(express.json());
   const tmuxOps = { killSessionAndDevPorts() {}, killWindowAndChildren() {}, isPaneAlive() { return false; } };
   app.use('/api', createWorkflowRouter(config, state, createGitOps(config), tmuxOps, () => {}));
-  app.use('/api', createRunReceiptRouter(config, state));
+  app.use('/api', createRunReceiptRouter(config, state, { authority: receipts }));
   const requestDigest = registerRoot(config.statePath, state.runGuard, fx.mainSha);
   state.saveWorkflow({
     id: RUN_ID, type: 'bugfix', input: 'LS-001', itemId: 'LS-001', prdPath: PACKET,
@@ -435,7 +466,7 @@ async function mount(fx) {
   const port = listener.address().port;
   config.port = port;
   return {
-    port, state,
+    port, state, receipts,
     close: async () => {
       await request(port, 'POST', '/api/workflow/auto-advance', { enabled: false }).catch(() => {});
       await new Promise((done) => listener.close(done));

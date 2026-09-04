@@ -235,6 +235,8 @@ const WORKFLOW_MUTATION_CASES = [
   ['/api/workflow/model-override', { reviewMode: 'sequential' }],
   ['/api/workflow/restore', { filename: 'missing.json' }],
   ['/api/workflow/recover', {}],
+  ['/api/workflow/receipt/finalize', {}],
+  ['/api/workflow/egress/deliver', { expectedSha: 'a'.repeat(40) }],
   ['/api/overseer/force-complete-task', { window: 'missing' }],
   ['/api/overseer/kill-skip-task', { window: 'missing' }],
 ];
@@ -251,6 +253,14 @@ test('R11 — every workflow mutation uses one Express-equivalent matcher for ca
         gateVerdict: { decision: 'ADMITTED' },
         bypassAdmission: true,
       }, `mutation matrix ${variant}`);
+      if (route === '/api/workflow/egress/deliver') {
+        const original = Buffer.from(`${JSON.stringify(legacyWorkflow(), null, 2)}\n`);
+        fs.writeFileSync(fx.workflowFile, original);
+        const response = await httpJson(server.port, 'POST', variant, baseBody);
+        try {
+          assert.equal(response.body.egress, 'receipt_pr_delivery', `${variant}: installed capability marker missing`);
+        } finally { fs.rmSync(fx.workflowFile, { force: true }); }
+      }
     }
   }
 });

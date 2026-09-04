@@ -12,9 +12,9 @@ const LOCAL_EGRESS_MESSAGE =
 function egressRefusal(code, extra = {}) {
   const messages = {
     [DEFAULT_BRANCH_PUSH_REMOVED]:
-      'Pushing the default branch from Build Studio is disabled until A1c installs reviewed PR egress.',
+      'Pushing the default branch from Build Studio is disabled. Reviewed PR egress can publish only the frozen candidate branch.',
     [REMOTE_MUTATION_REMOVED]:
-      'Git remote mutation from Build Studio is disabled until A1c installs reviewed PR egress.',
+      'This legacy remote mutation path is disabled. Use receipt-backed PR delivery for the frozen candidate.',
   };
   return {
     code,

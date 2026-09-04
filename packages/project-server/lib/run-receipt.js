@@ -15,8 +15,10 @@
  * What a receipt is NOT: product or founder acceptance, a merge or push
  * authorization, or proof of who ran the factory. Its digests are integrity
  * bindings a later reader can recompute; they are not signatures, and this
- * module claims no authenticity the system cannot verify. PR egress stays
- * disabled; nothing here reaches a remote or the default branch.
+ * module claims no authenticity the system cannot verify. This module itself
+ * never reaches a remote or the default branch. A separate receipt-egress
+ * authority may use a verified receipt to publish only its frozen branch,
+ * open the exact PR and attach the exact-SHA receipt status.
  *
  * Finalization fails CLOSED on every missing, stale, contradictory, malformed
  * or ambiguous input, and a finalized receipt is immutable: a later
@@ -32,6 +34,7 @@ const { execFileSync } = require('child_process');
 
 const {
   safeRunId, digest, isObject, exactKeys, writeExclusive, createLeaseStore,
+  assertAbsolutePathNoSymlink,
 } = require('./authority-store');
 const { createAdmissionRegistry } = require('./admission-registry');
 const { isTechnicalStop } = require('./technical-stop');
@@ -111,6 +114,16 @@ function sha256(data) {
 
 function str(value) {
   return typeof value === 'string' && value.length > 0 ? value.slice(0, MAX_STRING) : null;
+}
+
+/**
+ * Effective string for the configuration projection, or null. Never
+ * truncates: an over-long value must reach assertProjectionSafe intact so it
+ * refuses (RECEIPT_PROJECTION_UNSAFE) instead of collapsing into the same
+ * projection and configDigest as another value that shares its prefix.
+ */
+function projected(value) {
+  return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
 function int(value) {
@@ -313,11 +326,11 @@ function assertProjectionSafe(value, trail) {
 function executedAgent(agent, task) {
   return {
     task,
-    role: str(agent.role),
-    cli: str(agent.cli),
-    model: str(agent.model),
-    modelSource: str(agent.modelSource),
-    effort: str(agent.effort),
+    role: projected(agent.role),
+    cli: projected(agent.cli),
+    model: projected(agent.model),
+    modelSource: projected(agent.modelSource),
+    effort: projected(agent.effort),
   };
 }
 
@@ -349,7 +362,7 @@ function projectGroups(groups) {
   if (!isObject(groups)) return out;
   for (const key of Object.keys(groups).sort()) {
     const slot = isObject(groups[key]) ? groups[key] : {};
-    out[key] = { cli: str(slot.cli), model: str(slot.model), effort: str(slot.effort) };
+    out[key] = { cli: projected(slot.cli), model: projected(slot.model), effort: projected(slot.effort) };
   }
   return out;
 }
@@ -368,32 +381,32 @@ function buildConfigProjection(config, wf) {
   const parallel = simulator.parallel_testing;
   const projection = {
     schemaVersion: CONFIG_PROJECTION_SCHEMA_VERSION,
-    preset: str(config.preset),
-    builderStrategy: str(config.builder_strategy) || 'role',
+    preset: projected(config.preset),
+    builderStrategy: projected(config.builder_strategy) || 'role',
     cli: {
-      default: str(cli.default) || 'claude',
-      defaultModel: str(cli.default_model),
-      defaultEffort: str(cli.default_effort),
+      default: projected(cli.default) || 'claude',
+      defaultModel: projected(cli.default_model),
+      defaultEffort: projected(cli.default_effort),
       useGlobal: cli.use_global === true,
       groups: projectGroups(cli.groups),
     },
     review: {
-      reviewMode: str(config.review_mode),
+      reviewMode: projected(config.review_mode),
       maxReviewRounds: int(config.max_review_rounds),
-      codeReviewEffort: str(isObject(config.code_review) ? config.code_review.effort : null),
-      finalReviewEffort: str(isObject(config.final_review) ? config.final_review.effort : null),
+      codeReviewEffort: projected(isObject(config.code_review) ? config.code_review.effort : null),
+      finalReviewEffort: projected(isObject(config.final_review) ? config.final_review.effort : null),
     },
     qa: {
       serverRunsSuite: qa.server_runs_suite !== false,
       strict: qa.strict !== false,
       honorCleanApproval: qa.honor_clean_approval !== false,
-      scope: str(qa.scope),
+      scope: projected(qa.scope),
       expectedTestCount: int(qa.expected_test_count),
-      onlyTesting: Array.isArray(qa.only_testing) ? qa.only_testing.map((t) => str(t)).filter(Boolean) : null,
+      onlyTesting: Array.isArray(qa.only_testing) ? qa.only_testing.map((t) => projected(t)).filter(Boolean) : null,
       appleResultAuthority: qa.apple_result_authority === true,
-      testLanguage: str(qa.test_language),
+      testLanguage: projected(qa.test_language),
       simulatorParallelTesting: typeof parallel === 'boolean' || Number.isInteger(parallel) ? parallel : null,
-      simulatorDestination: str(simulator.destination),
+      simulatorDestination: projected(simulator.destination),
     },
     egress: {
       policy: 'egress_hold',
@@ -402,7 +415,7 @@ function buildConfigProjection(config, wf) {
       remoteMutation: 'disabled',
       legacyAutoDeploy: deployment.auto_deploy === true,
       legacyAutoTag: deployment.auto_tag === true,
-      versioning: str(deployment.versioning),
+      versioning: projected(deployment.versioning),
     },
     executedSteps: executedSteps(wf),
   };
@@ -532,11 +545,21 @@ function collectReviewEvidence(wf, reviewGates = REVIEW_GATE_STEPS.filter((step)
 function createRunReceiptStore({ statePath, lockTimeoutMs = 5000, lockPollMs = 5 } = {}) {
   if (!statePath) throw new Error('createRunReceiptStore: statePath is required');
   const dir = path.join(statePath, RECEIPT_DIR);
+  function assertReceiptPathSafe(target, runId = null) {
+    try {
+      assertAbsolutePathNoSymlink(target);
+    } catch (error) {
+      throw new RunReceiptError(CODES.STORAGE_UNPROTECTED, `receipt authority path is unsafe: ${error.message}`, {
+        runId: runId === null ? null : String(runId), cause: error.code || null,
+      });
+    }
+  }
   const leases = createLeaseStore({
     locksDir: path.join(dir, '.locks'),
     lockTimeoutMs,
     lockPollMs,
     busyError: (runId) => new RunReceiptError(CODES.BUSY, `receipt for ${runId} is being finalized by another process`, { runId }),
+    assertSafePath: (target) => assertReceiptPathSafe(target),
   });
 
   function fileFor(runId) {
@@ -547,9 +570,20 @@ function createRunReceiptStore({ statePath, lockTimeoutMs = 5000, lockPollMs = 5
   function load(runId) {
     const id = String(runId);
     const file = fileFor(id);
-    if (!fs.existsSync(file)) return null;
+    assertReceiptPathSafe(file, id);
+    let stat;
+    try {
+      stat = fs.lstatSync(file);
+    } catch (error) {
+      if (error && error.code === 'ENOENT') return null;
+      throw new RunReceiptError(CODES.UNREADABLE, `receipt for ${id} cannot be inspected: ${error.message}`, { runId: id, file });
+    }
+    if (!stat.isFile()) {
+      throw new RunReceiptError(CODES.UNREADABLE, `receipt for ${id} exists but is not a regular file`, { runId: id, file });
+    }
     let doc;
     try {
+      assertReceiptPathSafe(file, id);
       doc = JSON.parse(fs.readFileSync(file, 'utf8'));
       validateReceipt(doc, id);
     } catch (error) {
@@ -560,7 +594,10 @@ function createRunReceiptStore({ statePath, lockTimeoutMs = 5000, lockPollMs = 5
 
   /** Run `fn` while holding the run's receipt lease. */
   function withLease(runId, fn) {
-    const lease = leases.acquire(String(runId));
+    const id = String(runId);
+    assertReceiptPathSafe(path.join(dir, '.locks'), id);
+    assertReceiptPathSafe(fileFor(id), id);
+    const lease = leases.acquire(id);
     try {
       return fn();
     } finally {
@@ -590,6 +627,7 @@ function createRunReceiptStore({ statePath, lockTimeoutMs = 5000, lockPollMs = 5
       const draft = { ...body, evidenceDigest, finalizedAt: now().toISOString(), receiptDigest: null };
       draft.receiptDigest = receiptDigestOf(draft);
       validateReceipt(draft, id);
+      assertReceiptPathSafe(fileFor(id), id);
       if (!writeExclusive(fileFor(id), draft)) {
         const raced = load(id);
         if (raced && raced.evidenceDigest === evidenceDigest) return { created: false, receipt: raced };
@@ -1128,7 +1166,39 @@ function createRunReceiptAuthority({ config, state, qaGate, git, store, lockTime
     };
   }
 
-  return { finalize, read, verify, store: receipts };
+  /**
+   * Re-gather the ACTIVE run's material receipt evidence immediately before
+   * an external delivery boundary. This is intentionally read-only and is
+   * called while the receipt lease is held by the egress authority.
+   */
+  function verifyForDelivery({ runId, candidateSha, receiptDigest } = {}) {
+    if (typeof runId !== 'string' || !runId
+      || typeof candidateSha !== 'string' || !SHA_RE.test(candidateSha)
+      || typeof receiptDigest !== 'string' || !HEX64_RE.test(receiptDigest)) {
+      refuse(CODES.BAD_REQUEST, 'delivery verification requires runId, candidateSha, and receiptDigest');
+    }
+    const wf = activeWorkflow(runId);
+    const receipt = receipts.load(runId);
+    if (!receipt || receipt.receiptDigest !== receiptDigest || receipt.candidate.sha !== candidateSha) {
+      refuse(CODES.EVIDENCE_DRIFT, `run ${runId} no longer matches its delivery receipt`, { runId });
+    }
+    const latestBody = gatherReceiptBody(wf, candidateSha);
+    if (evidenceDigestOf(latestBody) !== receipt.evidenceDigest) {
+      refuse(CODES.EVIDENCE_DRIFT, `run ${runId} material evidence changed before delivery`, { runId });
+    }
+    return {
+      receipt,
+      verification: {
+        active: true,
+        candidateBranch: receipt.candidate.branch,
+        candidateSha,
+        matchesReceipt: true,
+        checkedAt: new Date().toISOString(),
+      },
+    };
+  }
+
+  return { finalize, read, verify, verifyForDelivery, store: receipts };
 }
 
 module.exports = {

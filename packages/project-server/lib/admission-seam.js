@@ -62,6 +62,7 @@ const WORKFLOW_MUTATIONS = new Set([
   // A1c receipt: finalizing the factory-run receipt binds the admitted run's
   // stored identity, so it verifies the stored context like every mutation.
   '/api/workflow/receipt/finalize',
+  '/api/workflow/egress/deliver',
   '/api/overseer/force-complete-task',
   '/api/overseer/kill-skip-task',
 ]);
@@ -118,8 +119,8 @@ function classifyAdmissionRoute(req) {
 /** Body fields a client may never use to carry its own authority. */
 const CLIENT_AUTHORITY_FIELDS = /^(runRequest|.*verdict.*|.*approval.*|approved|bypass.*|admission)$/i;
 
-function refusalResponse(res, e) {
-  const payload = admissionErrorPayload(e);
+function refusalResponse(res, e, extra = {}) {
+  const payload = { ...admissionErrorPayload(e), ...extra };
   if (!e || !e.code) payload.code = 'ADMISSION_VALIDATOR_FAILURE';
   return res.status(403).json(payload);
 }
@@ -128,6 +129,7 @@ function createAdmissionSeam({ state, admission }) {
   if (!state || !admission) throw new Error('createAdmissionSeam: state and admission are required');
 
   return function admissionSeam(req, res, next) {
+    let classifiedRoute = null;
     try {
       // The seam's own read route — what would a valid RunRequest say right now?
       if (req.method === 'GET' && req.path === '/api/admission/context') {
@@ -142,7 +144,10 @@ function createAdmissionSeam({ state, admission }) {
       // C — reads pass. A refused or stopped run must stay renderable.
       if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
 
-      const classifiedRoute = classifyAdmissionRoute(req);
+      classifiedRoute = classifyAdmissionRoute(req);
+      const refusalExtra = classifiedRoute && classifiedRoute.routePath === '/api/workflow/egress/deliver'
+        ? { egress: 'receipt_pr_delivery' }
+        : {};
 
       // A — start ingress.
       if (classifiedRoute && classifiedRoute.kind === 'start') {
@@ -172,7 +177,7 @@ function createAdmissionSeam({ state, admission }) {
             return refusalResponse(res, new AdmissionRefusedError(
               'ADMISSION_CLIENT_VERDICT',
               `${JSON.stringify(key)} is not accepted here — mutations of a registered run run on the server's stored admission, not on anything a client sends`,
-            ));
+            ), refusalExtra);
           }
         }
         const active = isWorkflowMutation ? state.loadWorkflow() : state.loadRun();
@@ -188,7 +193,10 @@ function createAdmissionSeam({ state, admission }) {
       return next();
     } catch (e) {
       // Fail CLOSED — a broken validator refuses; it never waves through.
-      return refusalResponse(res, e);
+      const extra = classifiedRoute && classifiedRoute.routePath === '/api/workflow/egress/deliver'
+        ? { egress: 'receipt_pr_delivery' }
+        : {};
+      return refusalResponse(res, e, extra);
     }
   };
 }

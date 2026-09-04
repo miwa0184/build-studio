@@ -495,6 +495,42 @@ test('receipt R7 — environment, secrets, raw config and local paths never ente
   assert.deepEqual(Object.keys(receipt.config).sort(), ['builderStrategy', 'cli', 'egress', 'executedSteps', 'preset', 'qa', 'review', 'schemaVersion']);
 });
 
+// Frozen-head review, HIGH B: projection strings were cut to 200 characters
+// before assertProjectionSafe ran, so two different effective values sharing a
+// 200-character prefix produced one projection and one configDigest.
+test('receipt R7 — two effective values that share a 200-character prefix never collapse into one projection', (t) => {
+  const prefix = 'v'.repeat(200);
+  const values = [`${prefix}1`, `${prefix}2`];
+  assert.notEqual(values[0], values[1]);
+  assert.equal(values[0].slice(0, 200), values[1].slice(0, 200));
+
+  const outcomes = values.map((versioning) => {
+    try {
+      return { configDigest: receiptLib.buildConfigProjection({ deployment: { versioning } }, { steps: {} }).configDigest };
+    } catch (error) {
+      return { refused: error.message };
+    }
+  });
+  assert.ok(outcomes.every((outcome) => outcome.refused),
+    `an over-long effective value must refuse instead of projecting; got ${JSON.stringify(outcomes)}`);
+
+  for (const versioning of values) {
+    const fx = makeRepo(t);
+    const configPath = path.join(fx.root, '.build-studio', 'config.yaml');
+    fs.writeFileSync(configPath, fs.readFileSync(configPath, 'utf8').replace('  versioning: semver', `  versioning: ${versioning}`));
+    const config = loadConfig(fx.root);
+    assert.equal(config.deployment.versioning, versioning, 'the resolver must carry the full effective value');
+    const state = createStateManager(config, () => {});
+    const { requestDigest } = registerRoot(fx.root, { admittedHead: fx.mainSha, guard: state.runGuard });
+    persistWorkflow(state, workflowAtHold(fx, { requestDigest, admittedHead: fx.mainSha }));
+    const authority = createRunReceiptAuthority({ config, state, qaGate: qaServerSuiteGateVerdict });
+    const receiptDir = path.join(config.statePath, RECEIPT_DIR);
+    assert.throws(() => authority.finalize(), (error) => error.code === CODES.PROJECTION_UNSAFE);
+    assert.deepEqual(receiptFiles(receiptDir), [], 'a refused projection must write no receipt');
+    assert.equal(authority.read(), null);
+  }
+});
+
 // ---------- 8. idempotency and concurrency ----------
 
 test('receipt R8 — the finalized receipt is bound, digested and byte-identical on a duplicate finalization', (t) => {
