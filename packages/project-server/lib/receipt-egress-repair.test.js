@@ -290,6 +290,40 @@ test('repair — the real receipt store refuses direct, dangling, and intermedia
   }
 });
 
+test('repair — the real receipt store refuses symlinked lease and receipt leaf targets before mutation', (t) => {
+  for (const scenario of ['locks-existing', 'locks-dangling', 'receipt-existing', 'receipt-dangling']) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `receipt-leaf-${scenario}-`));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), `receipt-leaf-outside-${scenario}-`));
+    t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+    const statePath = path.join(root, '.build-studio');
+    const receiptDir = path.join(statePath, 'run-receipt');
+    fs.mkdirSync(receiptDir, { recursive: true });
+    fs.writeFileSync(path.join(outside, 'sentinel'), 'unchanged');
+    const before = fs.readdirSync(outside).sort();
+    const store = createRunReceiptStore({ statePath });
+    let callbackRan = false;
+
+    if (scenario.startsWith('locks-')) {
+      const target = scenario.endsWith('existing') ? outside : path.join(root, 'missing-locks');
+      fs.symlinkSync(target, path.join(receiptDir, '.locks'));
+      assert.throws(() => store.withLease('leaf-symlink-run', () => {
+        callbackRan = true;
+      }), (error) => error.code === 'RECEIPT_STORAGE_UNPROTECTED');
+      assert.equal(callbackRan, false);
+    } else {
+      const target = scenario.endsWith('existing')
+        ? path.join(outside, 'sentinel')
+        : path.join(root, 'missing-receipt');
+      fs.symlinkSync(target, store.fileFor('leaf-symlink-run'));
+      assert.throws(() => store.load('leaf-symlink-run'), (error) => error.code === 'RECEIPT_STORAGE_UNPROTECTED');
+    }
+
+    assert.equal(fs.readFileSync(path.join(outside, 'sentinel'), 'utf8'), 'unchanged');
+    assert.deepEqual(fs.readdirSync(outside).sort(), before);
+  }
+});
+
 test('repair — the create-only push cannot fast-forward a branch created in the race window', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'receipt-egress-cas-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

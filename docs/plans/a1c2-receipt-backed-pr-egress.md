@@ -89,6 +89,7 @@ Permanent tests cover pre-mutation drift refusal, mismatched push URLs, a real
 two-stage Git URL rewrite, active-run and local-tip rebinding, a real
 bare-repository create race, base-SHA drift, closed-PR recovery, append-only
 journal tampering before status publication, direct/dangling/intermediate
-authority symlinks against the real receipt store, a conflicting receipt status
-on page two, nonce-bound status recovery, client-authority rejection, the HTTP
-contract and admission-seam classification.
+authority symlinks plus symlinked `.locks` and receipt-file leaves against the
+real receipt store, a conflicting receipt status on page two, nonce-bound status
+recovery, client-authority rejection, the HTTP contract and admission-seam
+classification.

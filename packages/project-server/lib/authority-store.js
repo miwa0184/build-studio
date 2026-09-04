@@ -148,11 +148,16 @@ function writeExclusive(file, value) {
  * reclaimer from moving a newer live owner. Bounded waiting ends in the
  * caller's typed busy error.
  */
-function createLeaseStore({ locksDir, lockTimeoutMs = 5000, lockPollMs = 5, busyError } = {}) {
+function createLeaseStore({
+  locksDir, lockTimeoutMs = 5000, lockPollMs = 5, busyError, assertSafePath,
+} = {}) {
   if (!locksDir) throw new Error('createLeaseStore: locksDir is required');
   const busy = typeof busyError === 'function'
     ? busyError
     : (key) => Object.assign(new Error(`lease for ${key} is busy`), { code: 'AUTHORITY_LEASE_BUSY' });
+  const ensureSafe = (...targets) => {
+    if (typeof assertSafePath === 'function') targets.forEach((target) => assertSafePath(target));
+  };
 
   function lockFor(key) {
     return path.join(locksDir, `${safeRunId(key)}.lock`);
@@ -163,6 +168,7 @@ function createLeaseStore({ locksDir, lockTimeoutMs = 5000, lockPollMs = 5, busy
   }
 
   function readOwner(lock) {
+    ensureSafe(lock, ownerFile(lock));
     try {
       const owner = JSON.parse(fs.readFileSync(ownerFile(lock), 'utf8'));
       if (!exactKeys(owner, ['protocolVersion', 'token', 'pid', 'hostname', 'runId', 'createdAt'])
@@ -195,6 +201,7 @@ function createLeaseStore({ locksDir, lockTimeoutMs = 5000, lockPollMs = 5, busy
     // had already been removed and move a new live owner B out of the lock.
     // Only the process that creates this claim may ever move A's lock.
     const claim = `${lock}.reclaimed-${owner.token}`;
+    ensureSafe(lock, ownerFile(lock), claim);
     try {
       fs.mkdirSync(claim);
     } catch (_) {
@@ -203,6 +210,7 @@ function createLeaseStore({ locksDir, lockTimeoutMs = 5000, lockPollMs = 5, busy
     const current = readOwner(lock);
     if (!current || current.token !== owner.token || !processIsDead(current)) return false;
     const tombstone = `${lock}.stale-${owner.token}-${crypto.randomUUID()}`;
+    ensureSafe(lock, tombstone);
     try {
       fs.renameSync(lock, tombstone);
     } catch (_) {
@@ -210,18 +218,23 @@ function createLeaseStore({ locksDir, lockTimeoutMs = 5000, lockPollMs = 5, busy
     }
     const movedOwner = readOwner(tombstone);
     if (!movedOwner || movedOwner.token !== owner.token) {
+      ensureSafe(tombstone, lock);
       try { fs.renameSync(tombstone, lock); } catch (_) {}
       return false;
     }
+    ensureSafe(tombstone);
     fs.rmSync(tombstone, { recursive: true, force: true });
     return true;
   }
 
   function tryAcquire(key) {
+    ensureSafe(locksDir);
     fs.mkdirSync(locksDir, { recursive: true });
+    ensureSafe(locksDir);
     const lock = lockFor(key);
     const token = crypto.randomUUID();
     const candidate = `${lock}.candidate-${token}`;
+    ensureSafe(lock, candidate);
     fs.mkdirSync(candidate, { recursive: false });
     const owner = {
       protocolVersion: LOCK_PROTOCOL_VERSION,
@@ -231,12 +244,15 @@ function createLeaseStore({ locksDir, lockTimeoutMs = 5000, lockPollMs = 5, busy
       runId: String(key),
       createdAt: new Date().toISOString(),
     };
+    ensureSafe(candidate, ownerFile(candidate));
     writeAtomic(ownerFile(candidate), owner);
     try {
+      ensureSafe(candidate, lock);
       fs.renameSync(candidate, lock);
       syncDirectory(locksDir);
       return { lock, owner };
     } catch (error) {
+      ensureSafe(candidate, lock);
       fs.rmSync(candidate, { recursive: true, force: true });
       if (error.code !== 'EEXIST' && error.code !== 'ENOTEMPTY') throw error;
       const existing = readOwner(lock);
@@ -258,11 +274,14 @@ function createLeaseStore({ locksDir, lockTimeoutMs = 5000, lockPollMs = 5, busy
   }
 
   function release(lease) {
+    ensureSafe(lease.lock, ownerFile(lease.lock));
     const current = readOwner(lease.lock);
     if (!current || current.token !== lease.owner.token || current.runId !== lease.owner.runId) return;
     const released = `${lease.lock}.release-${lease.owner.token}`;
+    ensureSafe(lease.lock, released);
     try {
       fs.renameSync(lease.lock, released);
+      ensureSafe(released);
       fs.rmSync(released, { recursive: true, force: true });
     } catch (_) {}
   }

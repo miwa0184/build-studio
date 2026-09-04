@@ -35,7 +35,8 @@ that move underneath you without your having edited anything.
   A durable nonce-bearing, append-only and digest-chained recovery journal is
   re-read immediately before every external mutation, making retries after ref
   creation, PR creation or status publication idempotent. Git URL rewrite
-  chains, authority-path symlinks, base/candidate/repository/PR/journal drift,
+  chains, authority-path symlinks (including the actual lease directory and
+  receipt-file leaf), base/candidate/repository/PR/journal drift,
   and conflicting statuses on any pagination page refuse. This capability
   cannot merge, tag, deploy,
   update an existing branch or delete one. See

@@ -536,11 +536,21 @@ function createRunReceiptStore({ statePath, lockTimeoutMs = 5000, lockPollMs = 5
   if (!statePath) throw new Error('createRunReceiptStore: statePath is required');
   const dir = path.join(statePath, RECEIPT_DIR);
   const authorityBase = path.dirname(path.resolve(statePath));
+  function assertReceiptPathSafe(target, runId = null) {
+    try {
+      assertPathComponentsNoSymlink(authorityBase, target);
+    } catch (error) {
+      throw new RunReceiptError(CODES.STORAGE_UNPROTECTED, `receipt authority path is unsafe: ${error.message}`, {
+        runId: runId === null ? null : String(runId), cause: error.code || null,
+      });
+    }
+  }
   const leases = createLeaseStore({
     locksDir: path.join(dir, '.locks'),
     lockTimeoutMs,
     lockPollMs,
     busyError: (runId) => new RunReceiptError(CODES.BUSY, `receipt for ${runId} is being finalized by another process`, { runId }),
+    assertSafePath: (target) => assertReceiptPathSafe(target),
   });
 
   function fileFor(runId) {
@@ -551,9 +561,20 @@ function createRunReceiptStore({ statePath, lockTimeoutMs = 5000, lockPollMs = 5
   function load(runId) {
     const id = String(runId);
     const file = fileFor(id);
-    if (!fs.existsSync(file)) return null;
+    assertReceiptPathSafe(file, id);
+    let stat;
+    try {
+      stat = fs.lstatSync(file);
+    } catch (error) {
+      if (error && error.code === 'ENOENT') return null;
+      throw new RunReceiptError(CODES.UNREADABLE, `receipt for ${id} cannot be inspected: ${error.message}`, { runId: id, file });
+    }
+    if (!stat.isFile()) {
+      throw new RunReceiptError(CODES.UNREADABLE, `receipt for ${id} exists but is not a regular file`, { runId: id, file });
+    }
     let doc;
     try {
+      assertReceiptPathSafe(file, id);
       doc = JSON.parse(fs.readFileSync(file, 'utf8'));
       validateReceipt(doc, id);
     } catch (error) {
@@ -564,13 +585,7 @@ function createRunReceiptStore({ statePath, lockTimeoutMs = 5000, lockPollMs = 5
 
   /** Run `fn` while holding the run's receipt lease. */
   function withLease(runId, fn) {
-    try {
-      assertPathComponentsNoSymlink(authorityBase, dir);
-    } catch (error) {
-      throw new RunReceiptError(CODES.STORAGE_UNPROTECTED, `receipt authority path is unsafe: ${error.message}`, {
-        runId: String(runId), cause: error.code || null,
-      });
-    }
+    assertReceiptPathSafe(path.join(dir, '.locks'), runId);
     const lease = leases.acquire(String(runId));
     try {
       return fn();
@@ -601,6 +616,7 @@ function createRunReceiptStore({ statePath, lockTimeoutMs = 5000, lockPollMs = 5
       const draft = { ...body, evidenceDigest, finalizedAt: now().toISOString(), receiptDigest: null };
       draft.receiptDigest = receiptDigestOf(draft);
       validateReceipt(draft, id);
+      assertReceiptPathSafe(fileFor(id), id);
       if (!writeExclusive(fileFor(id), draft)) {
         const raced = load(id);
         if (raced && raced.evidenceDigest === evidenceDigest) return { created: false, receipt: raced };
