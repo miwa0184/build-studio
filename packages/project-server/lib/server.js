@@ -203,8 +203,9 @@ function startServer(projectRoot, opts = {}) {
   const terminalRouter = createTerminalRouter(config, state, tmuxOps);
   const workflowRouter = createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast, { admission });
   const runRouter = createRunRouter(config, state, gitOps, tmuxOps, broadcast, parseExecutionPlan);
-  // A1c receipt: the write-once factory-run receipt for the active run.
-  // Finalization is a workflow mutation under the admission seam above.
+  // A1c receipt + receipt-backed PR delivery for the active run. Both are
+  // workflow mutations under the admission seam above. Delivery cannot merge
+  // or delete; it publishes only the exact frozen candidate and its status.
   const runReceiptRouter = createRunReceiptRouter(config, state);
   // One monitor per project-server, shared by the CI/CD tab and the Monitor
   // tab so a single cached `gh run list` answers both.

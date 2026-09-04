@@ -2,8 +2,8 @@
 
 > **Status: implemented 2026-09-04.** A per-run, write-once receipt that
 > proves a candidate was produced by one admitted run and reached the
-> existing Egress Hold with its technical evidence intact. This slice
-> prepares a later reviewed PR egress and installs none: no push, PR, merge,
+> existing Egress Hold with its technical evidence intact. This receipt slice
+> prepared the reviewed PR egress added by A1c.2. The receipt itself performs no push, PR, merge,
 > tag, deployment, default-branch checkout or branch deletion exists behind
 > it. Third technical slice of the A1a/A1b/A1c track; no product change.
 
@@ -79,9 +79,11 @@ exact key set on every read; a tampered or truncated receipt reads as
   decision the receipt records nothing about. The fields
   `productAcceptance: false` and `mergeAuthorization: false` are asserted as
   data so a reader holding only the file reaches the same conclusion.
-- **Not a merge or push authorization.** PR egress remains disabled. With or
-  without a receipt, `merge_to_main` answers `LOCAL_MERGE_REMOVED`, the tick
-  parks, deployment push and CI-fix acceptance refuse, exactly as before.
+- **Not a merge or push authorization.** The receipt never grants general
+  remote authority. A1c.2 may consume a verified receipt only to publish its
+  frozen candidate branch, exact PR and exact-SHA status. `merge_to_main`
+  remains a local-merge refusal, and deployment push and CI-fix acceptance
+  remain disabled.
 - **Not authenticity.** The digests are integrity bindings, not signatures.
   A process that can write this machine's files can write a receipt. The
   boundary enforced is the same as A1b.1's: no HTTP caller can assert a

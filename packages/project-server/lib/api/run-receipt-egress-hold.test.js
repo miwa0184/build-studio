@@ -282,6 +282,8 @@ test('receipt hold — the finalize route accepts no client authority and no unk
     // run, so at the real server a legacy run refuses before this handler.
     const route = classifyAdmissionRoute({ method: 'POST', path: '/api/workflow/receipt/finalize' });
     assert.equal(route && route.kind, 'workflow-mutation');
+    const deliveryRoute = classifyAdmissionRoute({ method: 'POST', path: '/api/workflow/egress/deliver' });
+    assert.equal(deliveryRoute && deliveryRoute.kind, 'workflow-mutation');
     assert.equal(classifyAdmissionRoute({ method: 'GET', path: '/api/workflow/receipt' }), null);
   } finally {
     await server.close();

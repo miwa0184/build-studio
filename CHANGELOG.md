@@ -25,6 +25,17 @@ that move underneath you without your having edited anything.
 
 ### Added
 
+- **Receipt-backed PR delivery is installed as a narrow A1c.2 endpoint.**
+  `POST /api/workflow/egress/deliver` accepts only `expectedSha`, finalizes and
+  re-verifies the active run's receipt, proves repository/origin/default-base
+  identity, pushes exactly `<sha>:refs/heads/<receipt-branch>`, creates or
+  reuses only the matching open PR, reads it back, and then publishes the
+  `factory-run-receipt` success status on that exact SHA. A durable recovery
+  journal makes retries after push, PR creation or status publication
+  idempotent. Base, candidate, repository or PR drift refuses. This capability
+  cannot merge, tag, deploy, force-push or delete a branch. See
+  `docs/plans/a1c2-receipt-backed-pr-egress.md`.
+
 - **A per-run factory-run receipt can be finalized at the Egress Hold.**
   `POST /api/workflow/receipt/finalize` writes one immutable, digest-bound
   file, `.build-studio/run-receipt/<runId>.json`, proving that the active
@@ -51,9 +62,10 @@ that move underneath you without your having edited anything.
 - **What the receipt is not.** It is machine evidence only: not product or
   founder acceptance, not a merge or push authorization, and not a
   signature. `productAcceptance: false`, `mergeAuthorization: false` and
-  `remoteEgress: "disabled"` are recorded as fields. PR egress remains
-  disabled; with or without a receipt the hold answers `LOCAL_MERGE_REMOVED`
-  and no push, PR, merge, tag or branch deletion exists behind it. See
+  `remoteEgress: "disabled"` are recorded as fields. The receipt does not
+  authorize arbitrary egress; the separate A1c.2 authority can publish only
+  the receipt's frozen branch, PR and status. The hold still answers
+  `LOCAL_MERGE_REMOVED`, and no merge, tag or branch deletion exists. See
   `docs/plans/a1c-factory-run-receipt.md`.
 
 ### Changed
@@ -146,12 +158,23 @@ through Git's repository-local exclude before the first receipt is written. If f
 and resolve any explicit ignore negation before retrying; Build Studio does not
 silently rewrite those repository decisions.
 
+For PR delivery, tracked config must name `deployment.repo` as `owner/repo`,
+`origin` must point to that repository, and the authenticated GitHub credential
+must have branch-push, PR and commit-status write access. Do not require the
+`factory-run-receipt` status in branch protection until this Build Studio change
+has landed and one real candidate has published the context successfully.
+
 ### Known issues
 
 - The local allowlist is top-level. Nested values continue through their
   existing category-specific normalization, and unreadable or malformed
   `local.json` still falls back to tracked YAML so a damaged optional UI
   preference file cannot prevent the project server from starting.
+- PR delivery is a synchronous, bounded server operation. Each Git or GitHub
+  command has a 30-second timeout; a network outage can therefore hold the
+  endpoint temporarily, but cannot create an unbounded retry loop. Retry the
+  same run and SHA after connectivity returns; the journal reconciles partial
+  progress.
 
 ### Notes for forks
 

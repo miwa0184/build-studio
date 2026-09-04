@@ -15,8 +15,10 @@
  * What a receipt is NOT: product or founder acceptance, a merge or push
  * authorization, or proof of who ran the factory. Its digests are integrity
  * bindings a later reader can recompute; they are not signatures, and this
- * module claims no authenticity the system cannot verify. PR egress stays
- * disabled; nothing here reaches a remote or the default branch.
+ * module claims no authenticity the system cannot verify. This module itself
+ * never reaches a remote or the default branch. A separate receipt-egress
+ * authority may use a verified receipt to publish only its frozen branch,
+ * open the exact PR and attach the exact-SHA receipt status.
  *
  * Finalization fails CLOSED on every missing, stale, contradictory, malformed
  * or ambiguous input, and a finalized receipt is immutable: a later
