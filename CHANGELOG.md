@@ -28,12 +28,14 @@ that move underneath you without your having edited anything.
 - **Receipt-backed PR delivery is installed as a narrow A1c.2 endpoint.**
   `POST /api/workflow/egress/deliver` accepts only `expectedSha`, finalizes and
   re-verifies the active run's receipt, proves repository/origin/default-base
-  identity, pushes exactly `<sha>:refs/heads/<receipt-branch>`, creates or
-  reuses only the matching open PR, reads it back, and then publishes the
-  `factory-run-receipt` success status on that exact SHA. A durable recovery
-  journal makes retries after push, PR creation or status publication
-  idempotent. Base, candidate, repository or PR drift refuses. This capability
-  cannot merge, tag, deploy, force-push or delete a branch. See
+  identity, validates the single effective fetch and push URLs, creates the
+  exact remote candidate ref with an expected-absent compare-and-swap, creates
+  or reuses only the matching open same-repository PR, binds its base SHA, and
+  then publishes the `factory-run-receipt` success status on that exact SHA.
+  A durable nonce-bearing recovery journal makes retries after ref creation,
+  PR creation or status publication idempotent. Base, candidate, repository,
+  PR or journal drift refuses. This capability cannot merge, tag, deploy,
+  update an existing branch or delete one. See
   `docs/plans/a1c2-receipt-backed-pr-egress.md`.
 
 - **A per-run factory-run receipt can be finalized at the Egress Hold.**

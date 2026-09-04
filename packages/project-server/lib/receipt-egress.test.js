@@ -32,6 +32,7 @@ function fixture(t, overrides = {}) {
       return { created: true, receipt };
     },
     verify: () => ({ receipt, verification: { matchesReceipt: true, candidateSha: SHA } }),
+    verifyForDelivery: () => ({ receipt, verification: { active: true, matchesReceipt: true, candidateSha: SHA } }),
     store: { withLease: (_runId, fn) => fn() },
   };
   const git = (args) => {
@@ -49,12 +50,19 @@ function fixture(t, overrides = {}) {
     findOpenPr: () => remote.pr,
     createPr: ({ head, base }) => {
       calls.push(['createPr', head, base]);
-      remote.pr = { number: 17, url: 'https://github.com/owner/project/pull/17', state: 'OPEN', headRefName: head, headRefOid: SHA, headRepository: { nameWithOwner: 'owner/project' }, baseRefName: base };
+      remote.pr = { number: 17, url: 'https://github.com/owner/project/pull/17', state: 'OPEN', headRefName: head, headRefOid: SHA, headRepository: { nameWithOwner: 'owner/project' }, baseRefName: base, baseRefOid: BASE };
       return remote.pr;
     },
+    findPr: () => remote.pr,
     readPr: () => remote.pr,
     readStatuses: () => remote.statuses,
-    publishStatus: (status) => { calls.push(['status', status.state, status.sha]); remote.statuses.unshift(status); },
+    publishStatus: (status) => {
+      calls.push(['status', status.state, status.sha]);
+      remote.statuses.unshift({
+        context: 'factory-run-receipt', state: status.state, description: status.description,
+        target_url: status.targetUrl,
+      });
+    },
   };
   const config = { projectRoot: root, statePath: path.join(root, '.build-studio'), deployment: { repo: 'owner/project' } };
   return { root, calls, remote, receipt, authority, git, github, config, ...overrides };
@@ -98,7 +106,8 @@ test('A1c.2 pushes the exact object, creates one exact PR, then publishes SUCCES
   assert.equal(result.candidateSha, SHA);
   assert.equal(result.pr.number, 17);
   const push = fx.calls.find((call) => call[0] === 'git' && call[1] === 'push');
-  assert.deepEqual(push, ['git', 'push', 'origin', `${SHA}:refs/heads/factory/candidate-001`]);
+  assert.deepEqual(push, ['git', 'push', '--porcelain', '--force-with-lease=refs/heads/factory/candidate-001:',
+    'git@github.com:owner/project.git', `${SHA}:refs/heads/factory/candidate-001`]);
   assert.equal(fx.calls.some((call) => call.includes('--force') || call.includes('--delete')), false);
   const createIndex = fx.calls.findIndex((call) => call[0] === 'createPr');
   const statusIndex = fx.calls.findIndex((call) => call[0] === 'status');
@@ -125,7 +134,7 @@ test('A1c.2 is retry-safe after every external boundary and never creates a seco
   assert.equal(fx.calls.filter((call) => call[0] === 'createPr').length, 1);
   const journal = again.journal;
   assert.equal(journal.stage, 'delivered');
-  assert.equal(journal.revision, 4, 'a replay must not regress or rewrite the delivered journal');
+  assert.equal(journal.revision, 5, 'a replay must not regress or rewrite the delivered journal');
 });
 
 test('A1c.2 refuses a remote branch or PR that points at any other SHA', (t) => {
@@ -136,7 +145,7 @@ test('A1c.2 refuses a remote branch or PR that points at any other SHA', (t) => 
 
   const prDrift = fixture(t);
   prDrift.remote.branchSha = SHA;
-  prDrift.remote.pr = { number: 9, url: 'https://github.com/owner/project/pull/9', state: 'OPEN', headRefName: 'factory/candidate-001', headRefOid: 'e'.repeat(40), headRepository: { nameWithOwner: 'owner/project' }, baseRefName: 'main' };
+  prDrift.remote.pr = { number: 9, url: 'https://github.com/owner/project/pull/9', state: 'OPEN', headRefName: 'factory/candidate-001', headRefOid: 'e'.repeat(40), headRepository: { nameWithOwner: 'owner/project' }, baseRefName: 'main', baseRefOid: BASE };
   assert.throws(() => service(prDrift).deliver({ expectedSha: SHA }), (error) => error.code === 'EGRESS_PR_CONFLICT');
   assert.equal(prDrift.calls.some((call) => call[0] === 'status'), false);
 });
@@ -151,7 +160,7 @@ test('A1c.2 never replaces a journaled PR and never overwrites a conflicting rec
 
   const statusConflict = fixture(t);
   statusConflict.remote.branchSha = SHA;
-  statusConflict.remote.pr = { number: 18, url: 'https://github.com/owner/project/pull/18', state: 'OPEN', headRefName: 'factory/candidate-001', headRefOid: SHA, headRepository: { nameWithOwner: 'owner/project' }, baseRefName: 'main' };
+  statusConflict.remote.pr = { number: 18, url: 'https://github.com/owner/project/pull/18', state: 'OPEN', headRefName: 'factory/candidate-001', headRefOid: SHA, headRepository: { nameWithOwner: 'owner/project' }, baseRefName: 'main', baseRefOid: BASE };
   statusConflict.remote.statuses = [{ context: 'factory-run-receipt', state: 'failure', description: 'revoked', target_url: statusConflict.remote.pr.url }];
   assert.throws(() => service(statusConflict).deliver({ expectedSha: SHA }), (error) => error.code === 'EGRESS_STATUS_CONFLICT');
   assert.equal(statusConflict.calls.some((call) => call[0] === 'status'), false);
@@ -186,20 +195,20 @@ test('A1c.2 GitHub adapter uses only repo reads, PR create/read, and exact commi
     if (args[0] === 'repo') return JSON.stringify({ nameWithOwner: 'owner/project', defaultBranchRef: { name: 'main' }, viewerPermission: 'WRITE' });
     if (args[0] === 'pr' && args[1] === 'list') return '[]';
     if (args[0] === 'pr' && args[1] === 'create') return 'https://github.com/owner/project/pull/17';
-    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ number: 17, url: 'https://github.com/owner/project/pull/17', state: 'OPEN', headRefName: 'factory/candidate-001', headRefOid: SHA, headRepository: { nameWithOwner: 'owner/project' }, baseRefName: 'main' });
+    if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ number: 17, url: 'https://github.com/owner/project/pull/17', state: 'OPEN', headRefName: 'factory/candidate-001', headRefOid: SHA, headRepository: { nameWithOwner: 'owner/project' }, baseRefName: 'main', baseRefOid: BASE });
     if (args[0] === 'api' && args.includes('--method') && args.includes('GET')) return '[]';
     if (args[0] === 'api') return '{}';
     throw new Error(`unexpected gh call: ${args.join(' ')}`);
   };
   const gh = createGithubAdapter(run);
   assert.equal(gh.inspectRepo('owner/project').permission, 'WRITE');
-  assert.equal(gh.findOpenPr({ repo: 'owner/project', head: 'factory/candidate-001' }), null);
+  assert.equal(gh.findPr({ repo: 'owner/project', head: 'factory/candidate-001' }), null);
   gh.createPr({ repo: 'owner/project', head: 'factory/candidate-001', base: 'main', title: 'title', body: 'body' });
   gh.readPr({ repo: 'owner/project', number: 17 });
   gh.readStatuses({ repo: 'owner/project', sha: SHA });
   gh.publishStatus({ repo: 'owner/project', sha: SHA, state: 'success', description: 'receipt', targetUrl: 'https://github.com/owner/project/pull/17' });
   const flat = calls.map((args) => args.join(' ')).join('\n');
-  assert.doesNotMatch(flat, /\bmerge\b|--delete|--force|\/git\/refs/);
+  assert.doesNotMatch(flat, /\bmerge\b|--delete|\/git\/refs/);
   assert.match(flat, new RegExp(`repos/owner/project/statuses/${SHA}`));
 });
 

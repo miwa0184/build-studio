@@ -30,11 +30,11 @@ function statusFor(code) {
   return 409;
 }
 
-function refusal(res, error) {
+function refusal(res, error, capability = null) {
   if (!(error instanceof RunReceiptError) && !(error instanceof ReceiptEgressError)) throw error;
   const { message, code, stack, name, ...details } = error;
   delete details.cause;
-  const egress = error instanceof ReceiptEgressError ? 'receipt_pr_delivery' : 'not_installed';
+  const egress = capability || (error instanceof ReceiptEgressError ? 'receipt_pr_delivery' : 'not_installed');
   return res.status(statusFor(code)).json({ code, error: message, egress, ...details });
 }
 
@@ -85,7 +85,7 @@ function createRunReceiptRouter(config, state, { qaGate = qaServerSuiteGateVerdi
     try {
       return res.status(200).json(delivery.deliver(req.body));
     } catch (error) {
-      return refusal(res, error);
+      return refusal(res, error, 'receipt_pr_delivery');
     }
   });
 

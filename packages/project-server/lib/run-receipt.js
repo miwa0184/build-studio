@@ -1130,7 +1130,39 @@ function createRunReceiptAuthority({ config, state, qaGate, git, store, lockTime
     };
   }
 
-  return { finalize, read, verify, store: receipts };
+  /**
+   * Re-gather the ACTIVE run's material receipt evidence immediately before
+   * an external delivery boundary. This is intentionally read-only and is
+   * called while the receipt lease is held by the egress authority.
+   */
+  function verifyForDelivery({ runId, candidateSha, receiptDigest } = {}) {
+    if (typeof runId !== 'string' || !runId
+      || typeof candidateSha !== 'string' || !SHA_RE.test(candidateSha)
+      || typeof receiptDigest !== 'string' || !HEX64_RE.test(receiptDigest)) {
+      refuse(CODES.BAD_REQUEST, 'delivery verification requires runId, candidateSha, and receiptDigest');
+    }
+    const wf = activeWorkflow(runId);
+    const receipt = receipts.load(runId);
+    if (!receipt || receipt.receiptDigest !== receiptDigest || receipt.candidate.sha !== candidateSha) {
+      refuse(CODES.EVIDENCE_DRIFT, `run ${runId} no longer matches its delivery receipt`, { runId });
+    }
+    const latestBody = gatherReceiptBody(wf, candidateSha);
+    if (evidenceDigestOf(latestBody) !== receipt.evidenceDigest) {
+      refuse(CODES.EVIDENCE_DRIFT, `run ${runId} material evidence changed before delivery`, { runId });
+    }
+    return {
+      receipt,
+      verification: {
+        active: true,
+        candidateBranch: receipt.candidate.branch,
+        candidateSha,
+        matchesReceipt: true,
+        checkedAt: new Date().toISOString(),
+      },
+    };
+  }
+
+  return { finalize, read, verify, verifyForDelivery, store: receipts };
 }
 
 module.exports = {

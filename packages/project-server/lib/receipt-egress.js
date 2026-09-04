@@ -8,15 +8,16 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { execFileSync } = require('child_process');
-const { writeAtomic, digest, exactKeys, safeRunId } = require('./authority-store');
+const { writeAtomic, writeExclusive, digest, exactKeys, safeRunId } = require('./authority-store');
 
 const STATUS_CONTEXT = 'factory-run-receipt';
 const DELIVERY_DIR = path.join('run-receipt', 'egress');
 const SHA_RE = /^[0-9a-f]{40}$/;
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const BRANCH_RE = /^(?!-)(?!.*\.\.)(?!\/)(?!.*\/$)[A-Za-z0-9._/-]+$/;
-const JOURNAL_STAGES = new Set(['prepared', 'branch_pushed', 'pr_open', 'delivered']);
+const JOURNAL_STAGES = new Set(['prepared', 'branch_pushed', 'pr_open', 'status_pending', 'delivered']);
 const JOURNAL_STAGE_RANK = new Map([...JOURNAL_STAGES].map((stage, index) => [stage, index]));
 const COMMAND_TIMEOUT_MS = 30_000;
 
@@ -80,19 +81,19 @@ function createGithubAdapter(run = (args) => execFileSync('gh', args, {
         permission: value.viewerPermission,
       };
     },
-    findOpenPr({ repo, head }) {
-      const rows = json(run(['pr', 'list', '--repo', repo, '--state', 'open', '--head', head,
-        '--json', 'number,url,state,headRefName,headRefOid,headRepository,baseRefName', '--limit', '2'])) || [];
-      if (rows.length > 1) refuse(CODES.PR_CONFLICT, `more than one open PR targets branch ${head}`);
+    findPr({ repo, head }) {
+      const rows = json(run(['pr', 'list', '--repo', repo, '--state', 'all', '--head', head,
+        '--json', 'number,url,state,headRefName,headRefOid,headRepository,baseRefName,baseRefOid', '--limit', '2'])) || [];
+      if (rows.length > 1) refuse(CODES.PR_CONFLICT, `more than one PR targets branch ${head}`);
       return rows[0] || null;
     },
     createPr({ repo, head, base, title, body }) {
       run(['pr', 'create', '--repo', repo, '--head', head, '--base', base, '--title', title, '--body', body]);
-      return this.findOpenPr({ repo, head });
+      return this.findPr({ repo, head });
     },
     readPr({ repo, number }) {
       return json(run(['pr', 'view', String(number), '--repo', repo,
-        '--json', 'number,url,state,headRefName,headRefOid,headRepository,baseRefName']));
+        '--json', 'number,url,state,headRefName,headRefOid,headRepository,baseRefName,baseRefOid']));
     },
     readStatuses({ repo, sha }) {
       // GitHub returns newest-first. One page is sufficient because this
@@ -114,7 +115,8 @@ function validatePr(pr, receipt) {
     || pr.headRefOid !== receipt.candidate.sha
     || !pr.headRepository
     || String(pr.headRepository.nameWithOwner).toLowerCase() !== receipt.identity.admittedRepo.toLowerCase()
-    || pr.baseRefName !== receipt.candidate.base.branch) {
+    || pr.baseRefName !== receipt.candidate.base.branch
+    || pr.baseRefOid !== receipt.candidate.base.sha) {
     refuse(CODES.PR_CONFLICT, 'the open PR does not match the receipt-bound branch, head, and base', {
       prNumber: pr && pr.number || null,
     });
@@ -136,29 +138,45 @@ function deliveryIntent(receipt, repo) {
 }
 
 function validateJournal(doc, intent) {
-  if (!doc || !exactKeys(doc, [...Object.keys(intent), 'intentDigest', 'revision', 'stage', 'pr', 'updatedAt'])
+  const stage = doc && JOURNAL_STAGE_RANK.get(doc.stage);
+  const needsPr = Number.isInteger(stage) && stage >= JOURNAL_STAGE_RANK.get('pr_open');
+  const needsNonce = Number.isInteger(stage) && stage >= JOURNAL_STAGE_RANK.get('status_pending');
+  if (!doc || !exactKeys(doc, [...Object.keys(intent), 'intentDigest', 'revision', 'stage', 'pr', 'statusNonce', 'updatedAt'])
     || doc.intentDigest !== digest(intent)
     || Object.keys(intent).some((key) => doc[key] !== intent[key])
-    || !Number.isInteger(doc.revision) || doc.revision < 1
+    || !Number.isInteger(doc.revision) || doc.revision !== stage + 1
     || !JOURNAL_STAGES.has(doc.stage)
     || typeof doc.updatedAt !== 'string'
+    || needsPr !== (doc.pr !== null)
+    || needsNonce !== (typeof doc.statusNonce === 'string' && /^[0-9a-f]{32}$/.test(doc.statusNonce))
     || (doc.pr !== null && (!exactKeys(doc.pr, ['number', 'url'])
-      || !Number.isInteger(doc.pr.number) || typeof doc.pr.url !== 'string'))) {
+      || !Number.isInteger(doc.pr.number)
+      || doc.pr.url.toLowerCase() !== `https://github.com/${intent.repo}/pull/${doc.pr.number}`.toLowerCase()))) {
     refuse(CODES.JOURNAL_CONFLICT, `run ${intent.runId} has a delivery journal for different evidence`);
   }
   return doc;
 }
 
-function createReceiptEgress({ config, receiptAuthority, git, github, now = () => new Date() } = {}) {
+function createReceiptEgress({
+  config, receiptAuthority, git, github, now = () => new Date(),
+  randomToken = () => crypto.randomBytes(16).toString('hex'),
+} = {}) {
   if (!config || !config.projectRoot || !receiptAuthority) throw new Error('createReceiptEgress requires config and receiptAuthority');
   const runGit = git || defaultGit(config.projectRoot);
   const gh = github || createGithubAdapter();
   const journalDir = path.join(config.statePath || path.join(config.projectRoot, '.build-studio'), DELIVERY_DIR);
 
-  function loadJournal(intent) {
-    if (fs.existsSync(journalDir) && fs.lstatSync(journalDir).isSymbolicLink()) {
-      refuse(CODES.JOURNAL_CONFLICT, 'delivery journal directory must not be a symbolic link');
+  function assertJournalPathSafe() {
+    const statePath = config.statePath || path.join(config.projectRoot, '.build-studio');
+    for (const candidate of [statePath, path.join(statePath, 'run-receipt'), journalDir]) {
+      if (fs.existsSync(candidate) && fs.lstatSync(candidate).isSymbolicLink()) {
+        refuse(CODES.JOURNAL_CONFLICT, `delivery journal path component must not be a symbolic link: ${candidate}`);
+      }
     }
+  }
+
+  function loadJournal(intent) {
+    assertJournalPathSafe();
     const file = path.join(journalDir, `${safeRunId(intent.runId)}.json`);
     if (!fs.existsSync(file)) return { file, doc: null };
     if (fs.lstatSync(file).isSymbolicLink()) {
@@ -172,18 +190,78 @@ function createReceiptEgress({ config, receiptAuthority, git, github, now = () =
     }
   }
 
-  function saveJournal(file, intent, stage, pr, prior = null) {
+  function saveJournal(file, intent, stage, pr, prior = null, statusNonce = null) {
     if (prior && JOURNAL_STAGE_RANK.get(prior.stage) >= JOURNAL_STAGE_RANK.get(stage)) return prior;
+    const targetRank = JOURNAL_STAGE_RANK.get(stage);
+    if (!Number.isInteger(targetRank)
+      || (!prior && stage !== 'prepared')
+      || (prior && JOURNAL_STAGE_RANK.get(prior.stage) + 1 !== targetRank)) {
+      refuse(CODES.JOURNAL_CONFLICT, `invalid delivery journal transition to ${stage}`);
+    }
+    assertJournalPathSafe();
+    if (prior) {
+      const current = loadJournal(intent).doc;
+      if (!current || digest(current) !== digest(prior)) {
+        refuse(CODES.JOURNAL_CONFLICT, 'delivery journal changed since it was read');
+      }
+    }
     const doc = {
       ...intent,
       intentDigest: digest(intent),
-      revision: prior ? prior.revision + 1 : 1,
+      revision: targetRank + 1,
       stage,
       pr: pr ? { number: pr.number, url: pr.url } : null,
+      statusNonce: statusNonce || (prior && prior.statusNonce) || null,
       updatedAt: now().toISOString(),
     };
-    writeAtomic(file, doc);
-    return doc;
+    validateJournal(doc, intent);
+    if (!prior) {
+      if (!writeExclusive(file, doc)) refuse(CODES.JOURNAL_CONFLICT, 'delivery journal appeared during initial publication');
+    } else {
+      writeAtomic(file, doc);
+    }
+    return loadJournal(intent).doc;
+  }
+
+  function remoteUrls(repo) {
+    const read = (args) => String(runGit(args)).split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+    const fetchUrls = read(['remote', 'get-url', '--all', 'origin']);
+    const pushUrls = read(['remote', 'get-url', '--push', '--all', 'origin']);
+    if (fetchUrls.length !== 1 || pushUrls.length !== 1
+      || !parseOriginRepo(fetchUrls[0]) || !parseOriginRepo(pushUrls[0])
+      || parseOriginRepo(fetchUrls[0]).toLowerCase() !== repo.toLowerCase()
+      || parseOriginRepo(pushUrls[0]).toLowerCase() !== repo.toLowerCase()) {
+      refuse(CODES.REPO_MISMATCH, 'origin must have exactly one fetch URL and one effective push URL for the admitted repository');
+    }
+    return { fetchUrl: fetchUrls[0], pushUrl: pushUrls[0] };
+  }
+
+  function verifyBase(receipt, fetchUrl) {
+    runGit(['fetch', '--quiet', fetchUrl,
+      `refs/heads/${receipt.candidate.base.branch}:refs/remotes/origin/${receipt.candidate.base.branch}`]);
+    const baseSha = runGit(['rev-parse', '--verify', `refs/remotes/origin/${receipt.candidate.base.branch}^{commit}`]).trim();
+    if (baseSha !== receipt.candidate.base.sha) {
+      refuse(CODES.BASE_DRIFT, 'remote default branch moved after the candidate evidence was frozen', {
+        expectedBaseSha: receipt.candidate.base.sha, actualBaseSha: baseSha,
+      });
+    }
+  }
+
+  function verifyAuthority(receipt) {
+    if (typeof receiptAuthority.verifyForDelivery !== 'function') {
+      refuse(CODES.CANDIDATE_DRIFT, 'receipt authority cannot re-verify active delivery evidence');
+    }
+    const checked = receiptAuthority.verifyForDelivery({
+      runId: receipt.runId,
+      candidateSha: receipt.candidate.sha,
+      receiptDigest: receipt.receiptDigest,
+    });
+    if (!checked || !checked.verification || checked.verification.active !== true
+      || checked.verification.matchesReceipt !== true
+      || checked.verification.candidateSha !== receipt.candidate.sha
+      || !checked.receipt || checked.receipt.receiptDigest !== receipt.receiptDigest) {
+      refuse(CODES.CANDIDATE_DRIFT, 'active run no longer matches the immutable delivery receipt');
+    }
   }
 
   function preflight(receipt, expectedSha) {
@@ -203,10 +281,7 @@ function createReceiptEgress({ config, receiptAuthority, git, github, now = () =
     if (receipt.identity.admittedRepo !== repo) {
       refuse(CODES.REPO_MISMATCH, 'deployment.repo does not match the admitted repository');
     }
-    const originRepo = parseOriginRepo(runGit(['remote', 'get-url', 'origin']));
-    if (!originRepo || originRepo.toLowerCase() !== repo.toLowerCase()) {
-      refuse(CODES.REPO_MISMATCH, 'origin does not point at the admitted deployment repository');
-    }
+    const urls = remoteUrls(repo);
     const tracked = runGit(['status', '--porcelain', '--untracked-files=no']);
     if (tracked.trim()) refuse(CODES.WORKTREE_DIRTY, 'tracked worktree changes exist at PR egress');
     const repoView = gh.inspectRepo(repo);
@@ -215,17 +290,12 @@ function createReceiptEgress({ config, receiptAuthority, git, github, now = () =
       || !['ADMIN', 'MAINTAIN', 'WRITE'].includes(repoView.permission)) {
       refuse(CODES.REPO_MISMATCH, 'GitHub repository identity, default branch, or write authority does not match the receipt');
     }
-    runGit(['fetch', '--quiet', 'origin',
-      `refs/heads/${receipt.candidate.base.branch}:refs/remotes/origin/${receipt.candidate.base.branch}`]);
-    const baseSha = runGit(['rev-parse', '--verify', `refs/remotes/origin/${receipt.candidate.base.branch}^{commit}`]).trim();
-    if (baseSha !== receipt.candidate.base.sha) {
-      refuse(CODES.BASE_DRIFT, 'remote default branch moved after the candidate evidence was frozen', {
-        expectedBaseSha: receipt.candidate.base.sha, actualBaseSha: baseSha,
-      });
-    }
+    verifyBase(receipt, urls.fetchUrl);
     const localSha = runGit(['rev-parse', '--verify', `${expectedSha}^{commit}`]).trim();
     if (localSha !== expectedSha) refuse(CODES.CANDIDATE_DRIFT, 'the exact candidate object is not available locally');
-    return repo;
+    const branchSha = runGit(['rev-parse', '--verify', `refs/heads/${receipt.candidate.branch}^{commit}`]).trim();
+    if (branchSha !== expectedSha) refuse(CODES.CANDIDATE_DRIFT, 'the local candidate branch moved after receipt finalization');
+    return { repo, ...urls };
   }
 
   function deliver(body = {}) {
@@ -240,24 +310,28 @@ function createReceiptEgress({ config, receiptAuthority, git, github, now = () =
     }
     const receipt = verified.receipt;
     return receiptAuthority.store.withLease(receipt.runId, () => {
-      const repo = preflight(receipt, body.expectedSha);
+      verifyAuthority(receipt);
+      const { repo, fetchUrl, pushUrl } = preflight(receipt, body.expectedSha);
       const intent = deliveryIntent(receipt, repo);
       const { file, doc: prior } = loadJournal(intent);
       let journal = prior || saveJournal(file, intent, 'prepared', null);
 
-      const remoteLine = runGit(['ls-remote', '--heads', 'origin', `refs/heads/${intent.candidateBranch}`]).trim();
+      const remoteLine = runGit(['ls-remote', '--heads', pushUrl, `refs/heads/${intent.candidateBranch}`]).trim();
       const remoteSha = remoteLine ? remoteLine.split(/\s+/)[0] : null;
       if (remoteSha && remoteSha !== intent.candidateSha) {
         refuse(CODES.REMOTE_BRANCH_CONFLICT, 'remote candidate branch already points at another commit', { remoteSha });
       }
       if (!remoteSha) {
-        runGit(['push', 'origin', `${intent.candidateSha}:refs/heads/${intent.candidateBranch}`]);
+        runGit(['push', '--porcelain', `--force-with-lease=refs/heads/${intent.candidateBranch}:`,
+          pushUrl, `${intent.candidateSha}:refs/heads/${intent.candidateBranch}`]);
       }
       journal = saveJournal(file, intent, 'branch_pushed', journal.pr, journal);
 
+      verifyAuthority(receipt);
+      verifyBase(receipt, fetchUrl);
       let pr = journal.pr
         ? gh.readPr({ repo, number: journal.pr.number })
-        : gh.findOpenPr({ repo, head: intent.candidateBranch });
+        : gh.findPr({ repo, head: intent.candidateBranch });
       if (pr) validatePr(pr, receipt);
       if (!pr) {
         pr = gh.createPr({
@@ -271,7 +345,14 @@ function createReceiptEgress({ config, receiptAuthority, git, github, now = () =
       validatePr(pr, receipt);
       journal = saveJournal(file, intent, 'pr_open', pr, journal);
 
-      const description = `receipt ${intent.receiptDigest.slice(0, 16)} · run ${intent.runId}`.slice(0, 140);
+      verifyAuthority(receipt);
+      verifyBase(receipt, fetchUrl);
+      pr = gh.readPr({ repo, number: pr.number });
+      validatePr(pr, receipt);
+      if (journal.stage === 'pr_open') {
+        journal = saveJournal(file, intent, 'status_pending', pr, journal, randomToken());
+      }
+      const description = `receipt ${intent.receiptDigest} nonce ${journal.statusNonce}`.slice(0, 140);
       const statuses = gh.readStatuses({ repo, sha: intent.candidateSha });
       const currentStatus = statuses.find((status) => status.context === STATUS_CONTEXT);
       const exactStatus = currentStatus
@@ -282,7 +363,16 @@ function createReceiptEgress({ config, receiptAuthority, git, github, now = () =
         refuse(CODES.STATUS_CONFLICT, 'the exact candidate already has a conflicting factory-run-receipt status');
       }
       if (!currentStatus) {
+        if (journal.stage === 'delivered') {
+          refuse(CODES.STATUS_CONFLICT, 'delivered journal exists but its exact receipt status is missing');
+        }
         gh.publishStatus({ repo, sha: intent.candidateSha, state: 'success', description, targetUrl: pr.url });
+      }
+      const confirmed = gh.readStatuses({ repo, sha: intent.candidateSha })
+        .find((status) => status.context === STATUS_CONTEXT);
+      if (!confirmed || confirmed.state !== 'success'
+        || confirmed.description !== description || confirmed.target_url !== pr.url) {
+        refuse(CODES.STATUS_CONFLICT, 'the exact receipt status could not be verified after publication');
       }
       journal = saveJournal(file, intent, 'delivered', pr, journal);
       return {

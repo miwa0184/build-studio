@@ -3,7 +3,7 @@
 > **Status: implemented locally 2026-09-04.** This slice turns a finalized
 > factory-run receipt into one candidate-branch push, one exact pull request
 > and one exact-SHA `factory-run-receipt` commit status. It contains no merge,
-> tag, deployment, force-push or branch-deletion capability.
+> tag, deployment, existing-ref update or branch-deletion capability.
 
 ## Authority boundary
 
@@ -14,8 +14,8 @@ server re-verifies all of the following:
 
 - the active admitted run can still finalize the same immutable receipt;
 - the local candidate branch still equals the frozen receipt SHA;
-- `deployment.repo`, the admitted repository and `origin` name the same
-  GitHub repository;
+- `deployment.repo`, the admitted repository and the single effective fetch
+  and push URLs for `origin` name the same GitHub repository;
 - GitHub reports that repository, its default branch and write permission;
 - the tracked worktree is clean;
 - a fresh fetch shows the remote default branch still equals the receipt base;
@@ -35,13 +35,19 @@ directory and binds run, repository, base, candidate and receipt digest.
 
 External effects are reconciled before they are attempted:
 
-1. If the remote candidate branch is absent, push the exact object with
-   `<sha>:refs/heads/<branch>`. If it exists at another SHA, refuse.
-2. Reuse an existing open PR only when its head branch, head SHA and base all
-   match. Otherwise create one and read it back from GitHub.
+1. If the remote candidate branch is absent, push the exact object with a
+   zero-old-value `--force-with-lease=<ref>:` compare-and-swap. Despite Git's
+   option name this can only create an absent ref; it cannot update any
+   existing branch. The verified URL is passed directly, so a separate
+   `remote.origin.pushurl` cannot redirect the write.
+2. Reuse a PR only when it is open and its repository, head branch, head SHA,
+   base branch and base SHA all match. A closed or merged PR for the branch is
+   a conflict and is never replaced.
 3. Publish `factory-run-receipt: success` only after that exact PR is proven.
-   The status description binds the receipt digest and the target URL is the
-   PR. An exact existing status is reused.
+   Before publication, a durable `status_pending` journal step creates a
+   random nonce. The status description binds the full receipt digest and that
+   nonce; its target URL is the PR. A retry may reuse only that journal-bound
+   status, and reads it back before recording delivery.
 
 A crash after any external effect is retry-safe: the next call observes the
 exact branch, PR or status and continues without creating a second PR or
@@ -52,7 +58,8 @@ changing authority. A conflicting retry refuses.
 - no default-branch push;
 - no merge, auto-merge or founder-acceptance claim;
 - no tag or deploy;
-- no force-push;
+- no update, forced or otherwise, of an existing remote branch; the sole
+  lease-shaped Git option is a create-only zero-old-value CAS;
 - no local or remote branch deletion;
 - no client-selected repository, branch, base, status context or PR number.
 
@@ -63,12 +70,14 @@ repository and falsified with a negative control.
 The first version uses GitHub's commit-status API rather than a Check Run. It
 therefore works with the existing authenticated `gh` credential when that
 credential has push/PR and commit-status write access; it does not require a
-new GitHub App. Every external command is bounded by a 30-second timeout.
+new GitHub App. This protects against accidental or stale status reuse, not a
+malicious repository writer who deliberately impersonates the same context;
+the receipt itself likewise claims integrity, not cryptographic authenticity.
+Every external command is bounded by a 30-second timeout.
 
 ## Verification contract
 
-Permanent tests cover pre-mutation drift refusal, exact refspec construction,
-status-after-PR ordering, partial-failure replay, conflicting remote branches
-and PRs, client-authority rejection, the HTTP body contract and admission-seam
-classification. Existing receipt, hold and parser tests remain unchanged and
-green.
+Permanent tests cover pre-mutation drift refusal, mismatched push URLs, active
+run and local-tip rebinding, a real bare-repository create race, base-SHA drift,
+closed-PR recovery, journal path/schema tampering, nonce-bound status recovery,
+client-authority rejection, the HTTP contract and admission-seam classification.

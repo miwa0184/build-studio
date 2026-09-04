@@ -9,6 +9,7 @@ const express = require('express');
 const http = require('http');
 const { createRunReceiptRouter } = require('./run-receipt');
 const { ReceiptEgressError } = require('../receipt-egress');
+const { RunReceiptError } = require('../run-receipt');
 
 const SHA = 'a'.repeat(40);
 
@@ -35,6 +36,21 @@ test('A1c.2 route accepts exact SHA only and returns the authority result', asyn
   assert.equal(good.status, 200);
   assert.deepEqual(good.body, { outcome: 'delivered', candidateSha: SHA });
   assert.deepEqual(calls, [{ expectedSha: SHA, repo: 'other/repo' }, { expectedSha: SHA }]);
+});
+
+test('A1c.2 route reports the installed capability for receipt-authority refusals', async (t) => {
+  const authority = { verify() {}, finalize() {}, store: { withLease: (_id, fn) => fn() } };
+  const egress = {
+    deliver() {
+      throw new RunReceiptError('RECEIPT_EVIDENCE_DRIFT', 'receipt changed');
+    },
+  };
+  const server = await mount(createRunReceiptRouter({}, {}, { authority, egress }));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const response = await request(server.address().port, { expectedSha: SHA });
+  assert.equal(response.status, 409);
+  assert.equal(response.body.code, 'RECEIPT_EVIDENCE_DRIFT');
+  assert.equal(response.body.egress, 'receipt_pr_delivery');
 });
 
 async function mount(router) {
