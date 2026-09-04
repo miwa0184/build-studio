@@ -16,6 +16,8 @@ server re-verifies all of the following:
 - the local candidate branch still equals the frozen receipt SHA;
 - `deployment.repo`, the admitted repository and the single effective fetch
   and push URLs for `origin` name the same GitHub repository;
+- neither effective URL matches another active `insteadOf` or `pushInsteadOf`
+  prefix, preventing Git from rewriting a URL a second time at transport;
 - GitHub reports that repository, its default branch and write permission;
 - the tracked worktree is clean;
 - a fresh fetch shows the remote default branch still equals the receipt base;
@@ -31,7 +33,11 @@ Typed delivery refusals identify the installed capability as
 
 Delivery is serialized by the receipt's per-run filesystem lease. Its recovery
 journal lives under the already ignored `.build-studio/run-receipt/egress/`
-directory and binds run, repository, base, candidate and receipt digest.
+directory and binds run, repository, base, candidate and receipt digest. The
+journal is an append-only chain of exclusive per-stage files. Each stage binds
+the digest of its predecessor; the complete chain is re-read immediately before
+every external mutation. Unknown entries, gaps, overwritten evidence and any
+symlink in the real receipt or journal authority path fail closed.
 
 External effects are reconciled before they are attempted:
 
@@ -46,8 +52,10 @@ External effects are reconciled before they are attempted:
 3. Publish `factory-run-receipt: success` only after that exact PR is proven.
    Before publication, a durable `status_pending` journal step creates a
    random nonce. The status description binds the full receipt digest and that
-   nonce; its target URL is the PR. A retry may reuse only that journal-bound
-   status, and reads it back before recording delivery.
+   nonce; its target URL is the PR. All commit-status pages are read before a
+   decision, so an older conflicting context cannot hide beyond page one. A
+   retry may reuse only that journal-bound status, and reads it back before
+   recording delivery.
 
 A crash after any external effect is retry-safe: the next call observes the
 exact branch, PR or status and continues without creating a second PR or
@@ -77,7 +85,10 @@ Every external command is bounded by a 30-second timeout.
 
 ## Verification contract
 
-Permanent tests cover pre-mutation drift refusal, mismatched push URLs, active
-run and local-tip rebinding, a real bare-repository create race, base-SHA drift,
-closed-PR recovery, journal path/schema tampering, nonce-bound status recovery,
-client-authority rejection, the HTTP contract and admission-seam classification.
+Permanent tests cover pre-mutation drift refusal, mismatched push URLs, a real
+two-stage Git URL rewrite, active-run and local-tip rebinding, a real
+bare-repository create race, base-SHA drift, closed-PR recovery, append-only
+journal tampering before status publication, direct/dangling/intermediate
+authority symlinks against the real receipt store, a conflicting receipt status
+on page two, nonce-bound status recovery, client-authority rejection, the HTTP
+contract and admission-seam classification.

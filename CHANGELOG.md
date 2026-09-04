@@ -32,9 +32,12 @@ that move underneath you without your having edited anything.
   exact remote candidate ref with an expected-absent compare-and-swap, creates
   or reuses only the matching open same-repository PR, binds its base SHA, and
   then publishes the `factory-run-receipt` success status on that exact SHA.
-  A durable nonce-bearing recovery journal makes retries after ref creation,
-  PR creation or status publication idempotent. Base, candidate, repository,
-  PR or journal drift refuses. This capability cannot merge, tag, deploy,
+  A durable nonce-bearing, append-only and digest-chained recovery journal is
+  re-read immediately before every external mutation, making retries after ref
+  creation, PR creation or status publication idempotent. Git URL rewrite
+  chains, authority-path symlinks, base/candidate/repository/PR/journal drift,
+  and conflicting statuses on any pagination page refuse. This capability
+  cannot merge, tag, deploy,
   update an existing branch or delete one. See
   `docs/plans/a1c2-receipt-backed-pr-egress.md`.
 

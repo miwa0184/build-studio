@@ -10,6 +10,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { digest } = require('./authority-store');
+const { createRunReceiptStore } = require('./run-receipt');
 const { createReceiptEgress } = require('./receipt-egress');
 
 const SHA = 'a'.repeat(40);
@@ -53,6 +54,7 @@ function fixture(t) {
   };
   const git = (args) => {
     calls.push(['git', ...args]);
+    if (args[0] === 'config') return '';
     if (args[0] === 'status') return '';
     if (args[0] === 'remote' && args.includes('--push')) return remote.pushUrl;
     if (args[0] === 'remote') return remote.fetchUrl;
@@ -168,10 +170,10 @@ test('repair — malformed stage invariants and parent symlinks make the journal
     candidateSha: SHA, receiptDigest: RECEIPT_DIGEST,
   };
   const dir = path.join(malformed.config.statePath, 'run-receipt', 'egress');
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, `${RUN_ID}.json`), JSON.stringify({
+  fs.mkdirSync(path.join(dir, RUN_ID), { recursive: true });
+  fs.writeFileSync(path.join(dir, RUN_ID, '1-prepared.json'), JSON.stringify({
     ...intent, intentDigest: digest(intent), revision: 1, stage: 'delivered', pr: null,
-    statusNonce: null, updatedAt: new Date().toISOString(),
+    statusNonce: null, priorDigest: null, updatedAt: new Date().toISOString(),
   }));
   assert.throws(() => service(malformed).deliver({ expectedSha: SHA }), (error) => error.code === 'EGRESS_JOURNAL_CONFLICT');
   assert.equal(mutated(malformed), false);
@@ -196,6 +198,96 @@ test('repair — an exact-looking pre-existing status is not accepted without a 
   }];
   assert.throws(() => service(fx).deliver({ expectedSha: SHA }), (error) => error.code === 'EGRESS_STATUS_CONFLICT');
   assert.equal(fx.calls.some((call) => call[0] === 'status'), false);
+});
+
+test('repair — a two-stage insteadOf chain is refused before Git can rewrite the verified URL again', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'receipt-egress-rewrite-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const work = path.join(root, 'work');
+  const attacker = path.join(root, 'attacker.git');
+  fs.mkdirSync(work);
+  execFileSync('git', ['init', '-q'], { cwd: work });
+  execFileSync('git', ['init', '--bare', '-q', attacker], { cwd: root });
+  execFileSync('git', ['config', 'url.https://github.com/owner/.insteadOf', 'short:'], { cwd: work });
+  execFileSync('git', ['config', `url.file://${attacker}/.insteadOf`, 'https://github.com/owner/'], { cwd: work });
+  execFileSync('git', ['remote', 'add', 'origin', 'short:project'], { cwd: work });
+
+  const fx = fixture(t);
+  fx.config.projectRoot = work;
+  fx.config.statePath = path.join(work, '.build-studio');
+  const before = execFileSync('git', [`--git-dir=${attacker}`, 'for-each-ref', '--format=%(objectname) %(refname)'], {
+    cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+  const egress = createReceiptEgress({
+    config: fx.config, receiptAuthority: fx.authority, github: fx.github,
+  });
+  assert.throws(() => egress.deliver({ expectedSha: SHA }), (error) => error.code === 'EGRESS_REPO_MISMATCH');
+  const after = execFileSync('git', [`--git-dir=${attacker}`, 'for-each-ref', '--format=%(objectname) %(refname)'], {
+    cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+  assert.equal(after, before);
+  assert.equal(mutated(fx), false);
+});
+
+test('repair — a changed pending journal is re-read immediately before status publication', (t) => {
+  const fx = fixture(t);
+  fx.remote.branchSha = SHA;
+  fx.remote.pr = fx.pr();
+  let attacked = false;
+  fx.github.readStatuses = () => {
+    if (!attacked) {
+      attacked = true;
+      const file = path.join(fx.config.statePath, 'run-receipt', 'egress', RUN_ID, '4-status_pending.json');
+      const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+      doc.statusNonce = 'f'.repeat(32);
+      fs.writeFileSync(file, JSON.stringify(doc));
+    }
+    return [];
+  };
+  assert.throws(() => service(fx).deliver({ expectedSha: SHA }), (error) => error.code === 'EGRESS_JOURNAL_CONFLICT');
+  assert.equal(fx.calls.some((call) => call[0] === 'status'), false);
+});
+
+test('repair — GitHub status pagination includes a conflicting context on page two', () => {
+  const { createGithubAdapter } = require('./receipt-egress');
+  const pageOne = Array.from({ length: 100 }, (_, index) => ({ context: `other-${index}` }));
+  const conflict = { context: 'factory-run-receipt', state: 'failure' };
+  const calls = [];
+  const adapter = createGithubAdapter((args) => {
+    calls.push(args);
+    return JSON.stringify([pageOne, [conflict]]);
+  });
+  const statuses = adapter.readStatuses({ repo: 'owner/project', sha: SHA });
+  assert.equal(statuses.length, 101);
+  assert.deepEqual(statuses.at(-1), conflict);
+  assert.deepEqual(calls[0].slice(-2), ['--paginate', '--slurp']);
+});
+
+test('repair — the real receipt store refuses direct, dangling, and intermediate authority symlinks', (t) => {
+  const cases = ['direct', 'dangling', 'intermediate'];
+  for (const scenario of cases) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `receipt-store-${scenario}-`));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), `receipt-store-outside-${scenario}-`));
+    t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+    fs.writeFileSync(path.join(outside, 'sentinel'), 'unchanged');
+    let statePath = path.join(root, '.build-studio');
+    if (scenario === 'direct') {
+      fs.mkdirSync(statePath);
+      fs.symlinkSync(outside, path.join(statePath, 'run-receipt'));
+    } else if (scenario === 'dangling') {
+      fs.mkdirSync(statePath);
+      fs.symlinkSync(path.join(root, 'missing-target'), path.join(statePath, 'run-receipt'));
+    } else {
+      const linked = path.join(root, 'linked-project');
+      fs.symlinkSync(outside, linked);
+      statePath = path.join(linked, '.build-studio');
+    }
+    const store = createRunReceiptStore({ statePath });
+    assert.throws(() => store.withLease('symlink-run', () => 'unsafe'), (error) => error.code === 'RECEIPT_STORAGE_UNPROTECTED');
+    assert.equal(fs.readFileSync(path.join(outside, 'sentinel'), 'utf8'), 'unchanged');
+    assert.deepEqual(fs.readdirSync(outside).sort(), ['sentinel']);
+  }
 });
 
 test('repair — the create-only push cannot fast-forward a branch created in the race window', (t) => {

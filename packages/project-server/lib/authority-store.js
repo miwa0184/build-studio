@@ -47,6 +47,38 @@ function exactKeys(value, keys) {
     && Object.keys(value).sort().join('\0') === [...keys].sort().join('\0');
 }
 
+/** Refuse symlinks in every existing component from base through target. */
+function assertPathComponentsNoSymlink(base, target) {
+  const root = path.resolve(base);
+  const leaf = path.resolve(target);
+  const relative = path.relative(root, leaf);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    const error = new Error(`authority path escapes its base: ${leaf}`);
+    error.code = 'AUTHORITY_PATH_ESCAPE';
+    throw error;
+  }
+  const candidates = [root];
+  let current = root;
+  for (const part of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    candidates.push(current);
+  }
+  for (const candidate of candidates) {
+    let stat;
+    try {
+      stat = fs.lstatSync(candidate);
+    } catch (error) {
+      if (error && error.code === 'ENOENT') break;
+      throw error;
+    }
+    if (stat.isSymbolicLink()) {
+      const error = new Error(`authority path component is a symbolic link: ${candidate}`);
+      error.code = 'AUTHORITY_PATH_SYMLINK';
+      throw error;
+    }
+  }
+}
+
 function syncDirectory(directory) {
   let fd;
   try {
@@ -245,6 +277,7 @@ module.exports = {
   digest,
   isObject,
   exactKeys,
+  assertPathComponentsNoSymlink,
   syncDirectory,
   writeAtomic,
   writeExclusive,

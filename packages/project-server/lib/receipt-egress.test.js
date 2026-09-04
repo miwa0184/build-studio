@@ -37,6 +37,7 @@ function fixture(t, overrides = {}) {
   };
   const git = (args) => {
     calls.push(['git', ...args]);
+    if (args[0] === 'config') return '';
     if (args[0] === 'status') return '';
     if (args[0] === 'remote') return 'git@github.com:owner/project.git';
     if (args[0] === 'fetch') return '';
@@ -82,6 +83,7 @@ test('A1c.2 refuses before remote mutation when receipt candidate, local branch,
   const baseDrift = fixture(t);
   baseDrift.git = (args) => {
     baseDrift.calls.push(['git', ...args]);
+    if (args[0] === 'config') return '';
     if (args[0] === 'status') return '';
     if (args[0] === 'remote') return 'https://github.com/owner/project.git';
     if (args[0] === 'fetch') return '';
@@ -179,7 +181,7 @@ test('A1c.2 refuses a tampered delivery journal instead of trusting or repairing
   const firstGithub = { ...fx.github, publishStatus: () => { throw new Error('stop after PR'); } };
   assert.throws(() => createWith(fx, firstGithub).deliver({ expectedSha: SHA }), /stop after PR/);
   const journalDir = path.join(fx.config.statePath, 'run-receipt', 'egress');
-  const journalFile = path.join(journalDir, `${RUN_ID}.json`);
+  const journalFile = path.join(journalDir, RUN_ID, '4-status_pending.json');
   const doc = JSON.parse(fs.readFileSync(journalFile, 'utf8'));
   doc.candidateSha = 'd'.repeat(40);
   fs.writeFileSync(journalFile, JSON.stringify(doc));
@@ -196,7 +198,7 @@ test('A1c.2 GitHub adapter uses only repo reads, PR create/read, and exact commi
     if (args[0] === 'pr' && args[1] === 'list') return '[]';
     if (args[0] === 'pr' && args[1] === 'create') return 'https://github.com/owner/project/pull/17';
     if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ number: 17, url: 'https://github.com/owner/project/pull/17', state: 'OPEN', headRefName: 'factory/candidate-001', headRefOid: SHA, headRepository: { nameWithOwner: 'owner/project' }, baseRefName: 'main', baseRefOid: BASE });
-    if (args[0] === 'api' && args.includes('--method') && args.includes('GET')) return '[]';
+    if (args[0] === 'api' && args.includes('--method') && args.includes('GET')) return '[[]]';
     if (args[0] === 'api') return '{}';
     throw new Error(`unexpected gh call: ${args.join(' ')}`);
   };
@@ -210,6 +212,7 @@ test('A1c.2 GitHub adapter uses only repo reads, PR create/read, and exact commi
   const flat = calls.map((args) => args.join(' ')).join('\n');
   assert.doesNotMatch(flat, /\bmerge\b|--delete|\/git\/refs/);
   assert.match(flat, new RegExp(`repos/owner/project/statuses/${SHA}`));
+  assert.match(flat, /--paginate --slurp/);
 });
 
 function createWith(fx, github) {
