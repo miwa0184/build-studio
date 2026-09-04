@@ -95,7 +95,8 @@ agent_defaults:
 # tmux agent. Codex is similar (bypass flag for auto/bypassPermissions). Only
 # claude fully honors restrictive permission_mode values (dontAsk, plan, …).
 # These can also be set per project from the hub (Project → Agents tab); hub
-# writes go to .build-studio/local.json, which overrides this file.
+# writes the supported machine-local category to .build-studio/local.json.
+# Project policy such as builder_strategy and support remains tracked here.
 # Which CLIs are offered at all is installation-wide: by default every CLI
 # whose binary is detected is enabled; pin explicitly via
 # ~/.build-studio/config.json → { "enabled_clis": ["claude", "opencode"] }.

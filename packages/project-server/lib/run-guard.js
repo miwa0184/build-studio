@@ -5,21 +5,32 @@
  *
  * Schema 2 deliberately puts the run's identity, non-renewable counters,
  * terminal cause and the single bounded continuation envelope in one file.
+ * The immutable Egress Hold identity is a separately digested write-once file
+ * in the same ignored authority directory, registered monotonically by the
+ * aggregate before publication so absence or deletion fails closed.
  * The admission registry is only the root-registration cross-link; it is not a
  * second lineage store. Schema 1 remains readable for historical rendering and
  * cancellation, but no authority mutation may upgrade or rewrite it.
  */
 
-const crypto = require('crypto');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const { REASON_CODES } = require('./technical-stop');
+const {
+  safeRunId,
+  digest,
+  isObject,
+  exactKeys,
+  writeAtomic,
+  writeExclusive,
+  createLeaseStore,
+} = require('./authority-store');
 
 const LEGACY_SCHEMA_VERSION = 1;
 const SCHEMA_VERSION = 2;
 const GUARD_DIR = 'run-guard';
-const LOCK_PROTOCOL_VERSION = 1;
+const EGRESS_HOLD_SUFFIX = '.egress-hold.json';
+const EGRESS_HOLD_COUNTER = 'egress_hold_authority';
 const REPAIR_STATES = Object.freeze({ ACTIVE_ROOT: 'ACTIVE_ROOT', STOPPED: 'STOPPED' });
 const WORKFLOW_TYPES = new Set(['review', 'execution', 'kickoff', 'onboarding', 'bugfix']);
 const TECHNICAL_REASON_CODES = new Set(Object.values(REASON_CODES));
@@ -85,35 +96,6 @@ class RunGuardNamedTransitionError extends RunGuardError {
   constructor(message, details = {}) {
     super('RunGuardNamedTransitionError', 'RUN_GUARD_NAMED_TRANSITION_REQUIRED', message, details);
   }
-}
-
-function safeRunId(runId) {
-  const raw = String(runId || 'unknown-run');
-  const cleaned = raw.replace(/[^A-Za-z0-9._-]/g, '_');
-  if (cleaned === raw && raw.length <= 100) return cleaned;
-  return `${cleaned.slice(0, 60)}-${crypto.createHash('sha1').update(raw).digest('hex').slice(0, 12)}`;
-}
-
-function canonicalJson(value) {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  if (value && typeof value === 'object') {
-    const keys = Object.keys(value).sort();
-    return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
-  }
-  return JSON.stringify(value);
-}
-
-function digest(value) {
-  return crypto.createHash('sha256').update(canonicalJson(value)).digest('hex');
-}
-
-function isObject(value) {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-}
-
-function exactKeys(value, keys) {
-  return isObject(value)
-    && Object.keys(value).sort().join('\0') === [...keys].sort().join('\0');
 }
 
 function assertExact(value, keys, label) {
@@ -454,6 +436,33 @@ function technicalCause(runId, stop) {
   };
 }
 
+function validateEgressHoldAuthority(hold, runId) {
+  assertExact(hold, [
+    'schemaVersion', 'runId', 'candidateBranch', 'candidateSha',
+    'defaultBranch', 'createdAt', 'authorityDigest',
+  ], 'egress hold authority');
+  if (hold.schemaVersion !== 1 || hold.runId !== runId) {
+    throw new Error('egress hold authority identity is invalid');
+  }
+  for (const key of ['candidateBranch', 'defaultBranch']) {
+    assertString(hold[key], `egress hold authority.${key}`);
+    if (!/^(?!.*\.\.)[A-Za-z0-9._/-]+$/.test(hold[key])) {
+      throw new Error(`egress hold authority.${key} is not a safe ref`);
+    }
+  }
+  assertString(hold.candidateSha, 'egress hold authority.candidateSha');
+  if (!/^[a-f0-9]{40}$/.test(hold.candidateSha)) {
+    throw new Error('egress hold authority.candidateSha is invalid');
+  }
+  assertString(hold.createdAt, 'egress hold authority.createdAt');
+  const body = { ...hold };
+  delete body.authorityDigest;
+  if (!/^[a-f0-9]{64}$/.test(hold.authorityDigest)
+    || hold.authorityDigest !== digest(body)) {
+    throw new Error('egress hold authority digest does not match');
+  }
+}
+
 function createRunGuard({
   statePath,
   isRegistered,
@@ -471,37 +480,17 @@ function createRunGuard({
     return path.join(dir, `${safeRunId(runId)}.json`);
   }
 
-  function lockFor(runId) {
-    return path.join(locksDir, `${safeRunId(runId)}.lock`);
+  function egressHoldFileFor(runId) {
+    return path.join(dir, `${safeRunId(runId)}${EGRESS_HOLD_SUFFIX}`);
   }
 
-  function syncDirectory(directory) {
-    let fd;
-    try {
-      fd = fs.openSync(directory, 'r');
-      fs.fsyncSync(fd);
-    } finally {
-      if (fd !== undefined) fs.closeSync(fd);
-    }
-  }
-
-  function writeAtomic(file, value, { exclusive = false } = {}) {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    const tmp = `${file}.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`;
-    let fd;
-    try {
-      fd = fs.openSync(tmp, exclusive ? 'wx' : 'w', 0o600);
-      fs.writeFileSync(fd, JSON.stringify(value, null, 2));
-      fs.fsyncSync(fd);
-      fs.closeSync(fd);
-      fd = undefined;
-      fs.renameSync(tmp, file);
-      syncDirectory(path.dirname(file));
-    } finally {
-      if (fd !== undefined) fs.closeSync(fd);
-      try { fs.unlinkSync(tmp); } catch (_) {}
-    }
-  }
+  const leases = createLeaseStore({
+    locksDir,
+    lockTimeoutMs,
+    lockPollMs,
+    busyError: (runId) => new RunGuardBusyError(`run aggregate for ${runId} is busy`, { runId }),
+  });
+  const { lockFor, acquire, release } = leases;
 
   function corrupt(runId, file, error) {
     if (error instanceof RunGuardError) throw error;
@@ -509,6 +498,20 @@ function createRunGuard({
       `run guard for ${runId} cannot be verified: ${error.message}`,
       { runId, file, cause: error },
     );
+  }
+
+  function readEgressHoldFile(runId) {
+    const id = String(runId);
+    const file = egressHoldFileFor(id);
+    if (!fs.existsSync(file)) return null;
+    let hold;
+    try {
+      hold = JSON.parse(fs.readFileSync(file, 'utf8'));
+      validateEgressHoldAuthority(hold, id);
+    } catch (error) {
+      corrupt(id, file, error);
+    }
+    return clone(hold);
   }
 
   function crossCheckRegistry(doc, runId) {
@@ -595,6 +598,78 @@ function createRunGuard({
     return clone(doc);
   }
 
+  function loadEgressHold(runId) {
+    const id = String(runId);
+    // A hold is authority only for a readable, registered run aggregate.
+    const run = readDoc(id);
+    const marker = Number(run.counters && run.counters[EGRESS_HOLD_COUNTER] || 0);
+    const hold = readEgressHoldFile(id);
+    if (marker === 0 && hold === null) return null;
+    if (marker !== 1 || hold === null) {
+      corrupt(id, egressHoldFileFor(id), new Error(
+        marker === 1
+          ? 'egress hold authority is registered but missing'
+          : 'egress hold authority file and aggregate marker disagree',
+      ));
+    }
+    return hold;
+  }
+
+  function captureEgressHold(runId, hold) {
+    const id = String(runId);
+    const lease = acquire(id);
+    try {
+      const run = readDoc(id);
+      if (run.schemaVersion === LEGACY_SCHEMA_VERSION) {
+        throw new RunGuardLegacyReadOnlyError(`run ${id} uses legacy schema 1 and is read-only`, { runId: id });
+      }
+      if (!isObject(hold)) throw new RunGuardNamedTransitionError('a complete egress hold authority is required');
+      const body = {
+        schemaVersion: 1,
+        runId: id,
+        candidateBranch: hold.candidateBranch,
+        candidateSha: hold.candidateSha,
+        defaultBranch: hold.defaultBranch,
+        createdAt: new Date().toISOString(),
+      };
+      const proposed = { ...body, authorityDigest: digest(body) };
+      try {
+        validateEgressHoldAuthority(proposed, id);
+      } catch (error) {
+        throw new RunGuardNamedTransitionError(`invalid egress hold authority: ${error.message}`, { runId: id });
+      }
+      const marker = Number(run.counters && run.counters[EGRESS_HOLD_COUNTER] || 0);
+      const existing = readEgressHoldFile(id);
+      if (marker !== 0 || existing) {
+        if (marker !== 1 || !existing) {
+          corrupt(id, egressHoldFileFor(id), new Error('egress hold authority file and aggregate marker disagree'));
+        }
+        const sameIdentity = existing.candidateBranch === proposed.candidateBranch
+          && existing.candidateSha === proposed.candidateSha
+          && existing.defaultBranch === proposed.defaultBranch;
+        if (sameIdentity) return existing;
+        throw new RunGuardConflictError(`egress hold authority for ${id} is already frozen`, { runId: id });
+      }
+      // Register that this run owns a durable freeze before publishing the
+      // separate immutable document. A crash or deletion between these writes
+      // leaves marker=1 + missing file, which loadEgressHold refuses closed.
+      run.counters[EGRESS_HOLD_COUNTER] = 1;
+      writeTransition(run);
+      const file = egressHoldFileFor(id);
+      if (!writeExclusive(file, proposed)) {
+        const raced = readEgressHoldFile(id);
+        if (raced
+          && raced.candidateBranch === proposed.candidateBranch
+          && raced.candidateSha === proposed.candidateSha
+          && raced.defaultBranch === proposed.defaultBranch) return raced;
+        throw new RunGuardConflictError(`egress hold authority for ${id} was frozen concurrently`, { runId: id });
+      }
+      return clone(proposed);
+    } finally {
+      release(lease);
+    }
+  }
+
   function rootDoc(runId, identity) {
     const id = String(runId);
     validateIdentity(identity, id);
@@ -648,115 +723,6 @@ function createRunGuard({
       release(lease);
     }
     return clone(doc);
-  }
-
-  function ownerFile(lock) {
-    return path.join(lock, 'owner.json');
-  }
-
-  function readOwner(lock) {
-    try {
-      const owner = JSON.parse(fs.readFileSync(ownerFile(lock), 'utf8'));
-      if (!exactKeys(owner, ['protocolVersion', 'token', 'pid', 'hostname', 'runId', 'createdAt'])
-        || owner.protocolVersion !== LOCK_PROTOCOL_VERSION
-        || typeof owner.token !== 'string' || owner.token.length === 0
-        || !Number.isInteger(owner.pid) || owner.pid <= 0
-        || typeof owner.hostname !== 'string' || owner.hostname.length === 0
-        || typeof owner.runId !== 'string' || owner.runId.length === 0
-        || typeof owner.createdAt !== 'string' || owner.createdAt.length === 0) return null;
-      return owner;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  function processIsDead(owner) {
-    if (!owner || owner.hostname !== os.hostname()) return false;
-    try {
-      process.kill(owner.pid, 0);
-      return false;
-    } catch (error) {
-      return error && error.code === 'ESRCH';
-    }
-  }
-
-  function reclaimStale(lock, owner) {
-    if (!processIsDead(owner)) return false;
-    // The token-specific claim is intentionally permanent. Without it, a
-    // reclaimer that paused after observing dead owner A could wake after A
-    // had already been removed and move a new live owner B out of the lock.
-    // Only the process that creates this claim may ever move A's lock.
-    const claim = `${lock}.reclaimed-${owner.token}`;
-    try {
-      fs.mkdirSync(claim);
-    } catch (_) {
-      return false;
-    }
-    const current = readOwner(lock);
-    if (!current || current.token !== owner.token || !processIsDead(current)) return false;
-    const tombstone = `${lock}.stale-${owner.token}-${crypto.randomUUID()}`;
-    try {
-      fs.renameSync(lock, tombstone);
-    } catch (_) {
-      return false;
-    }
-    const movedOwner = readOwner(tombstone);
-    if (!movedOwner || movedOwner.token !== owner.token) {
-      try { fs.renameSync(tombstone, lock); } catch (_) {}
-      return false;
-    }
-    fs.rmSync(tombstone, { recursive: true, force: true });
-    return true;
-  }
-
-  function tryAcquire(runId) {
-    fs.mkdirSync(locksDir, { recursive: true });
-    const lock = lockFor(runId);
-    const token = crypto.randomUUID();
-    const candidate = `${lock}.candidate-${token}`;
-    fs.mkdirSync(candidate, { recursive: false });
-    const owner = {
-      protocolVersion: LOCK_PROTOCOL_VERSION,
-      token,
-      pid: process.pid,
-      hostname: os.hostname(),
-      runId: String(runId),
-      createdAt: new Date().toISOString(),
-    };
-    writeAtomic(ownerFile(candidate), owner);
-    try {
-      fs.renameSync(candidate, lock);
-      syncDirectory(locksDir);
-      return { lock, owner };
-    } catch (error) {
-      fs.rmSync(candidate, { recursive: true, force: true });
-      if (error.code !== 'EEXIST' && error.code !== 'ENOTEMPTY') throw error;
-      const existing = readOwner(lock);
-      if (existing && existing.runId === String(runId) && reclaimStale(lock, existing)) return tryAcquire(runId);
-      return null;
-    }
-  }
-
-  function acquire(runId) {
-    const deadline = Date.now() + lockTimeoutMs;
-    do {
-      const lease = tryAcquire(runId);
-      if (lease) return lease;
-      if (Date.now() >= deadline) break;
-      const until = Date.now() + lockPollMs;
-      while (Date.now() < until) { /* bounded synchronous lock poll */ }
-    } while (true);
-    throw new RunGuardBusyError(`run aggregate for ${runId} is busy`, { runId: String(runId) });
-  }
-
-  function release(lease) {
-    const current = readOwner(lease.lock);
-    if (!current || current.token !== lease.owner.token || current.runId !== lease.owner.runId) return;
-    const released = `${lease.lock}.release-${lease.owner.token}`;
-    try {
-      fs.renameSync(lease.lock, released);
-      fs.rmSync(released, { recursive: true, force: true });
-    } catch (_) {}
   }
 
   function writeTransition(doc) {
@@ -925,6 +891,7 @@ function createRunGuard({
 
   return {
     fileFor,
+    egressHoldFileFor,
     lockFor,
     register,
     load: readDoc,
@@ -940,6 +907,8 @@ function createRunGuard({
     setAcceptanceGaps,
     setIncidents,
     captureTechnicalStop,
+    loadEgressHold,
+    captureEgressHold,
   };
 }
 
@@ -957,5 +926,6 @@ module.exports = {
   LEGACY_SCHEMA_VERSION,
   SCHEMA_VERSION,
   GUARD_DIR,
+  EGRESS_HOLD_SUFFIX,
   REPAIR_STATES,
 };
