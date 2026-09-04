@@ -21,7 +21,7 @@ that move underneath you without your having edited anything.
 
 ---
 
-## 2026-09-04 — The factory-run receipt
+## 2026-09-04 — Effective configuration contract and factory-run receipt
 
 ### Added
 
@@ -58,6 +58,12 @@ that move underneath you without your having edited anything.
 
 ### Changed
 
+- **The project server now refuses to start when a valid
+  `.build-studio/local.json` claims unsupported top-level settings.** Only
+  `cli`, `agent_defaults` and `step_groups` belong in this ignored
+  machine-local file; move `builder_strategy`, `support` and other project
+  policy into tracked `config.yaml`. Writes through the local-settings helper
+  are refused before touching disk under the same contract.
 - **Parking at the Egress Hold now records the candidate sha it froze**
   (`steps.merge_to_main.candidateSha`). That branch, sha and default branch are
   write-once once validly frozen: re-entering the hold cannot silently rebind
@@ -86,6 +92,9 @@ that move underneath you without your having edited anything.
 
 ### Fixed
 
+- **The duplicated `final_review` default is now one object.** Its `effort`
+  and `wrapup_past_cap` defaults coexist, including when YAML overrides only
+  one of them, and receipts record the effective default effort.
 - **Ambiguous review counts can no longer authorize a factory-run receipt.**
   A count field is accepted only when its complete value is one integer;
   alternatives and hedges such as `0 or 1`, `0/1`, `0 (template)` or trailing
@@ -125,21 +134,24 @@ that move underneath you without your having edited anything.
 ### Upgrade steps
 
 **In Build Studio** — re-inject the project server into the Electron app
-(`node inject-resources.js --sync-only`) and restart it. No hub change.
+(`node inject-resources.js --sync-only`) and restart it. This command also
+syncs the updated template; no separate Hub build is required for this change.
 
-**In each managed project** — normally nothing to do. New onboardings carry the
-ignore rule, and older projects are protected through Git's repository-local
-exclude before the first receipt is written. If finalization returns
+**In each managed project** — inspect `.build-studio/local.json` before updating.
+Move any top-level key other than `cli`, `agent_defaults` or `step_groups` into
+tracked `config.yaml` (or remove it if it was only an inert experiment). New
+onboardings carry the receipt ignore rule, and older projects are protected
+through Git's repository-local exclude before the first receipt is written. If finalization returns
 `RECEIPT_STORAGE_UNPROTECTED`, remove any tracked receipt path from the index
 and resolve any explicit ignore negation before retrying; Build Studio does not
 silently rewrite those repository decisions.
 
 ### Known issues
 
-- `.build-studio/local.json` keys the resolver does not read are still
-  silently ignored. The receipt records the resolver's effective value,
-  which is correct today; schema hardening of local keys and the duplicated
-  `final_review` default are a separate successor slice.
+- The local allowlist is top-level. Nested values continue through their
+  existing category-specific normalization, and unreadable or malformed
+  `local.json` still falls back to tracked YAML so a damaged optional UI
+  preference file cannot prevent the project server from starting.
 
 ### Notes for forks
 

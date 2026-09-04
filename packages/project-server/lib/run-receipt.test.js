@@ -424,16 +424,20 @@ test('receipt R5 — unresolved blocking review evidence refuses', (t) => {
 
 // ---------- 6. effective configuration ----------
 
-test('receipt R6 — the projection records resolver output, not values merely present in local.json', (t) => {
+test('receipt R6 — the projection records effective supported local overrides', (t) => {
   const fx = makeFixture(t);
-  // The resolver ignores builder_strategy in local.json but honours cli. The
-  // receipt must say what the server actually runs with.
-  write(path.join(fx.root, '.build-studio', 'local.json'), JSON.stringify({ builder_strategy: 'goal', cli: { default: 'codex' } }));
+  // Policy such as builder_strategy is tracked in config.yaml; local.json may
+  // only contribute the machine-local categories the resolver consumes.
+  write(path.join(fx.root, '.build-studio', 'local.json'), JSON.stringify({
+    cli: { default: 'codex' },
+    agent_defaults: { effort: 'high' },
+  }));
   const config = loadConfig(fx.root);
   const authority = createRunReceiptAuthority({ config, state: fx.state, qaGate: qaServerSuiteGateVerdict });
   const { receipt } = authority.finalize();
   assert.equal(receipt.config.builderStrategy, 'role');
   assert.equal(receipt.config.cli.default, 'codex');
+  assert.equal(receipt.config.review.finalReviewEffort, 'high');
   assert.equal(receipt.config.schemaVersion, 1);
   assert.match(receipt.configDigest, /^[0-9a-f]{64}$/);
   const executed = Object.fromEntries(receipt.config.executedSteps.map((s) => [s.step, s]));

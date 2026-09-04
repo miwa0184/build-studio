@@ -235,10 +235,11 @@ the explicit repository-local `info/exclude` migration described above.
 - Projection of the receipt onto `workflow-state.json`. The receipt is read
   from its own store; the workflow file is not made to carry a claim about
   it.
-- Hardening of `.build-studio/local.json`: keys the resolver ignores stay
-  silently ignored. The receipt records what the resolver returned, which is
-  the honest value today, and the local-key schema is a successor slice
-  together with the duplicated `final_review` default.
+- Nested schema hardening within the supported `.build-studio/local.json`
+  categories. The successor slice in
+  `docs/plans/effective-config-contract.md` closed the top-level silent-ignore
+  defect, array write-loss and duplicated `final_review` default;
+  category-specific nested normalization remains unchanged.
 - Retention of receipt files and of the token-specific lease claims.
 
 ## Known limits
