@@ -16,6 +16,7 @@ const { createStatusRouter } = require('./api/status');
 const { createTerminalRouter } = require('./api/terminal');
 const { createWorkflowRouter } = require('./api/workflow');
 const { createRunRouter } = require('./api/run');
+const { createRunReceiptRouter } = require('./api/run-receipt');
 const { createDeploymentRouter } = require('./api/deployment');
 const { createMonitorRouter } = require('./api/monitor');
 const { createMonitor } = require('./monitor');
@@ -202,6 +203,9 @@ function startServer(projectRoot, opts = {}) {
   const terminalRouter = createTerminalRouter(config, state, tmuxOps);
   const workflowRouter = createWorkflowRouter(config, state, gitOps, tmuxOps, broadcast, { admission });
   const runRouter = createRunRouter(config, state, gitOps, tmuxOps, broadcast, parseExecutionPlan);
+  // A1c receipt: the write-once factory-run receipt for the active run.
+  // Finalization is a workflow mutation under the admission seam above.
+  const runReceiptRouter = createRunReceiptRouter(config, state);
   // One monitor per project-server, shared by the CI/CD tab and the Monitor
   // tab so a single cached `gh run list` answers both.
   const monitor = createMonitor(config);
@@ -220,6 +224,7 @@ function startServer(projectRoot, opts = {}) {
   app.use('/api/terminal', terminalRouter);
   app.use('/api', workflowRouter);
   app.use('/api', runRouter);
+  app.use('/api', runReceiptRouter);
   app.use('/api', deploymentRouter);
   app.use('/api', monitorRouter);
   app.use('/api', runbooksRouter);

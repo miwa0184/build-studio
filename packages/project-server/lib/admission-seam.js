@@ -59,6 +59,9 @@ const WORKFLOW_MUTATIONS = new Set([
   '/api/workflow/model-override',
   '/api/workflow/restore',
   '/api/workflow/recover',
+  // A1c receipt: finalizing the factory-run receipt binds the admitted run's
+  // stored identity, so it verifies the stored context like every mutation.
+  '/api/workflow/receipt/finalize',
   '/api/overseer/force-complete-task',
   '/api/overseer/kill-skip-task',
 ]);

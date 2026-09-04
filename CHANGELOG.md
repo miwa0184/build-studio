@@ -21,6 +21,138 @@ that move underneath you without your having edited anything.
 
 ---
 
+## 2026-09-04 — The factory-run receipt
+
+### Added
+
+- **A per-run factory-run receipt can be finalized at the Egress Hold.**
+  `POST /api/workflow/receipt/finalize` writes one immutable, digest-bound
+  file, `.build-studio/run-receipt/<runId>.json`, proving that the active
+  run was server-admitted, is not technically stopped, carries no acceptance
+  gap, reached the finalized `LOCAL_MERGE_REMOVED` hold with every earlier
+  step completed, and that the candidate branch tip equals the sha, branch
+  and default branch the hold froze and descends from the admitted head. A
+  pending hold or a hold without a frozen sha refuses. The receipt binds the
+  effective workflow sequence and all of its review gates, the committed task packet (blob id
+  and content digest), the persisted server-run QA authority (re-evaluated,
+  and with Apple result authority its log and `.xcresult` digests are
+  re-checked on disk), every review verdict with agent provenance, and an
+  allowlisted projection of the effectively resolved configuration —
+  builder strategy, CLI slots, the QA contract, the still-disabled egress
+  policy, and the CLI/model/effort each agent actually launched with. Review
+  markers are parsed only from anchored structured fields; quoted templates,
+  prose negations, contradictory markers and unknown values cannot become an
+  approval.
+  `GET /api/workflow/receipt` (and `/:runId`) returns it with a live check
+  of whether the candidate still sits at the bound sha. Every refusal is
+  typed (`RECEIPT_*`) and fails closed. Ineligible runs write nothing; an
+  otherwise eligible older project may receive only the repo-local ignore
+  migration before a later commit-point recheck refuses.
+- **What the receipt is not.** It is machine evidence only: not product or
+  founder acceptance, not a merge or push authorization, and not a
+  signature. `productAcceptance: false`, `mergeAuthorization: false` and
+  `remoteEgress: "disabled"` are recorded as fields. PR egress remains
+  disabled; with or without a receipt the hold answers `LOCAL_MERGE_REMOVED`
+  and no push, PR, merge, tag or branch deletion exists behind it. See
+  `docs/plans/a1c-factory-run-receipt.md`.
+
+### Changed
+
+- **Parking at the Egress Hold now records the candidate sha it froze**
+  (`steps.merge_to_main.candidateSha`). That branch, sha and default branch are
+  write-once once validly frozen: re-entering the hold cannot silently rebind
+  them to a later candidate. A candidate that moves after the hold cannot be
+  receipted as the one that reached it.
+- **Agent records now carry the effort token that reached the command line**
+  (`agent.effort`, `null` when none did), so the receipt records what ran
+  rather than what was configured. Runs launched before this change record
+  `null`.
+- **Finalizing a receipt is classified as a mutation of the admitted run** by
+  the central admission seam, so a legacy or unregistered run is refused
+  before the handler, like every other work-advancing route.
+- The run aggregate's write discipline (canonical digest, atomic write,
+  per-run lease with proved-dead reclaim) now lives in
+  `lib/authority-store.js` and is shared by the receipt store. Behaviour is
+  unchanged; the lock canaries still pass.
+- **Receipt finalization now distinguishes material evidence from aggregate
+  revision churn.** Under the receipt lease it re-gathers all receipt-relevant
+  authority and refuses material drift, while a counter-only revision increment
+  remains byte-identically idempotent.
+- **Older managed projects receive safe local receipt storage automatically.**
+  Before writing, Build Studio proves the path is untracked and ignored. When
+  the onboarding-era rule is absent it adds `.build-studio/run-receipt/` to
+  Git's repository-local `info/exclude`, not to product files, and verifies the
+  result through Git. Tracked paths or effective negations fail closed.
+
+### Fixed
+
+- **Ambiguous review counts can no longer authorize a factory-run receipt.**
+  A count field is accepted only when its complete value is one integer;
+  alternatives and hedges such as `0 or 1`, `0/1`, `0 (template)` or trailing
+  prose are ambiguous and fail closed instead of being truncated to zero.
+- **A review gate cannot hide beyond the Egress Hold or contribute evidence
+  while unfinished.** Every configured receipt-bearing review gate must occur
+  before `merge_to_main` and have durable status `completed`; otherwise receipt
+  finalization refuses.
+- **Markdown indented code blocks cannot manufacture a review verdict.** Lines
+  beginning with a tab or at least four spaces are excluded before verdict
+  marker parsing, alongside fenced examples, quotes and list items.
+- **Repeated advances at an already frozen Egress Hold preserve its original
+  candidate identity.** If the branch moves afterward, receipt finalization
+  reports `CANDIDATE_DRIFT` instead of blessing the new tip with old evidence.
+- **Legacy Egress Holds cannot invent missing historical identity.** A hold
+  parked before candidate SHA capture remains explicitly unfrozen on later
+  advances and receipt finalization refuses `HOLD_NOT_FROZEN`; current branch
+  state is never substituted for evidence that was not recorded at the hold.
+- **The first complete Egress Hold identity is now durable authority outside
+  mutable workflow state.** A digested, write-once per-run document in the
+  existing ignored `run-guard` directory is registered monotonically by the
+  run aggregate and projected over every workflow load and save. Relaunch and
+  snapshot restore therefore cannot erase or re-freeze it. A missing or
+  damaged registered authority fails closed as `RUN_GUARD_UNREADABLE`.
+- **Verdict parsing now follows Markdown tab stops for indented code.** One to
+  three leading spaces followed by a tab count as code indentation, and an
+  indented fence inside a fenced block cannot expose the example markers it
+  contains.
+- **Fenced review examples now close only with a matching Markdown fence.** A
+  tilde fence cannot close a backtick fence, and a shorter delimiter cannot
+  close a longer one, so example text cannot become receipt authority.
+- **Receipt finalization now requires the durable Egress Hold document
+  directly.** A valid-looking mutable workflow hold without that authority is
+  refused as `HOLD_NOT_FROZEN`; the branch, candidate sha and default branch
+  must match the write-once authority exactly.
+
+### Upgrade steps
+
+**In Build Studio** — re-inject the project server into the Electron app
+(`node inject-resources.js --sync-only`) and restart it. No hub change.
+
+**In each managed project** — normally nothing to do. New onboardings carry the
+ignore rule, and older projects are protected through Git's repository-local
+exclude before the first receipt is written. If finalization returns
+`RECEIPT_STORAGE_UNPROTECTED`, remove any tracked receipt path from the index
+and resolve any explicit ignore negation before retrying; Build Studio does not
+silently rewrite those repository decisions.
+
+### Known issues
+
+- `.build-studio/local.json` keys the resolver does not read are still
+  silently ignored. The receipt records the resolver's effective value,
+  which is correct today; schema hardening of local keys and the duplicated
+  `final_review` default are a separate successor slice.
+
+### Notes for forks
+
+- A receipt is write-once. Do not add a route or reducer that rewrites
+  `.build-studio/run-receipt/<runId>.json`; supersession is a successor run's
+  receipt naming the predecessor's `receiptDigest` in `supersedes`.
+- Keep finalization behind the admission seam and keep its body allowlist
+  at exactly `candidateSha`. A client field must be able to make
+  finalization refuse, never succeed.
+- The config projection is an allowlist built from the RESOLVED config
+  object. Extend it by adding named fields, never by spreading a config
+  block, and keep `assertProjectionSafe` in the write path.
+
 ## 2026-09-03 — Apple-native QA artifacts can be authoritative
 
 ### Added

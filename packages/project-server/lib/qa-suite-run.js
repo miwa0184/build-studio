@@ -233,6 +233,30 @@ function collectNativeArtifacts({
   }
 }
 
+/**
+ * Re-digest native artifacts already on disk, with the same manifest rule
+ * collectNativeArtifacts used to produce them. Reads only; throws when the
+ * log or the bundle is missing, empty, or carries a symlink. A later reader
+ * (the factory-run receipt) uses this to prove the evidence it binds is
+ * still the evidence the authority was verified against.
+ */
+function digestNativeArtifacts({ logPath, resultBundlePath, fsImpl = fs }) {
+  if (typeof logPath !== 'string' || !logPath) throw new Error('native artifact log path is missing');
+  if (typeof resultBundlePath !== 'string' || !resultBundlePath) throw new Error('native artifact result bundle path is missing');
+  const logSha256 = sha256(fsImpl.readFileSync(logPath));
+  if (!fsImpl.statSync(resultBundlePath).isDirectory()) throw new Error('result bundle is not a directory');
+  const files = regularFilesBelow(resultBundlePath, fsImpl);
+  if (files.length === 0) throw new Error('result bundle contains no regular files');
+  const manifest = [];
+  let totalBytes = 0;
+  for (const file of files) {
+    const bytes = fsImpl.readFileSync(file.absolute);
+    totalBytes += file.size;
+    manifest.push(`${sha256(bytes)} ${file.size} ${file.relative}\n`);
+  }
+  return { logSha256, fileCount: files.length, totalBytes, manifestDigest: sha256(manifest.join('')) };
+}
+
 /** Human-readable form of the argv, for the prompt and for error messages. */
 function displayCommand(args) {
   return ['xcodebuild', ...args.map(a => (/[\s"']/.test(a) ? JSON.stringify(a) : a))].join(' ');
@@ -1024,6 +1048,7 @@ module.exports = {
   buildXcodebuildArgs,
   createNativeArtifactPaths,
   collectNativeArtifacts,
+  digestNativeArtifacts,
   displayCommand,
   parseTestCounts,
   evaluateSuiteAuthority,

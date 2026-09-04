@@ -407,6 +407,7 @@ const BUILD_STUDIO_GITIGNORE_PATTERNS = [
   '.build-studio/snapshots/',
   '.build-studio/admission/',
   '.build-studio/run-guard/',
+  '.build-studio/run-receipt/',
   '.build-studio/*.bak*',
   '# Hub-written local overrides (Agents-tab CLI settings) + model catalog cache — machine-local',
   '.build-studio/local.json',

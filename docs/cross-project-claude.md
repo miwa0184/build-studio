@@ -542,6 +542,13 @@ push and CI-fix acceptance routes before commit, branch creation, push, tag, or
 PR creation. A reviewed A1c PR-egress transaction must exist before Build
 Studio may publish again; it is not part of this commit.
 
+At the hold, Build Studio can finalize a **factory-run receipt** for the
+candidate (`.build-studio/run-receipt/<runId>.json`, machine-local and
+ignored). It is machine evidence that the admitted run produced this exact
+candidate with its QA and review evidence intact. It is not product
+acceptance and not a merge authorization; the later egress transaction will
+require one, and it changes nothing about the hold today.
+
 ### DB migrations
 
 Use **expand-then-contract** for zero-downtime deploys:

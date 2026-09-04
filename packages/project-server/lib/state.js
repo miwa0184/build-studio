@@ -15,6 +15,7 @@ const {
   TerminalRunError,
   TechnicalStopPersistError,
 } = require('./technical-stop');
+const { LOCAL_MERGE_REMOVED, egressRefusal } = require('./egress-boundary');
 
 class AcceptanceGapPersistError extends Error {
   constructor(gaps, cause) {
@@ -95,12 +96,11 @@ const MAX_SNAPSHOTS = 10;
  * This decorator wraps a persistence implementation so the enforcement is a
  * property of the boundary, for every current and future caller:
  *
- *   - loadWorkflow projects the guard's technicalStop and monotonic
- *     acceptanceGaps onto whatever the file says, so a stopped run always
- *     LOADS stopped and an unverified task never loads as covered;
- *   - saveWorkflow re-applies both authorities before anything is written, so
- *     a stale copy or snapshot cannot persist a transitionable state over a
- *     terminal one or clear acceptance evidence;
+ *   - loadWorkflow projects the guard's technicalStop, monotonic
+ *     acceptanceGaps and immutable Egress Hold onto whatever the file says,
+ *     so a stopped or parked run always LOADS that way;
+ *   - saveWorkflow re-applies all three authorities before anything is
+ *     written, so a stale copy, relaunch or snapshot cannot erase them;
  *   - a guard that exists but cannot be read fails CLOSED: loads carry a
  *     machine-readable `guardUnverifiable` marker and every save throws
  *     RunGuardCorruptError before touching disk;
@@ -169,6 +169,27 @@ function attachStateAuthority(state, config) {
     return wf;
   }
 
+  /** Project the immutable egress freeze over every mutable workflow view. */
+  function projectEgressHold(wf, hold) {
+    if (!hold) return wf;
+    if (!wf.steps || typeof wf.steps !== 'object') wf.steps = {};
+    const prior = wf.steps.merge_to_main;
+    wf.steps.merge_to_main = {
+      ...(prior && typeof prior === 'object' ? prior : {}),
+      status: 'blocked',
+      code: LOCAL_MERGE_REMOVED,
+      egress: 'not_installed',
+      error: egressRefusal(LOCAL_MERGE_REMOVED).error,
+      candidateBranch: hold.candidateBranch,
+      candidateSha: hold.candidateSha,
+      defaultBranch: hold.defaultBranch,
+    };
+    wf.currentStep = 'merge_to_main';
+    wf.autoAdvance = false;
+    wf.autoAdvanceSkipDemoReview = false;
+    return wf;
+  }
+
   /**
    * The terminal truth for a run: the guard's stop, else a pending one.
    * Throws RunGuardCorruptError when the guard exists but cannot be verified —
@@ -185,7 +206,11 @@ function attachStateAuthority(state, config) {
       const pending = pendingStops.get(String(runId));
       stop = pending ? pending.stop : null;
     }
-    return { stop, acceptanceGaps: clone(doc.acceptanceGaps || []) };
+    return {
+      stop,
+      acceptanceGaps: clone(doc.acceptanceGaps || []),
+      egressHold: runGuard.loadEgressHold(runId),
+    };
   }
 
   function authoritativeStop(runId) {
@@ -222,6 +247,7 @@ function attachStateAuthority(state, config) {
     try {
       const authority = authoritativeRun(wf.id);
       projectAcceptanceGaps(wf, authority.acceptanceGaps);
+      projectEgressHold(wf, authority.egressHold);
       if (authority.stop) applyToWorkflow(wf, authority.stop);
     } catch (e) {
       if (!(e instanceof RunGuardCorruptError)
@@ -266,6 +292,7 @@ function attachStateAuthority(state, config) {
       if (err) throw new TechnicalStopPersistError(stop, err);
     }
     projectAcceptanceGaps(wf, gaps);
+    projectEgressHold(wf, authority.egressHold);
     if (stop) applyToWorkflow(wf, stop);
     // The load-side marker is diagnostic, not state — it must not persist and
     // then outlive a repaired guard.
@@ -314,7 +341,17 @@ function attachStateAuthority(state, config) {
     return recorded;
   };
 
+  /** Persist the first complete egress identity before projecting the hold. */
+  state.recordEgressHold = function recordEgressHold(wf, hold) {
+    const recorded = runGuard.captureEgressHold(wf.id, hold);
+    projectEgressHold(wf, recorded);
+    delete wf.guardUnverifiable;
+    baseSave(wf);
+    return recorded;
+  };
+
   state.authoritativeStop = authoritativeStop;
+  state.authoritativeEgressHold = (runId) => authoritativeRun(runId).egressHold;
   state.runGuard = runGuard;
   return state;
 }
