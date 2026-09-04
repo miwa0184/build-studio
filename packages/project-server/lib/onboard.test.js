@@ -514,7 +514,7 @@ test('onboardProject: admission and run-guard runtime writes leave a committed p
 test('onboardProject: idempotent — re-adding patterns already present does not duplicate', async () => {
   const root = makeRepo({
     ...EXAMPLE_APP_SHAPE,
-    '.gitignore': 'node_modules\n.build-studio/workflow-state.json\n.build-studio/snapshots/\n.build-studio/admission/\n.build-studio/run-guard/\ndocs/agent-status.json\nprompt-*.txt\nstart-*.sh\nstart.sh\nTASK.md\ntmp/\n.build-studio/run-state.json\n.build-studio/*.bak*\n.build-studio/local.json\n.build-studio/*-cache.json\n.claude/scheduled_tasks.lock\n.claude/settings.local.json\ndocs/pr-evidence/**/*.png\ndocs/pr-evidence/**/*.jpg\ndocs/pr-evidence/**/*.jpeg\ndocs/pr-evidence/**/*.gif\ndocs/pr-evidence/**/*.pdf\n',
+    '.gitignore': 'node_modules\n.build-studio/workflow-state.json\n.build-studio/snapshots/\n.build-studio/admission/\n.build-studio/run-guard/\n.build-studio/run-receipt/\ndocs/agent-status.json\nprompt-*.txt\nstart-*.sh\nstart.sh\nTASK.md\ntmp/\n.build-studio/run-state.json\n.build-studio/*.bak*\n.build-studio/local.json\n.build-studio/*-cache.json\n.claude/scheduled_tasks.lock\n.claude/settings.local.json\ndocs/pr-evidence/**/*.png\ndocs/pr-evidence/**/*.jpg\ndocs/pr-evidence/**/*.jpeg\ndocs/pr-evidence/**/*.gif\ndocs/pr-evidence/**/*.pdf\n',
   });
   try {
     const result = await onboardProject(root, { name: 'desk', port: 3099 });

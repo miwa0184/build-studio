@@ -107,6 +107,151 @@ function syntheticFeedback(provenance, paneOutput, detail) {
   ].join('\n');
 }
 
+// ---------------------------------------------------------------------------
+// One strict, structured reading of a verdict body.
+//
+// Provenance answers WHO wrote the text. This answers WHAT the text says, for
+// a reader that must fail closed (the factory-run receipt). The engine's
+// advance path keeps its lenient regexes; this reader is deliberately
+// stricter, and every difference is in the refusing direction:
+//
+//   - markers are line-anchored: `**Approved:** yes` must be the whole line
+//     (case-insensitive, a closing period tolerated). A value with anything
+//     else on it — "yes | no", "yes/no", "yes (see below)" — is the prompt's
+//     format line or an unreadable hedge, never a verdict;
+//   - fenced and indented code blocks, blockquotes, inline code and list
+//     bullets are not markers: that is where prompts, pane echoes and
+//     prior-round quotes live;
+//   - `**Verdict:** …` is read against a closed vocabulary. Any refusing word
+//     ("not approved", "unapproved", "reject", "changes requested", "block",
+//     "fail") makes it a refusal even when "approved" also appears; only a
+//     bare "approved"/"approve" is an approval; anything else is unrecognized;
+//   - an explicit refusal anywhere wins. Otherwise more than one marker, a
+//     template-shaped marker, an unrecognized verdict, or disagreeing counts
+//     leave the verdict ambiguous (`approved: null`) — never approved.
+// ---------------------------------------------------------------------------
+
+const APPROVED_LINE = /^\*\*Approved:\*\*[ \t]*(.*?)[ \t]*$/i;
+const VERDICT_LINE = /^\*\*Verdict:\*\*[ \t]*(.*?)[ \t]*$/i;
+const COUNT_LINE = /^\*\*(Blocking|Medium|Low):\*\*[ \t]*(\d+)[ \t]*$/i;
+const COUNT_LINE_START = /^\*\*(?:Blocking|Medium|Low):\*\*/i;
+const REFUSING_VERDICT = /\bnot\s+approved\b|\bunapproved\b|\breject(?:ed|s)?\b|\bchanges?\s+requested\b|\bblock(?:ed|ing|s)?\b|\bfail(?:ed|s|ure|ures)?\b|\bdeclined?\b/i;
+const APPROVING_VERDICT = /^(?:approved?|lgtm|pass(?:ed)?)$/i;
+
+function startsIndentedCode(raw) {
+  let columns = 0;
+  for (const char of raw) {
+    if (char === ' ') columns += 1;
+    else if (char === '\t') columns += 4 - (columns % 4);
+    else break;
+    if (columns >= 4) return true;
+  }
+  return false;
+}
+
+/** The lines that can carry a marker: outside fences, not quoted, not bulleted. */
+function markerLines(feedback) {
+  const out = [];
+  let fence = null;
+  for (const raw of String(feedback || '').split(/\r?\n/)) {
+    const indentedCode = startsIndentedCode(raw);
+    const line = raw.trim();
+    const fenceLine = !indentedCode ? line.match(/^(`{3,}|~{3,})(.*)$/) : null;
+    if (fenceLine) {
+      const marker = fenceLine[1];
+      if (!fence) {
+        fence = { character: marker[0], length: marker.length };
+        continue;
+      }
+      if (marker[0] === fence.character
+        && marker.length >= fence.length
+        && /^[ \t]*$/.test(fenceLine[2])) {
+        fence = null;
+        continue;
+      }
+    }
+    if (fence || indentedCode) continue;
+    if (line.startsWith('>') || /^[-*+]\s/.test(line) || /^\d+[.)]\s/.test(line)) continue;
+    out.push(line);
+  }
+  return out;
+}
+
+function classifyApproved(value) {
+  const v = value.replace(/[.!]+$/, '').trim().toLowerCase();
+  if (v === 'yes') return 'yes';
+  if (v === 'no') return 'no';
+  return /\byes\b/.test(v) && /\bno\b/.test(v) ? 'template' : 'unrecognized';
+}
+
+function classifyVerdict(value) {
+  const v = value.replace(/[.!]+$/, '').trim();
+  if (REFUSING_VERDICT.test(v)) return 'no';
+  if (APPROVING_VERDICT.test(v)) return 'yes';
+  return 'unrecognized';
+}
+
+function parseFailing(feedback) {
+  const text = String(feedback || '');
+  const m = text.match(/(?<![\w-])(\d+)\s+(?:failed|failures)\b/i)
+    || text.match(/\*\*Failures:\*\*\s*(\d+)/i)
+    || text.match(/\((\d+)\s+failed/i);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+/**
+ * @returns {{approved: true|false|null, reason: string, markers: string[],
+ *   blocking: number|null, medium: number|null, low: number|null, failing: number}}
+ *
+ * `reason` is one of: approved, refused, no_marker, template, unrecognized,
+ * multiple, counts_malformed, counts_conflict. Counts are null when no
+ * anchored count exists or a structured count line is malformed.
+ */
+function parseStructuredVerdict(feedback) {
+  const markers = [];
+  const counts = { blocking: [], medium: [], low: [] };
+  let countsMalformed = false;
+  for (const line of markerLines(feedback)) {
+    const approved = line.match(APPROVED_LINE);
+    if (approved) markers.push({ kind: 'approved', value: classifyApproved(approved[1]) });
+    const verdict = line.match(VERDICT_LINE);
+    if (verdict) markers.push({ kind: 'verdict', value: classifyVerdict(verdict[1]) });
+    if (COUNT_LINE_START.test(line)) {
+      for (const field of line.split('|')) {
+        const count = field.trim().match(COUNT_LINE);
+        if (!count) {
+          countsMalformed = true;
+          continue;
+        }
+        counts[count[1].toLowerCase()].push(parseInt(count[2], 10));
+      }
+    }
+  }
+  const kinds = markers.map((m) => `${m.kind}:${m.value}`);
+  const single = (list) => (list.length === 0 ? null : new Set(list).size === 1 ? list[0] : undefined);
+  const blocking = single(counts.blocking);
+  const medium = single(counts.medium);
+  const low = single(counts.low);
+  const base = {
+    markers: kinds,
+    blocking: blocking === undefined ? null : blocking,
+    medium: medium === undefined ? null : medium,
+    low: low === undefined ? null : low,
+    failing: parseFailing(feedback),
+  };
+  const ambiguousCounts = countsMalformed
+    ? { ...base, blocking: null, medium: null, low: null }
+    : base;
+  if (markers.some((m) => m.value === 'no')) return { approved: false, reason: 'refused', ...base };
+  if (markers.length === 0) return { approved: null, reason: 'no_marker', ...ambiguousCounts };
+  if (markers.some((m) => m.value === 'template')) return { approved: null, reason: 'template', ...ambiguousCounts };
+  if (markers.some((m) => m.value === 'unrecognized')) return { approved: null, reason: 'unrecognized', ...ambiguousCounts };
+  if (markers.length > 1) return { approved: null, reason: 'multiple', ...ambiguousCounts };
+  if (countsMalformed) return { approved: null, reason: 'counts_malformed', ...ambiguousCounts };
+  if (blocking === undefined || medium === undefined || low === undefined) return { approved: null, reason: 'counts_conflict', ...base };
+  return { approved: true, reason: 'approved', ...base };
+}
+
 module.exports = {
   PROVENANCE,
   isAgentVerdict,
@@ -114,4 +259,5 @@ module.exports = {
   countsAsApproval,
   countsAsAcceptanceEvidence,
   syntheticFeedback,
+  parseStructuredVerdict,
 };

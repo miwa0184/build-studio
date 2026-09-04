@@ -74,6 +74,70 @@ test('corrupt local.json is tolerated (yaml stays authoritative)', () => {
   } finally { clean(root); }
 });
 
+test('an array local.json is treated as malformed and a later supported save is effective', () => {
+  const root = makeProject(BASE_YAML, '[1, 2]');
+  try {
+    assert.deepEqual(loadLocalOverrides(root), {});
+    saveLocalOverrides(root, { cli: { default: 'codex' } });
+    assert.deepEqual(loadLocalOverrides(root), { cli: { default: 'codex' } });
+    assert.equal(loadConfig(root).cli.default, 'codex');
+  } finally { clean(root); }
+});
+
+test('local.json refuses prototype-shaped top-level keys', () => {
+  const root = makeProject(BASE_YAML, '{"__proto__":{"model":"bogus"}}');
+  try {
+    assert.throws(
+      () => loadConfig(root),
+      /local\.json contains unsupported top-level keys: __proto__/,
+    );
+  } finally { clean(root); }
+});
+
+test('local.json refuses unknown top-level keys instead of silently ignoring policy', () => {
+  const root = makeProject(
+    BASE_YAML,
+    JSON.stringify({ builder_strategy: 'goal', support: { auto_commit: false } }),
+  );
+  try {
+    assert.throws(
+      () => loadConfig(root),
+      /local\.json contains unsupported top-level keys: builder_strategy, support/,
+    );
+  } finally { clean(root); }
+});
+
+test('every supported local.json category reaches the effective config', () => {
+  const root = makeProject(
+    BASE_YAML,
+    JSON.stringify({
+      cli: { default: 'codex' },
+      agent_defaults: { model: 'claude-opus-5', effort: 'high' },
+      step_groups: [{ key: 'verify', label: 'Verify', steps: ['qa_validation'] }],
+    }),
+  );
+  try {
+    const cfg = loadConfig(root);
+    assert.equal(cfg.cli.default, 'codex');
+    assert.equal(cfg.agent_defaults.model, 'claude-opus-5');
+    assert.equal(cfg.agent_defaults.effort, 'high');
+    assert.deepEqual(cfg.step_groups, [
+      { key: 'verify', label: 'Verify', hint: '', steps: ['qa_validation'] },
+    ]);
+  } finally { clean(root); }
+});
+
+test('saveLocalOverrides refuses an unsupported category before writing anything', () => {
+  const root = makeProject(BASE_YAML);
+  try {
+    assert.throws(
+      () => saveLocalOverrides(root, { builder_strategy: 'goal' }),
+      /unsupported top-level keys: builder_strategy/,
+    );
+    assert.equal(fs.existsSync(path.join(root, '.build-studio', 'local.json')), false);
+  } finally { clean(root); }
+});
+
 test('saveLocalOverrides: shallow-merges per top-level key, preserves others', () => {
   const root = makeProject(BASE_YAML);
   try {
@@ -90,6 +154,16 @@ test('saveLocalOverrides: shallow-merges per top-level key, preserves others', (
     // config.yaml on disk was never touched by saves
     const yamlOnDisk = fs.readFileSync(path.join(root, '.build-studio', 'config.yaml'), 'utf8');
     assert.equal(yamlOnDisk, BASE_YAML);
+  } finally { clean(root); }
+});
+
+test('final_review defaults keep effort and wrap-up policy in one object', () => {
+  const { DEFAULTS } = require('./config');
+  assert.deepEqual(DEFAULTS.final_review, { effort: 'high', wrapup_past_cap: true });
+
+  const root = makeProject(BASE_YAML + 'final_review:\n  wrapup_past_cap: false\n');
+  try {
+    assert.deepEqual(loadConfig(root).final_review, { effort: 'high', wrapup_past_cap: false });
   } finally { clean(root); }
 });
 
