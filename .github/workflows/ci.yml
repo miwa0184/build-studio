@@ -29,3 +29,28 @@ jobs:
       - name: Hub production build
         working-directory: packages/hub
         run: npx next build
+
+  fork-discipline:
+    # This fork is public and the product repository it builds for is not. Two
+    # rules follow, and both are checked here rather than trusted to habit:
+    # every commit explains itself, and no product-specific identifier enters
+    # the factory. Rationale and the measurement behind them: CONTRIBUTING.md.
+    #
+    # Pull requests only — it compares the PR's commits and added lines against
+    # the base, which a push to main has no equivalent of.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Fork discipline
+        run: |
+          node scripts/fork-discipline-check.mjs \
+            "${{ github.event.pull_request.base.sha }}" \
+            "${{ github.event.pull_request.head.sha }}"
