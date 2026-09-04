@@ -74,6 +74,26 @@ test('corrupt local.json is tolerated (yaml stays authoritative)', () => {
   } finally { clean(root); }
 });
 
+test('an array local.json is treated as malformed and a later supported save is effective', () => {
+  const root = makeProject(BASE_YAML, '[1, 2]');
+  try {
+    assert.deepEqual(loadLocalOverrides(root), {});
+    saveLocalOverrides(root, { cli: { default: 'codex' } });
+    assert.deepEqual(loadLocalOverrides(root), { cli: { default: 'codex' } });
+    assert.equal(loadConfig(root).cli.default, 'codex');
+  } finally { clean(root); }
+});
+
+test('local.json refuses prototype-shaped top-level keys', () => {
+  const root = makeProject(BASE_YAML, '{"__proto__":{"model":"bogus"}}');
+  try {
+    assert.throws(
+      () => loadConfig(root),
+      /local\.json contains unsupported top-level keys: __proto__/,
+    );
+  } finally { clean(root); }
+});
+
 test('local.json refuses unknown top-level keys instead of silently ignoring policy', () => {
   const root = makeProject(
     BASE_YAML,

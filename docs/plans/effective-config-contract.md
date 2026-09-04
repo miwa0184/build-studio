@@ -37,10 +37,12 @@ This slice validates the top-level ownership boundary. It does not introduce a
 new schema for nested keys inside the three existing categories; those retain
 their existing category-specific normalization and API validation.
 
-The established recovery behavior for an absent, unreadable or malformed
-optional `local.json` also remains unchanged: the resolver falls back to
-tracked YAML. The new refusal applies once a valid JSON object makes an
-unsupported top-level claim.
+The established recovery behavior for an absent, unreadable, malformed or
+non-object optional `local.json` remains: the resolver falls back to tracked
+YAML. Arrays are treated as malformed objects; a later supported save replaces
+the array with an effective object instead of silently losing the write. The
+new refusal applies once a valid JSON object makes an unsupported top-level
+claim, including a prototype-shaped key such as `__proto__`.
 
 ## Falsification and verification
 
@@ -51,8 +53,10 @@ Before the production fix, permanent tests proved three defects:
 3. `DEFAULTS.final_review.effort` was absent.
 
 The same tests now pass, alongside coverage that all three supported local
-categories reach the effective resolver output and the receipt test consumes
-only supported local overrides.
+categories reach the effective resolver output, malformed arrays cannot lose
+a later supported write, prototype-shaped top-level keys refuse, and the
+receipt test consumes only supported local overrides while asserting the
+effective final-review effort.
 
 ## Upgrade
 

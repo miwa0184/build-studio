@@ -437,6 +437,7 @@ test('receipt R6 — the projection records effective supported local overrides'
   const { receipt } = authority.finalize();
   assert.equal(receipt.config.builderStrategy, 'role');
   assert.equal(receipt.config.cli.default, 'codex');
+  assert.equal(receipt.config.review.finalReviewEffort, 'high');
   assert.equal(receipt.config.schemaVersion, 1);
   assert.match(receipt.configDigest, /^[0-9a-f]{64}$/);
   const executed = Object.fromEntries(receipt.config.executedSteps.map((s) => [s.step, s]));

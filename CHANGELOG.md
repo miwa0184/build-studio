@@ -58,6 +58,12 @@ that move underneath you without your having edited anything.
 
 ### Changed
 
+- **The project server now refuses to start when a valid
+  `.build-studio/local.json` claims unsupported top-level settings.** Only
+  `cli`, `agent_defaults` and `step_groups` belong in this ignored
+  machine-local file; move `builder_strategy`, `support` and other project
+  policy into tracked `config.yaml`. Writes through the local-settings helper
+  are refused before touching disk under the same contract.
 - **Parking at the Egress Hold now records the candidate sha it froze**
   (`steps.merge_to_main.candidateSha`). That branch, sha and default branch are
   write-once once validly frozen: re-entering the hold cannot silently rebind
@@ -86,13 +92,9 @@ that move underneath you without your having edited anything.
 
 ### Fixed
 
-- **Machine-local configuration can no longer pretend to set project policy.**
-  `.build-studio/local.json` accepts only the three categories the resolver
-  actually consumes (`cli`, `agent_defaults` and `step_groups`); unknown
-  top-level keys fail closed on both load and write instead of being silently
-  ignored. `builder_strategy`, `support` and other project policy remain in
-  tracked `config.yaml`. The duplicated `final_review` default is also one
-  object now, so its `effort` and `wrapup_past_cap` defaults coexist.
+- **The duplicated `final_review` default is now one object.** Its `effort`
+  and `wrapup_past_cap` defaults coexist, including when YAML overrides only
+  one of them, and receipts record the effective default effort.
 - **Ambiguous review counts can no longer authorize a factory-run receipt.**
   A count field is accepted only when its complete value is one integer;
   alternatives and hedges such as `0 or 1`, `0/1`, `0 (template)` or trailing
@@ -132,9 +134,8 @@ that move underneath you without your having edited anything.
 ### Upgrade steps
 
 **In Build Studio** — re-inject the project server into the Electron app
-(`node inject-resources.js --sync-only`) and restart it. The template comment
-also changes, so rebuild the Hub bundle before packaging a distributable app;
-no runtime Hub logic changed.
+(`node inject-resources.js --sync-only`) and restart it. This command also
+syncs the updated template; no separate Hub build is required for this change.
 
 **In each managed project** — inspect `.build-studio/local.json` before updating.
 Move any top-level key other than `cli`, `agent_defaults` or `step_groups` into

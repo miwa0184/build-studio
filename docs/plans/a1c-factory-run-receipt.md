@@ -238,8 +238,8 @@ the explicit repository-local `info/exclude` migration described above.
 - Nested schema hardening within the supported `.build-studio/local.json`
   categories. The successor slice in
   `docs/plans/effective-config-contract.md` closed the top-level silent-ignore
-  defect and the duplicated `final_review` default; category-specific nested
-  normalization remains unchanged.
+  defect, array write-loss and duplicated `final_review` default;
+  category-specific nested normalization remains unchanged.
 - Retention of receipt files and of the token-specific lease claims.
 
 ## Known limits
