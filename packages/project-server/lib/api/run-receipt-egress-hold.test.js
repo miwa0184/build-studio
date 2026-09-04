@@ -29,6 +29,10 @@ const RUN_ID = 'bugfix-2026-09-04T11-00-00-cd34';
 const PACKET = 'docs/backlog/LS-001.md';
 const CLEAN_QA = '**Tests passed:** 12/12\n**Approved:** yes\n**Blocking:** 0\n12 passed';
 const CLEAN_REVIEW = '**Approved:** yes\n**Blocking:** 0  |  **Medium:** 0  |  **Low:** 0';
+// The production probe invokes `zsh -c ...`, but ubuntu-latest has no zsh.
+// Delegate that probe to POSIX sh so the fixture tests PATH resolution rather
+// than the runner's shell inventory. The shim must not report success blindly.
+const ZSH_SHIM = '#!/bin/sh\nexec /bin/sh -c "$2"\n';
 
 test('receipt hold — park, finalize, read, and the hold still refuses every egress with a receipt present', async (t) => {
   const fx = makeFixture(t);
@@ -319,7 +323,7 @@ test('receipt hold — a launched agent records the effort token that reached it
   const configPath = path.join(fx.root, '.build-studio', 'config.yaml');
   fs.writeFileSync(configPath, `${fs.readFileSync(configPath, 'utf8')}agent_defaults:\n  effort: high\n`);
   fs.writeFileSync(path.join(fx.root, '.gitignore'), `${fs.readFileSync(path.join(fx.root, '.gitignore'), 'utf8')}start*.sh\nprompt-*.txt\n`);
-  const bin = stubBinDir(['claude', 'pgrep']);
+  const bin = stubBinDir(['claude', 'pgrep'], { zsh: ZSH_SHIM });
   t.after(() => { try { fs.rmSync(bin, { recursive: true, force: true }); } catch (_) {} });
   const server = await mountWorkflow(fx.root, {
     id: 'effort-run', type: 'bugfix', input: 'LS-001', itemId: 'LS-001', prdPath: PACKET,
