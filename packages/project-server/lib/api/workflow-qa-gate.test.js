@@ -98,7 +98,7 @@ test('failure count parsed from "(N failed" parenthetical form', () => {
 
 test('server exact-count authority blocks before and regardless of an agent clean verdict or operator override', () => {
   const config = { qa_validation: { expected_test_count: 56 } };
-  const counts = parseTestCounts(singleBundleLog('SudokuDailyUITests', 55, { style: 'objc' }));
+  const counts = parseTestCounts(singleBundleLog('SampleAppUITests', 55, { style: 'objc' }));
   const step = {
     suiteRun: {
       status: 'completed',
@@ -118,15 +118,15 @@ test('server exact-count authority blocks before and regardless of an agent clea
 
 test('server exact-count authority passes only its persisted exact verdict; legacy projects are unaffected', () => {
   const config = {
-    qa_validation: { expected_test_count: 56, only_testing: ['SudokuDailyUITests'] },
+    qa_validation: { expected_test_count: 56, only_testing: ['SampleAppUITests'] },
     simulator: { parallel_testing: false },
   };
-  const counts = parseTestCounts(singleBundleLog('SudokuDailyUITests', 56, { style: 'objc' }));
+  const counts = parseTestCounts(singleBundleLog('SampleAppUITests', 56, { style: 'objc' }));
   assert.equal(qaServerSuiteGateVerdict({
     suiteRun: { status: 'completed', exitCode: 0, counts, authority: {
       configured: true, blocked: false, code: 'QA_EXACT_COUNT_VERIFIED',
       expectedTestCount: 56, actualTestCount: 56,
-      onlyTesting: ['SudokuDailyUITests'], parallelTesting: false,
+      onlyTesting: ['SampleAppUITests'], parallelTesting: false,
     } },
   }, config).blocked, false);
   assert.equal(qaServerSuiteGateVerdict({}, {}).blocked, false);
@@ -135,7 +135,7 @@ test('server exact-count authority passes only its persisted exact verdict; lega
 
 test('persisted exact authority is bound to current target scope and serial setting', () => {
   const config = {
-    qa_validation: { expected_test_count: 56, only_testing: ['SudokuDailyUITests'] },
+    qa_validation: { expected_test_count: 56, only_testing: ['SampleAppUITests'] },
     simulator: { parallel_testing: false },
   };
   const authority = {
@@ -143,10 +143,10 @@ test('persisted exact authority is bound to current target scope and serial sett
     expectedTestCount: 56, actualTestCount: 56,
     onlyTesting: ['OtherUITests'], parallelTesting: false,
   };
-  const counts = parseTestCounts(singleBundleLog('SudokuDailyUITests', 56, { style: 'objc' }));
+  const counts = parseTestCounts(singleBundleLog('SampleAppUITests', 56, { style: 'objc' }));
   const suiteRun = { status: 'completed', exitCode: 0, counts, authority };
   assert.equal(qaServerSuiteGateVerdict({ suiteRun }, config).code, 'QA_SERVER_SUITE_SCOPE_STALE');
-  authority.onlyTesting = ['SudokuDailyUITests'];
+  authority.onlyTesting = ['SampleAppUITests'];
   authority.parallelTesting = true;
   assert.equal(qaServerSuiteGateVerdict({ suiteRun }, config).code, 'QA_SERVER_SUITE_PARALLELISM_STALE');
 });

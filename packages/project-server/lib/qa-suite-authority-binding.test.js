@@ -226,7 +226,7 @@ test('control — genuine multi-target output with independently bound evidence 
 
 test('control — valid single-target Swift and Objective-C output verifies when exact and fully corroborated', () => {
   for (const style of ['swift', 'objc']) {
-    const verdict = evaluateSuiteAuthority(completed(singleBundleLog('SudokuDailyUITests', 56, { style })), 56, { onlyTesting: ['SudokuDailyUITests'] });
+    const verdict = evaluateSuiteAuthority(completed(singleBundleLog('SampleAppUITests', 56, { style })), 56, { onlyTesting: ['SampleAppUITests'] });
     assert.equal(verdict.blocked, false, `${style}: ${JSON.stringify(verdict)}`);
     assert.equal(verdict.code, 'QA_EXACT_COUNT_VERIFIED');
     assert.equal(verdict.actualTestCount, 56);
@@ -242,7 +242,7 @@ test('control — valid single-target Swift and Objective-C output verifies when
   }
   // Exactness is unchanged: 55 and 57 mismatch by count, not by evidence.
   for (const n of [55, 57]) {
-    const verdict = evaluateSuiteAuthority(completed(singleBundleLog('SudokuDailyUITests', n)), 56, { onlyTesting: ['SudokuDailyUITests'] });
+    const verdict = evaluateSuiteAuthority(completed(singleBundleLog('SampleAppUITests', n)), 56, { onlyTesting: ['SampleAppUITests'] });
     assert.equal(verdict.code, 'QA_EXPECTED_TEST_COUNT_MISMATCH');
     assert.equal(verdict.actualTestCount, n);
   }
