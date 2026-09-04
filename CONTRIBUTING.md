@@ -54,3 +54,40 @@ Types: `feat`, `fix`, `chore`, `docs`, `refactor`, `test`.
 
 Open an issue with steps to reproduce, what you expected, and what happened.
 Include your OS, Node version, and relevant logs (with any secrets redacted).
+
+## Fork discipline
+
+Two rules this fork adds on top of upstream. Both are checked by the
+`fork-discipline` CI job on every pull request, because a rule that lives only
+in prose is a promise, and this project has learned what promises are worth.
+
+### 1. Every commit explains itself
+
+- Subject: `type(scope): summary`, scope optional, one of
+  feat / fix / test / docs / chore / refactor / perf / build / ci / revert.
+  Let the subject carry the reason, not only the action: "record the sha, so
+  the re-review diff is not dead code" beats "record the sha".
+- Body: at least fifteen words of prose, trailers excluded. Say what was wrong,
+  why the obvious fix does not work if it does not, and what would have to be
+  true for the change to be wrong.
+- No `Claude-Session:` URLs. The log is public and the link tells a reader
+  nothing.
+
+Measured 2026-09-04: none of upstream's last forty-five commits lacked a body;
+ten of this fork's thirty-three did, and all ten were recent. The gate exists so
+that trend cannot resume quietly.
+
+### 2. The factory stays product-agnostic
+
+Build Studio is a factory. A product's names, test targets, expected counts,
+schemes and destinations belong in that product's own tracked configuration, in
+that product's repository. None of them belong in factory source or fixtures.
+
+Two reasons, one of each kind. Normative: a correctness contract must be
+versioned next to the thing it governs, not scattered through the tool that runs
+it. Practical: this repository is public and a product repository may not be, so
+anything named here is published.
+
+The check runs on ADDED lines only, so it is a ratchet rather than a sweep.
+Existing occurrences are cleaned up by whoever next touches that file, and no
+new one can enter.
