@@ -37,7 +37,12 @@ directory and binds run, repository, base, candidate and receipt digest. The
 journal is an append-only chain of exclusive per-stage files. Each stage binds
 the digest of its predecessor; the complete chain is re-read immediately before
 every external mutation. Unknown entries, gaps, overwritten evidence and any
-symlink in the real receipt or journal authority path fail closed.
+pre-existing symlink anywhere in the full absolute receipt or journal authority
+path fail closed. A root-owned compatibility alias directly below the filesystem
+root (for example macOS `/var` to `/private/var`) is canonicalized once; project-
+and user-controlled symlinks below it still refuse. Receipt-file and
+lease-directory safety are checked before any lease callback or receipt precommit
+hook runs.
 
 External effects are reconciled before they are attempted:
 
@@ -83,6 +88,14 @@ malicious repository writer who deliberately impersonates the same context;
 the receipt itself likewise claims integrity, not cryptographic authenticity.
 Every external command is bounded by a 30-second timeout.
 
+The local filesystem trust boundary is the macOS account running Build Studio.
+The path checks prevent accidental, stale and pre-positioned symlink redirection;
+they do not claim atomic resistance to a hostile same-user process replacing a
+directory in the interval between a path check and a Node filesystem call. Such
+an actor can already replace Build Studio code and run state. Stronger resistance
+would require descriptor-relative `openat`/`mkdirat`-style primitives that the
+Node API used here does not expose, and is outside this factory's threat model.
+
 ## Verification contract
 
 Permanent tests cover pre-mutation drift refusal, mismatched push URLs, a real
@@ -90,6 +103,7 @@ two-stage Git URL rewrite, active-run and local-tip rebinding, a real
 bare-repository create race, base-SHA drift, closed-PR recovery, append-only
 journal tampering before status publication, direct/dangling/intermediate
 authority symlinks plus symlinked `.locks` and receipt-file leaves against the
-real receipt store, a conflicting receipt status on page two, nonce-bound status
-recovery, client-authority rejection, the HTTP contract and admission-seam
-classification.
+real receipt store, including a symlink above the configured project path and
+proof that callbacks do not run, a conflicting receipt status on page two,
+nonce-bound status recovery, client-authority rejection, the HTTP contract and
+admission-seam classification.

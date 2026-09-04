@@ -34,7 +34,7 @@ const { execFileSync } = require('child_process');
 
 const {
   safeRunId, digest, isObject, exactKeys, writeExclusive, createLeaseStore,
-  assertPathComponentsNoSymlink,
+  assertAbsolutePathNoSymlink,
 } = require('./authority-store');
 const { createAdmissionRegistry } = require('./admission-registry');
 const { isTechnicalStop } = require('./technical-stop');
@@ -535,10 +535,9 @@ function collectReviewEvidence(wf, reviewGates = REVIEW_GATE_STEPS.filter((step)
 function createRunReceiptStore({ statePath, lockTimeoutMs = 5000, lockPollMs = 5 } = {}) {
   if (!statePath) throw new Error('createRunReceiptStore: statePath is required');
   const dir = path.join(statePath, RECEIPT_DIR);
-  const authorityBase = path.dirname(path.resolve(statePath));
   function assertReceiptPathSafe(target, runId = null) {
     try {
-      assertPathComponentsNoSymlink(authorityBase, target);
+      assertAbsolutePathNoSymlink(target);
     } catch (error) {
       throw new RunReceiptError(CODES.STORAGE_UNPROTECTED, `receipt authority path is unsafe: ${error.message}`, {
         runId: runId === null ? null : String(runId), cause: error.code || null,
@@ -585,8 +584,10 @@ function createRunReceiptStore({ statePath, lockTimeoutMs = 5000, lockPollMs = 5
 
   /** Run `fn` while holding the run's receipt lease. */
   function withLease(runId, fn) {
-    assertReceiptPathSafe(path.join(dir, '.locks'), runId);
-    const lease = leases.acquire(String(runId));
+    const id = String(runId);
+    assertReceiptPathSafe(path.join(dir, '.locks'), id);
+    assertReceiptPathSafe(fileFor(id), id);
+    const lease = leases.acquire(id);
     try {
       return fn();
     } finally {

@@ -316,12 +316,35 @@ test('repair — the real receipt store refuses symlinked lease and receipt leaf
         ? path.join(outside, 'sentinel')
         : path.join(root, 'missing-receipt');
       fs.symlinkSync(target, store.fileFor('leaf-symlink-run'));
+      assert.throws(() => store.withLease('leaf-symlink-run', () => {
+        callbackRan = true;
+      }), (error) => error.code === 'RECEIPT_STORAGE_UNPROTECTED');
+      assert.equal(callbackRan, false);
       assert.throws(() => store.load('leaf-symlink-run'), (error) => error.code === 'RECEIPT_STORAGE_UNPROTECTED');
     }
 
     assert.equal(fs.readFileSync(path.join(outside, 'sentinel'), 'utf8'), 'unchanged');
     assert.deepEqual(fs.readdirSync(outside).sort(), before);
   }
+});
+
+test('repair — a symlink above the configured project path refuses before creating authority state', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'receipt-parent-link-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'receipt-parent-outside-'));
+  t.after(() => fs.rmSync(outside, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(outside, 'project'));
+  fs.writeFileSync(path.join(outside, 'sentinel'), 'unchanged');
+  fs.symlinkSync(outside, path.join(root, 'linked-parent'));
+  const statePath = path.join(root, 'linked-parent', 'project', '.build-studio');
+  const store = createRunReceiptStore({ statePath });
+  let callbackRan = false;
+  assert.throws(() => store.withLease('parent-link-run', () => {
+    callbackRan = true;
+  }), (error) => error.code === 'RECEIPT_STORAGE_UNPROTECTED');
+  assert.equal(callbackRan, false);
+  assert.equal(fs.existsSync(path.join(outside, 'project', '.build-studio')), false);
+  assert.equal(fs.readFileSync(path.join(outside, 'sentinel'), 'utf8'), 'unchanged');
 });
 
 test('repair — the create-only push cannot fast-forward a branch created in the race window', (t) => {

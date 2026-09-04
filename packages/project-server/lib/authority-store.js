@@ -79,6 +79,31 @@ function assertPathComponentsNoSymlink(base, target) {
   }
 }
 
+/**
+ * Refuse pre-existing symlinks across the absolute authority path.
+ *
+ * macOS exposes root-owned compatibility aliases such as /var -> /private/var.
+ * Canonicalize that one trusted, root-level hop before checking the remaining
+ * path. Symlinks below the first component remain authority violations.
+ */
+function assertAbsolutePathNoSymlink(target) {
+  let leaf = path.resolve(target);
+  const parsed = path.parse(leaf);
+  const parts = path.relative(parsed.root, leaf).split(path.sep).filter(Boolean);
+  if (parts.length > 0) {
+    const first = path.join(parsed.root, parts[0]);
+    try {
+      const stat = fs.lstatSync(first);
+      if (stat.isSymbolicLink() && stat.uid === 0) {
+        leaf = path.join(fs.realpathSync.native(first), ...parts.slice(1));
+      }
+    } catch (error) {
+      if (!error || error.code !== 'ENOENT') throw error;
+    }
+  }
+  assertPathComponentsNoSymlink(path.parse(leaf).root, leaf);
+}
+
 function syncDirectory(directory) {
   let fd;
   try {
@@ -297,6 +322,7 @@ module.exports = {
   isObject,
   exactKeys,
   assertPathComponentsNoSymlink,
+  assertAbsolutePathNoSymlink,
   syncDirectory,
   writeAtomic,
   writeExclusive,
